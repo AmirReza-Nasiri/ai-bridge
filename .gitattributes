@@ -1,0 +1,3 @@
+# Normalize all text to LF in the repo AND working copy (Windows + macOS).
+# Prevents CRLF/LF churn and cross-platform `cargo fmt --check` mismatches.
+* text=auto eol=lf

@@ -1,0 +1,12 @@
+[package]
+name = "aibridge-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Engine dependencies are added as phases land (warm peer engine, profile
+# translation, review strategies). The foundation only needs std.

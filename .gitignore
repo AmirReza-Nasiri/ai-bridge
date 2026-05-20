@@ -1,0 +1,15 @@
+# Rust build output
+/target
+
+# Backups / editor cruft
+**/*.rs.bk
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+
+# AI Bridge runtime state (per-project)
+.ai-bridge/
+
+# NOTE: Cargo.lock IS committed (this is a binary workspace).

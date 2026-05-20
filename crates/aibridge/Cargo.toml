@@ -1,0 +1,18 @@
+[package]
+name = "aibridge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "aibridge"
+path = "src/main.rs"
+
+[dependencies]
+aibridge-core = { path = "../aibridge-core" }
+aibridge-platform = { path = "../aibridge-platform" }
+clap = { workspace = true }
+anyhow = { workspace = true }
