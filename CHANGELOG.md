@@ -66,7 +66,20 @@ versioning is semver.
   `aibridge` connected while the VS Code extension panel (different casing) did
   not. User scope is casing-proof and visible in every Claude context; tools are
   global, and the gate stays per-project via the Stop hook.
-- `budget_status` remains a stub; tiny-diff fast-path, rtk wiring + `--shared`/`uninit` are next.
+- **rtk output-optimizer wiring (safe mode, Codex R30).** `aibridge hook pretooluse`
+  + `aibridge init --rtk` wire a PreToolUse rewrite that routes ONLY safe,
+  read-only, high-noise inspection commands (`git status/diff/log/branch/show`,
+  `ls/dir/tree`) through `rtk rewrite` — never mutations, tests/builds,
+  diagnostics, or compound commands; fails open; raw bypass via `AIBRIDGE_RTK=0` /
+  `RTK_DISABLE=1` / `# ai-bridge:raw`. (Popularity ≠ accuracy → compression is
+  opt-in and narrow.) Unit-tested allowlist.
+- **`doctor` spawned-context PATH check.** The MCP server records a runtime
+  snapshot (`.ai-bridge/runtime/snapshot.json`: PATH + resolved git/codex/rtk) at
+  startup; `doctor` FAILs when git/codex resolve in the terminal but are missing
+  in the Claude-spawned context (a real Windows failure class).
+- Decided **not** to add a tiny-diff fast-path (Codex R30): the warm review path
+  is cheap (~2.4s) and skipping small diffs would weaken accuracy.
+- `budget_status` remains a stub; `--shared` / `uninit` are next.
 - Docs: invocation + knowledge model (how Claude discovers/uses AI Bridge).
 
 ## [0.1.0] — 2026-05-20

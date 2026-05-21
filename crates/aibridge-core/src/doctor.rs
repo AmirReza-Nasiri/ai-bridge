@@ -166,6 +166,7 @@ pub fn run(project: &Path, full: bool) -> Report {
     checks.push(mcp_registration(project));
     checks.push(stop_hook(project));
     checks.push(install_state(project));
+    checks.push(spawned_context(project));
 
     if full {
         checks.push(e2e_roundtrip(project));
@@ -246,6 +247,58 @@ fn install_state(project: &Path) -> Check {
             Status::Warn,
             "install state",
             "missing — run `aibridge init`",
+        )
+    }
+}
+
+/// Compare the terminal's CLI resolution against the snapshot the MCP server
+/// recorded at startup, to catch a "git/codex missing in the Claude-spawned
+/// context" PATH mismatch (a real Windows failure class).
+fn spawned_context(project: &Path) -> Check {
+    let snap = std::fs::read_to_string(
+        project
+            .join(".ai-bridge")
+            .join("runtime")
+            .join("snapshot.json"),
+    )
+    .ok()
+    .and_then(|s| serde_json::from_str::<Value>(&s).ok());
+
+    let snap = match snap {
+        Some(s) => s,
+        None => return check(
+            Status::Warn,
+            "spawned-context PATH",
+            "unknown — restart Claude (so the MCP server records its runtime), then re-run doctor",
+        ),
+    };
+
+    let resolved_in_snapshot = |name: &str| {
+        snap.pointer(&format!("/resolved/{name}"))
+            .and_then(Value::as_str)
+            .is_some()
+    };
+    let mut missing = Vec::new();
+    for tool in ["git", "codex"] {
+        if DefaultPlatform::find_executable(tool).is_ok() && !resolved_in_snapshot(tool) {
+            missing.push(tool);
+        }
+    }
+    if missing.is_empty() {
+        check(
+            Status::Pass,
+            "spawned-context PATH",
+            "git/codex resolvable in the Claude-spawned MCP server too",
+        )
+    } else {
+        check(
+            Status::Fail,
+            "spawned-context PATH",
+            format!(
+                "{} found in terminal but MISSING in the Claude-spawned context — \
+                 restart Claude from a terminal with these on PATH, or use absolute paths",
+                missing.join(", ")
+            ),
         )
     }
 }

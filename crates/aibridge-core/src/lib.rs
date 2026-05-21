@@ -10,6 +10,7 @@ pub mod git;
 pub mod health;
 pub mod install;
 pub mod mcp;
+pub mod optimizer;
 
 /// The crate (and product) version.
 pub fn version() -> &'static str {

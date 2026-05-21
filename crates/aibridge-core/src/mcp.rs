@@ -4,6 +4,7 @@
 
 use crate::codex::CodexPeer;
 use crate::{gate, health};
+use aibridge_platform::{DefaultPlatform, Platform};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
@@ -344,6 +345,46 @@ fn log_gate(cwd: &str, msg: &str) {
     }
 }
 
+/// Record the MCP server's spawned-context environment (PATH + resolved CLIs) to
+/// `.ai-bridge/runtime/snapshot.json` so `doctor` can detect a terminal-vs-Claude
+/// PATH mismatch (a real Windows failure class).
+fn write_runtime_snapshot() {
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| ".".to_string());
+    let dir = std::path::Path::new(&cwd)
+        .join(".ai-bridge")
+        .join("runtime");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let resolve = |name: &str| {
+        DefaultPlatform::find_executable(name)
+            .ok()
+            .map(|p| p.display().to_string())
+    };
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let snapshot = json!({
+        "ts_ms": ts,
+        "pid": std::process::id(),
+        "exe": std::env::current_exe().ok().map(|p| p.display().to_string()),
+        "cwd": cwd,
+        "path": std::env::var("PATH").unwrap_or_default(),
+        "resolved": {
+            "git": resolve("git"),
+            "codex": resolve("codex"),
+            "rtk": resolve("rtk"),
+        },
+    });
+    let _ = std::fs::write(
+        dir.join("snapshot.json"),
+        serde_json::to_string_pretty(&snapshot).unwrap_or_default(),
+    );
+}
+
 /// Soft cap on diff size sent to the reviewer (avoids huge prompts; rtk-based
 /// shrinking comes later).
 const MAX_DIFF_CHARS: usize = 24_000;
@@ -358,6 +399,7 @@ fn truncate_for_review(diff: &str) -> String {
 /// Run the stdio JSON-RPC loop until EOF.
 pub fn serve() -> anyhow::Result<()> {
     let mut server = Server::new();
+    write_runtime_snapshot(); // record the spawned-context PATH for `doctor`
     let stdin = std::io::stdin();
     let mut reader = stdin.lock();
     let mut stdout = std::io::stdout();

@@ -23,8 +23,12 @@ struct Cli {
 enum Commands {
     /// Run the AI Bridge MCP server (the warm peer engine).
     McpServer,
-    /// Wire hooks + MCP config + rtk into the project/user config.
-    Init,
+    /// Wire the MCP server + Stop review hook into the project (local).
+    Init {
+        /// Also wire the rtk output-optimizer PreToolUse hook (safe mode).
+        #[arg(long)]
+        rtk: bool,
+    },
     /// Translate `ai-bridge.profile.toml` into native per-CLI config.
     Profile {
         #[command(subcommand)]
@@ -38,6 +42,17 @@ enum Commands {
     },
     /// Diagnose (and optionally repair) the installation.
     Doctor,
+    /// Internal hook entry points (invoked by Claude Code hooks, not by you).
+    Hook {
+        #[command(subcommand)]
+        action: HookAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum HookAction {
+    /// PreToolUse rewrite that routes safe noisy commands through rtk.
+    Pretooluse,
 }
 
 #[derive(Subcommand, Debug)]
@@ -57,7 +72,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::McpServer => aibridge_core::mcp::serve(),
-        Commands::Init => init(),
+        Commands::Init { rtk } => init(rtk),
         Commands::Profile { action } => match action {
             ProfileAction::Apply { dry_run, fix } => {
                 not_yet(&format!("profile apply (dry_run={dry_run}, fix={fix})"))
@@ -65,7 +80,18 @@ fn main() -> Result<()> {
         },
         Commands::Selftest { full } => doctor_cmd(full),
         Commands::Doctor => doctor_cmd(false),
+        Commands::Hook { action } => match action {
+            HookAction::Pretooluse => hook_pretooluse(),
+        },
     }
+}
+
+fn hook_pretooluse() -> Result<()> {
+    use std::io::Read;
+    let mut input = String::new();
+    std::io::stdin().read_to_string(&mut input)?;
+    print!("{}", aibridge_core::optimizer::pretooluse_str(&input));
+    Ok(())
 }
 
 fn doctor_cmd(full: bool) -> Result<()> {
@@ -88,9 +114,9 @@ fn not_yet(what: &str) -> Result<()> {
     Ok(())
 }
 
-fn init() -> Result<()> {
+fn init(rtk: bool) -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let report = aibridge_core::install::init(&cwd)?;
+    let report = aibridge_core::install::init(&cwd, rtk)?;
     println!("AI Bridge: wired into {}", cwd.display());
     for action in &report.actions {
         println!("  • {action}");

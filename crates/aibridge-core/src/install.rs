@@ -29,14 +29,18 @@ pub struct InitReport {
     pub restart_required: bool,
 }
 
-/// Wire AI Bridge into the project rooted at `project` (local scope).
-pub fn init(project: &Path) -> Result<InitReport> {
+/// Wire AI Bridge into the project rooted at `project`. With `rtk`, also wire the
+/// rtk output-optimizer PreToolUse hook (safe mode).
+pub fn init(project: &Path, rtk: bool) -> Result<InitReport> {
     let exe = std::env::current_exe().context("resolving the aibridge executable path")?;
     let exe_str = exe.to_string_lossy().to_string();
     let mut actions = Vec::new();
 
     register_mcp_server(project, &exe_str, &mut actions)?;
     install_stop_hook(project, &mut actions)?;
+    if rtk {
+        install_rtk_hook(project, &exe_str, &mut actions)?;
+    }
     add_gate_line(project, &mut actions)?;
     write_install_state(project, &exe_str, &mut actions)?;
     git_exclude(project, ".ai-bridge/", &mut actions);
@@ -45,6 +49,74 @@ pub fn init(project: &Path) -> Result<InitReport> {
         actions,
         restart_required: true,
     })
+}
+
+/// Install the rtk PreToolUse rewrite hook into `.claude/settings.local.json`.
+/// It is `aibridge hook pretooluse` (exec form), which routes safe noisy
+/// commands through `rtk` and fails open otherwise.
+fn install_rtk_hook(project: &Path, exe: &str, actions: &mut Vec<String>) -> Result<()> {
+    let path = project.join(".claude").join("settings.local.json");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("creating {}", display(parent)))?;
+    }
+    let mut root = read_json(&path)?;
+    if !root.is_object() {
+        root = json!({});
+    }
+    let changed = {
+        let obj = root.as_object_mut().expect("object");
+        let hooks = obj.entry("hooks").or_insert_with(|| json!({}));
+        if !hooks.is_object() {
+            *hooks = json!({});
+        }
+        let pre = hooks
+            .as_object_mut()
+            .expect("object")
+            .entry("PreToolUse")
+            .or_insert_with(|| json!([]));
+        if !pre.is_array() {
+            *pre = json!([]);
+        }
+        let arr = pre.as_array_mut().expect("array");
+        let present = arr.iter().any(|g| {
+            g.pointer("/hooks")
+                .and_then(Value::as_array)
+                .map(|hs| {
+                    hs.iter().any(|h| {
+                        h.get("args")
+                            .and_then(Value::as_array)
+                            .map(|a| a.iter().any(|x| x.as_str() == Some("pretooluse")))
+                            .unwrap_or(false)
+                    })
+                })
+                .unwrap_or(false)
+        });
+        if present {
+            false
+        } else {
+            arr.push(json!({
+                "matcher": "Bash",
+                "hooks": [{
+                    "type": "command",
+                    "command": exe,
+                    "args": ["hook", "pretooluse"],
+                    "timeout": 30
+                }]
+            }));
+            true
+        }
+    };
+    if changed {
+        backup_if_exists(&path, actions)?;
+        write_json(&path, &root)?;
+        actions.push(format!(
+            "wired the rtk PreToolUse optimizer hook in {} (safe mode)",
+            display(&path)
+        ));
+    } else {
+        actions.push("rtk PreToolUse hook already present".to_string());
+    }
+    Ok(())
 }
 
 /// Register the MCP server in Claude's local scope via the `claude` CLI so the
