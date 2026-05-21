@@ -14,8 +14,14 @@ versioning is semver.
 - Real `health` / `capability_status` tools (CLI discovery via the platform
   layer; verified live finding `claude` and `codex` — the latter via the Windows
   `%APPDATA%\npm` fallback — and reporting `rtk` absent).
-- `review_diff` / `review_stop` / `consult` / `budget_status` are honest stubs
-  until the warm Codex child + review strategy land in the next increment.
+- **Engine increment 2a — warm Codex peer + live `consult`.** `CodexPeer`
+  spawns and keeps a `codex mcp-server` child warm over stdio JSON-RPC (first
+  turn via `codex`, later turns via `codex-reply` for prompt-cache reuse). The
+  `consult` tool is now live end-to-end — verified on Windows: aibridge →
+  `cmd /C codex.cmd` → real Codex reply. Platform gains `command_for` to spawn
+  `.cmd`/`.bat` shims correctly (no BatBadBut shell escaping).
+- `review_diff` / `review_stop` / `budget_status` remain honest stubs until the
+  review strategy + Stop-gate land in the next increment.
 - Docs: invocation + knowledge model (how Claude discovers/uses AI Bridge).
 
 ## [0.1.0] — 2026-05-20

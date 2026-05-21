@@ -6,13 +6,20 @@
 
 use anyhow::Result;
 use std::path::PathBuf;
+use std::process::Command;
 
 /// Platform-specific operations needed by AI Bridge.
 pub trait Platform {
     /// Locate an executable (CLI) by name, with platform-specific fallbacks.
     fn find_executable(name: &str) -> Result<PathBuf>;
+
     /// The AI Bridge config/state directory (`~/.aibridge`).
     fn config_dir() -> Result<PathBuf>;
+
+    /// Build a [`Command`] that runs `exe`, wrapping `.cmd`/`.bat` shims through
+    /// a shell where the OS requires it (Windows). Avoids the BatBadBut class of
+    /// argument-escaping issues by never going through a shell on Unix.
+    fn command_for(exe: &std::path::Path) -> Command;
 }
 
 #[cfg(unix)]

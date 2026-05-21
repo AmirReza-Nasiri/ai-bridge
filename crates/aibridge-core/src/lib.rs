@@ -1,8 +1,9 @@
 //! AI Bridge core: warm peer engine, review strategies, profile translation.
 //!
-//! Foundation increment: exposes [`version`], a [`health`] check, and a minimal
-//! [`mcp`] stdio server. The warm Codex child + review strategies land next.
+//! Increment: exposes [`version`], a [`health`] check, a [`codex`] warm-peer
+//! client, and the [`mcp`] stdio server (with a live `consult` tool).
 
+pub mod codex;
 pub mod health;
 pub mod mcp;
 
