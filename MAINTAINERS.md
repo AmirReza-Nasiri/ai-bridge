@@ -21,7 +21,10 @@ mutation, and config-path handling — all confined to `aibridge-platform`.
 
 Before any version bump:
 
-1. CI green on all four targets (win, mac-arm, mac-x86, linux).
+1. CI green: native (Windows, macOS Apple Silicon, Linux) + the Intel
+   cross-compile check (`x86_64-apple-darwin` built/linted on the Apple Silicon
+   runner). **Plus a manual runtime smoke on real Intel macOS** when one is
+   available — CI only proves the Intel build/ABI, not Intel runtime.
 2. `cargo fmt --all -- --check` and `cargo clippy --all-targets -- -D warnings`.
 3. `cargo test --workspace` green.
 4. `aibridge selftest` green on both Windows and macOS.
