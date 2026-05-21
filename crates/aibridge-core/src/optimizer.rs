@@ -12,13 +12,15 @@
 use aibridge_platform::{DefaultPlatform, Platform};
 use serde_json::{json, Value};
 
-/// Conservative allowlist of read-only, high-noise commands worth compressing.
+/// Conservative allowlist of read-only, high-noise commands whose output is
+/// structural/navigational — safe to compress. Deliberately EXCLUDES `git diff`
+/// and `git show` (no `--stat`): their output IS the content Claude reasons about,
+/// so compressing it could hide a real change/bug (Codex Round 31).
 const SAFE_PREFIXES: &[&str] = &[
     "git status",
-    "git diff",
+    "git diff --stat", // file-level summary only — never the full diff
     "git log",
     "git branch",
-    "git show",
     "ls",
     "dir",
     "tree",
@@ -139,6 +141,10 @@ mod tests {
         assert!(!is_rtk_safe("git diff | head"));
         assert!(!is_rtk_safe("cat err.log"));
         assert!(!is_rtk_safe("lsof -i"));
+        // full diff content must stay raw — only `git diff --stat` is safe
+        assert!(!is_rtk_safe("git diff"));
+        assert!(!is_rtk_safe("git diff -p"));
+        assert!(!is_rtk_safe("git show HEAD"));
     }
 
     #[test]
