@@ -103,9 +103,9 @@ fn rtk_rewrite(command: &str) -> Option<String> {
         .arg(command)
         .output()
         .ok()?;
-    if !out.status.success() {
-        return None;
-    }
+    // Trust stdout, not the exit code: rtk prints the rewrite to stdout but may
+    // exit non-zero (e.g. 3, a "no hook installed" nudge) while still emitting a
+    // valid rewrite; it exits 1 with empty stdout when there is no equivalent.
     let rewritten = String::from_utf8_lossy(&out.stdout).trim().to_string();
     // Accept only a non-empty rewrite of the same top-level command category.
     let first = command.split_whitespace().next().unwrap_or("");
