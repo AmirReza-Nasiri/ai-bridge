@@ -56,7 +56,7 @@ enum ProfileAction {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::McpServer => not_yet("mcp-server (warm peer engine)"),
+        Commands::McpServer => aibridge_core::mcp::serve(),
         Commands::Init => not_yet("init"),
         Commands::Profile { action } => match action {
             ProfileAction::Apply { dry_run, fix } => {

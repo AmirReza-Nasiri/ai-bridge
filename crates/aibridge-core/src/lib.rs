@@ -1,6 +1,10 @@
 //! AI Bridge core: warm peer engine, review strategies, profile translation.
 //!
-//! Foundation only exposes [`version`]; engine modules land in later phases.
+//! Foundation increment: exposes [`version`], a [`health`] check, and a minimal
+//! [`mcp`] stdio server. The warm Codex child + review strategies land next.
+
+pub mod health;
+pub mod mcp;
 
 /// The crate (and product) version.
 pub fn version() -> &'static str {

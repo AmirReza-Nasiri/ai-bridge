@@ -4,6 +4,20 @@ All notable changes to this project are documented here.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/);
 versioning is semver.
 
+## [Unreleased]
+
+### Added
+
+- **Engine increment 1 — connectable MCP server.** `aibridge mcp-server` is a
+  real newline-delimited JSON-RPC 2.0 stdio server: `initialize`, `tools/list`
+  (the 6 v1 tools with tight descriptions), and `tools/call` routing.
+- Real `health` / `capability_status` tools (CLI discovery via the platform
+  layer; verified live finding `claude` and `codex` — the latter via the Windows
+  `%APPDATA%\npm` fallback — and reporting `rtk` absent).
+- `review_diff` / `review_stop` / `consult` / `budget_status` are honest stubs
+  until the warm Codex child + review strategy land in the next increment.
+- Docs: invocation + knowledge model (how Claude discovers/uses AI Bridge).
+
 ## [0.1.0] — 2026-05-20
 
 ### Added
