@@ -3,8 +3,9 @@
 //! Increment: `consult` is wired to the warm Codex peer; review tools land next.
 
 use crate::codex::CodexPeer;
-use crate::health;
+use crate::{gate, health};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::io::{BufRead, Write};
 
 enum Handled {
@@ -13,14 +14,18 @@ enum Handled {
     Notification,
 }
 
-/// Holds the warm Codex peer across requests (spawned lazily on first use).
+/// Holds the warm Codex peer + per-(workspace,session) gate state across requests.
 struct Server {
     codex: Option<CodexPeer>,
+    gates: HashMap<String, gate::GateState>,
 }
 
 impl Server {
     fn new() -> Self {
-        Server { codex: None }
+        Server {
+            codex: None,
+            gates: HashMap::new(),
+        }
     }
 
     fn peer(&mut self) -> anyhow::Result<&mut CodexPeer> {
@@ -70,10 +75,7 @@ impl Server {
                 }
             }
             "review_diff" => self.review_diff(),
-            "review_stop" => {
-                "AI Bridge: `review_stop` (the automatic Stop gate) is not wired yet (next increment)."
-                    .to_string()
-            }
+            "review_stop" => self.review_stop(msg),
             other => format!("AI Bridge: unknown tool '{other}'."),
         };
         json!({ "content": [{ "type": "text", "text": text }] })
@@ -135,6 +137,157 @@ impl Server {
             ),
         }
     }
+
+    /// The automatic Stop gate. Returns the hook-decision JSON as a string:
+    /// `{}` (allow) or `{"decision":"block","reason":...}`.
+    fn review_stop(&mut self, msg: &Value) -> String {
+        let args = msg.pointer("/params/arguments");
+        let stop_active = args
+            .and_then(|a| a.get("stop_hook_active"))
+            .map(|v| v.as_bool().unwrap_or_else(|| v.as_str() == Some("true")))
+            .unwrap_or(false);
+        if stop_active {
+            return allow(); // already in a stop-hook continuation; don't re-gate
+        }
+        let cwd = args
+            .and_then(|a| a.get("cwd"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                std::env::current_dir()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| ".".to_string())
+            });
+        let session = args
+            .and_then(|a| a.get("session").or_else(|| a.get("transcript_path")))
+            .and_then(Value::as_str)
+            .unwrap_or("default")
+            .to_string();
+
+        let bundle = match crate::git::diff_bundle(&cwd) {
+            Ok(b) => b,
+            Err(_) => return allow(), // no git / misconfigured: don't trap; doctor catches it
+        };
+        if bundle.is_empty {
+            return allow();
+        }
+
+        let key = format!("{cwd}::{session}");
+        let mut state = self.gates.remove(&key).unwrap_or_default();
+        let decision = self.gate_decide(&mut state, &bundle, &cwd);
+        self.gates.insert(key, state);
+        decision
+    }
+
+    fn gate_decide(
+        &mut self,
+        st: &mut gate::GateState,
+        bundle: &crate::git::DiffBundle,
+        cwd: &str,
+    ) -> String {
+        let dh = bundle.hash;
+
+        if st.last_allowed_diff_hash == Some(dh) {
+            return allow();
+        }
+        if st.fail_ask_pending {
+            st.fail_ask_pending = false;
+            if st.last_blocked_diff_hash == Some(dh) {
+                return allow(); // the ask was surfaced last turn; let Claude stop now
+            }
+            // diff changed — fall through and review normally
+        }
+        // Same blocked diff stopping again with nothing changed → no progress.
+        if st.last_blocked_diff_hash == Some(dh) {
+            st.same_findings_blocks += 1;
+            if st.same_findings_blocks >= gate::NO_PROGRESS_THRESHOLD {
+                return self.fail_ask(
+                    st,
+                    dh,
+                    "the diff hasn't changed but peer review still has unresolved findings",
+                );
+            }
+            if let Some(reason) = st.cached_block_reason.clone() {
+                return block(&reason); // re-block with cached findings; no new Codex call
+            }
+        }
+
+        let prompt = gate::prompt(&bundle.text);
+        let review = match self.peer() {
+            Ok(peer) => peer.ask(&prompt, cwd),
+            Err(e) => Err(e),
+        };
+        let review = match review {
+            Ok(r) => r,
+            Err(_) => {
+                return self.fail_ask(
+                    st,
+                    dh,
+                    "peer review couldn't run (Codex unavailable or quota exhausted)",
+                )
+            }
+        };
+        let trace = gate::write_trace(cwd, &bundle.text, &review);
+
+        match gate::parse_verdict(&review) {
+            gate::Verdict::Approve => {
+                st.last_allowed_diff_hash = Some(dh);
+                st.last_blocked_diff_hash = None;
+                st.cached_block_reason = None;
+                st.same_findings_blocks = 0;
+                allow()
+            }
+            gate::Verdict::RequestChanges => {
+                let findings = gate::findings(&review);
+                let fh = gate::hash_str(&findings);
+                if st.last_findings_hash == Some(fh)
+                    && st.last_blocked_diff_hash.is_some()
+                    && st.last_blocked_diff_hash != Some(dh)
+                {
+                    st.same_findings_blocks += 1;
+                    if st.same_findings_blocks >= gate::NO_PROGRESS_THRESHOLD {
+                        return self.fail_ask(
+                            st,
+                            dh,
+                            "the same findings persist even though the code changed",
+                        );
+                    }
+                } else {
+                    st.same_findings_blocks = 1;
+                }
+                let reason = gate::compact_reason(&findings, &trace);
+                st.last_blocked_diff_hash = Some(dh);
+                st.last_findings_hash = Some(fh);
+                st.cached_block_reason = Some(reason.clone());
+                block(&reason)
+            }
+            gate::Verdict::Blocked | gate::Verdict::Unparseable => self.fail_ask(
+                st,
+                dh,
+                "peer review could not complete (blocked or unparseable verdict)",
+            ),
+        }
+    }
+
+    fn fail_ask(&mut self, st: &mut gate::GateState, dh: u64, why: &str) -> String {
+        st.fail_ask_pending = true;
+        st.last_blocked_diff_hash = Some(dh);
+        block(&format!(
+            "AI Bridge: {why}. I won't finalize on my own — ask the user how to proceed \
+             (continue without review / wait and retry / fix it first). The next stop will be \
+             allowed so you can deliver that question."
+        ))
+    }
+}
+
+/// Allow decision (let Claude finish).
+fn allow() -> String {
+    "{}".to_string()
+}
+
+/// Block decision JSON (send Claude back with `reason`).
+fn block(reason: &str) -> String {
+    json!({ "decision": "block", "reason": reason }).to_string()
 }
 
 /// Soft cap on diff size sent to the reviewer (avoids huge prompts; rtk-based

@@ -25,8 +25,17 @@ versioning is semver.
   to the warm Codex peer for a skeptical review. Verified live on Windows: a
   deliberate `ZeroDivisionError` bug in a scratch repo was correctly flagged
   with file/line, severity, a fix, and a `REQUEST_CHANGES` verdict.
-- `review_stop` (automatic Stop gate) / `budget_status` remain honest stubs until
-  the gate's allow/block normalization + loop policy land next.
+- **Engine increment 2c — live `review_stop` automatic gate.** Builds a full diff
+  bundle (status + staged + unstaged + untracked, excluding `.ai-bridge/`),
+  reviews it via the warm Codex peer, parses a sentinel verdict
+  (`<AI-BRIDGE-APPROVE/>` / `<AI-BRIDGE-REQUEST-CHANGES/>` / `<AI-BRIDGE-BLOCKED/>`),
+  and returns the hook decision (`{}` allow or `{"decision":"block","reason":…}`).
+  Implements the locked `single_critic_gate` policy: no artificial round cap,
+  diff/findings-hash no-progress detection, block-once-then-allow fail-ask,
+  `stop_hook_active` short-circuit, and a per-review trace under `.ai-bridge/`.
+  Verified live on Windows (5/5): block on a real bug → no-progress fail-ask →
+  allow → approve after fix.
+- `budget_status` remains a stub.
 - Docs: invocation + knowledge model (how Claude discovers/uses AI Bridge).
 
 ## [0.1.0] — 2026-05-20
