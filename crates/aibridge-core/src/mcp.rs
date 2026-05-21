@@ -142,39 +142,45 @@ impl Server {
     /// `{}` (allow) or `{"decision":"block","reason":...}`.
     fn review_stop(&mut self, msg: &Value) -> String {
         let args = msg.pointer("/params/arguments");
+        let cwd = resolve_cwd(args);
+        log_gate(&cwd, "INVOKED"); // entry marker: proves the hook reached us
         let stop_active = args
             .and_then(|a| a.get("stop_hook_active"))
             .map(|v| v.as_bool().unwrap_or_else(|| v.as_str() == Some("true")))
             .unwrap_or(false);
-        if stop_active {
-            return allow(); // already in a stop-hook continuation; don't re-gate
-        }
-        let cwd = args
-            .and_then(|a| a.get("cwd"))
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_else(|| {
-                std::env::current_dir()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|_| ".".to_string())
-            });
         let session = args
             .and_then(|a| a.get("session_id").or_else(|| a.get("transcript_path")))
             .and_then(Value::as_str)
             .unwrap_or("default")
             .to_string();
 
-        let bundle = match crate::git::diff_bundle(&cwd) {
+        let decision = self.review_stop_inner(&cwd, stop_active, &session);
+        // Always-on observability: prove the gate fired and what it decided
+        // (so it can never be a silent no-op).
+        log_gate(
+            &cwd,
+            &format!(
+                "stop_hook_active={stop_active} decision={}",
+                if decision == "{}" { "ALLOW" } else { "BLOCK" }
+            ),
+        );
+        decision
+    }
+
+    fn review_stop_inner(&mut self, cwd: &str, stop_active: bool, session: &str) -> String {
+        if stop_active {
+            return allow(); // already in a stop-hook continuation; don't re-gate
+        }
+        let bundle = match crate::git::diff_bundle(cwd) {
             Ok(b) => b,
-            Err(_) => return allow(), // no git / misconfigured: don't trap; doctor catches it
+            Err(_) => return allow(), // not a git repo / git missing: nothing to gate
         };
         if bundle.is_empty {
             return allow();
         }
-
         let key = format!("{cwd}::{session}");
         let mut state = self.gates.remove(&key).unwrap_or_default();
-        let decision = self.gate_decide(&mut state, &bundle, &cwd);
+        let decision = self.gate_decide(&mut state, &bundle, cwd);
         self.gates.insert(key, state);
         decision
     }
@@ -288,6 +294,54 @@ fn allow() -> String {
 /// Block decision JSON (send Claude back with `reason`).
 fn block(reason: &str) -> String {
     json!({ "decision": "block", "reason": reason }).to_string()
+}
+
+/// Resolve the project directory for a review, robust to a missing or
+/// unsubstituted `${cwd}` hook input: explicit arg → `CLAUDE_PROJECT_DIR` →
+/// the MCP server's own working dir (Claude spawns it in the project). This
+/// prevents the gate from silently allowing when `${cwd}` doesn't substitute.
+fn resolve_cwd(args: Option<&Value>) -> String {
+    if let Some(c) = args.and_then(|a| a.get("cwd")).and_then(Value::as_str) {
+        if !c.is_empty() && !c.starts_with("${") && std::path::Path::new(c).exists() {
+            return c.to_string();
+        }
+    }
+    if let Ok(dir) = std::env::var("CLAUDE_PROJECT_DIR") {
+        if !dir.is_empty() && std::path::Path::new(&dir).exists() {
+            return dir;
+        }
+    }
+    std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| ".".to_string())
+}
+
+/// Append a one-line record to `<cwd>/.ai-bridge/gate.log` so every gate
+/// invocation (and its decision) is observable — never a silent no-op.
+fn log_gate(cwd: &str, msg: &str) {
+    let dir = std::path::Path::new(cwd).join(".ai-bridge");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let path = dir.join("gate.log");
+    // Rotate at ~1 MB so a long-lived install never grows an unbounded log.
+    if std::fs::metadata(&path)
+        .map(|m| m.len() > 1_000_000)
+        .unwrap_or(false)
+    {
+        let _ = std::fs::rename(&path, dir.join("gate.log.1"));
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = f.write_all(format!("{ts} review_stop {msg}\n").as_bytes());
+    }
 }
 
 /// Soft cap on diff size sent to the reviewer (avoids huge prompts; rtk-based

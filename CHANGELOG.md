@@ -53,7 +53,14 @@ versioning is semver.
 - **README rewritten** around the real flow: 3-step setup
   (`cargo install` → `aibridge init` → restart + `aibridge doctor`), automatic
   vs on-demand use, and the single-command health check.
-- `budget_status` remains a stub; rtk wiring + `--shared`/`uninit` are next.
+- **Stop-gate hardening + observability.** `review_stop` resolves the project dir
+  robustly (`cwd` arg → `CLAUDE_PROJECT_DIR` → server cwd) so it never silently
+  allows on an unsubstituted `${cwd}`; every invocation is logged to
+  `.ai-bridge/gate.log` (INVOKED + decision, rotated at ~1 MB), and `init` now
+  git-ignores `.ai-bridge/`. Diagnosed (Codex R28) that `claude -p` headless
+  fires the Stop hook but exits before the ~15s review completes (killing the
+  child) — interactive mode blocks and waits, so the gate completes there.
+- `budget_status` remains a stub; tiny-diff fast-path, rtk wiring + `--shared`/`uninit` are next.
 - Docs: invocation + knowledge model (how Claude discovers/uses AI Bridge).
 
 ## [0.1.0] — 2026-05-20

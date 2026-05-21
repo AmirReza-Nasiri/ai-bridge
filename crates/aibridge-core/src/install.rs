@@ -37,6 +37,7 @@ pub fn init(project: &Path) -> Result<InitReport> {
     install_stop_hook(project, &mut actions)?;
     add_gate_line(project, &mut actions)?;
     write_install_state(project, &exe_str, &mut actions)?;
+    git_exclude(project, ".ai-bridge/", &mut actions);
 
     Ok(InitReport {
         actions,
