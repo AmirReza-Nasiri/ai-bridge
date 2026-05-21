@@ -60,6 +60,12 @@ versioning is semver.
   git-ignores `.ai-bridge/`. Diagnosed (Codex R28) that `claude -p` headless
   fires the Stop hook but exits before the ~15s review completes (killing the
   child) — interactive mode blocks and waits, so the gate completes there.
+- **`init` registers the MCP server at USER scope** (`claude mcp add -s user`),
+  not project-local. On Windows, project-local registration keys by path and can
+  split across `D:` vs `d:` drive-letter casing — so the terminal Claude saw
+  `aibridge` connected while the VS Code extension panel (different casing) did
+  not. User scope is casing-proof and visible in every Claude context; tools are
+  global, and the gate stays per-project via the Stop hook.
 - `budget_status` remains a stub; tiny-diff fast-path, rtk wiring + `--shared`/`uninit` are next.
 - Docs: invocation + knowledge model (how Claude discovers/uses AI Bridge).
 

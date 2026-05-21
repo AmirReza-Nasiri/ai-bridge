@@ -1,9 +1,11 @@
 //! `aibridge init`: wire the gate into Claude Code for the current project.
 //!
 //! Default install is **local / per-machine / untracked** (Codex Round 26):
-//! - MCP server → Claude local scope in `~/.claude.json` (via `claude mcp add`,
-//!   which canonicalizes the project path correctly), NOT a committed `.mcp.json`
-//!   with a machine-specific absolute path.
+//! - MCP server → Claude USER scope in `~/.claude.json` (via `claude mcp add -s
+//!   user`), NOT a committed `.mcp.json` with a machine-specific absolute path.
+//!   User scope is casing-proof on Windows (local/project-keyed paths can split
+//!   across `D:` vs `d:`); the tools are global, the gate stays per-project via
+//!   the Stop hook below.
 //! - Stop hook → `.claude/settings.local.json` (gitignored by Claude), NOT the
 //!   committed `settings.json`.
 //! - Gate-awareness note → `CLAUDE.local.md` (+ `.git/info/exclude`), NOT the
@@ -53,12 +55,12 @@ fn register_mcp_server(project: &Path, exe: &str, actions: &mut Vec<String>) -> 
         .context("locating the `claude` CLI (needed to register the MCP server)")?;
 
     let _ = DefaultPlatform::command_for(&claude)
-        .args(["mcp", "remove", "aibridge", "-s", "local"])
+        .args(["mcp", "remove", "aibridge", "-s", "user"])
         .current_dir(project)
         .output(); // ignore: may not exist yet
 
     let out = DefaultPlatform::command_for(&claude)
-        .args(["mcp", "add", "aibridge", "-s", "local", "--"])
+        .args(["mcp", "add", "aibridge", "-s", "user", "--"])
         .arg(exe)
         .arg("mcp-server")
         .current_dir(project)
@@ -70,7 +72,9 @@ fn register_mcp_server(project: &Path, exe: &str, actions: &mut Vec<String>) -> 
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    actions.push("registered the `aibridge` MCP server (Claude local scope)".to_string());
+    actions.push(
+        "registered the `aibridge` MCP server (Claude user scope — all projects)".to_string(),
+    );
     Ok(())
 }
 
@@ -210,7 +214,7 @@ fn write_install_state(project: &Path, exe: &str, actions: &mut Vec<String>) -> 
         "version": crate::version(),
         "scope": "local",
         "aibridge_exe": exe,
-        "mcp_server": "aibridge (claude local scope)",
+        "mcp_server": "aibridge (claude user scope)",
         "stop_hook": ".claude/settings.local.json",
         "gate_note": "CLAUDE.local.md",
         "installed_at_ms": now_ms(),
