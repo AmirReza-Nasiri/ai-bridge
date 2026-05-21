@@ -57,7 +57,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::McpServer => aibridge_core::mcp::serve(),
-        Commands::Init => not_yet("init"),
+        Commands::Init => init(),
         Commands::Profile { action } => match action {
             ProfileAction::Apply { dry_run, fix } => {
                 not_yet(&format!("profile apply (dry_run={dry_run}, fix={fix})"))
@@ -75,5 +75,22 @@ fn not_yet(what: &str) -> Result<()> {
         aibridge_platform::platform_name(),
         what
     );
+    Ok(())
+}
+
+fn init() -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let report = aibridge_core::install::init(&cwd)?;
+    println!("AI Bridge: wired into {}", cwd.display());
+    for action in &report.actions {
+        println!("  • {action}");
+    }
+    if report.restart_required {
+        println!(
+            "\nRESTART_REQUIRED: restart Claude Code so it connects the aibridge MCP server \
+             and loads the Stop hook."
+        );
+    }
+    println!("Then work normally — the automatic peer-review gate is active.");
     Ok(())
 }

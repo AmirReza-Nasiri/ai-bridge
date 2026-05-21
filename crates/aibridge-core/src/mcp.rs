@@ -159,7 +159,7 @@ impl Server {
                     .unwrap_or_else(|_| ".".to_string())
             });
         let session = args
-            .and_then(|a| a.get("session").or_else(|| a.get("transcript_path")))
+            .and_then(|a| a.get("session_id").or_else(|| a.get("transcript_path")))
             .and_then(Value::as_str)
             .unwrap_or("default")
             .to_string();

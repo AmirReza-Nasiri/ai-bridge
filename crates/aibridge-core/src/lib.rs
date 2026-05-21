@@ -7,6 +7,7 @@ pub mod codex;
 pub mod gate;
 pub mod git;
 pub mod health;
+pub mod install;
 pub mod mcp;
 
 /// The crate (and product) version.

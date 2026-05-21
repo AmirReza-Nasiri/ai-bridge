@@ -35,7 +35,16 @@ versioning is semver.
   `stop_hook_active` short-circuit, and a per-review trace under `.ai-bridge/`.
   Verified live on Windows (5/5): block on a real bug → no-progress fail-ask →
   allow → approve after fix.
-- `budget_status` remains a stub.
+- **`aibridge init` — one-command wiring (local scope, Codex Round 26).**
+  Registers the `aibridge` MCP server via `claude mcp add` (local), installs the
+  `Stop` review hook in `.claude/settings.local.json` (with `statusMessage`, a
+  120s `timeout`, and `cwd`/`session_id`/`transcript_path`/`stop_hook_active`
+  inputs), writes the gate note to `CLAUDE.local.md` (+ `.git/info/exclude`), and
+  records ownership in `.ai-bridge/install-state.json`. Merge-safe, idempotent,
+  backs up touched files, and never edits committed config (a `--shared` team
+  mode is future). Verified on Windows: after init, `claude mcp get aibridge`
+  reports **✓ Connected**.
+- `budget_status` remains a stub; `selftest` / `doctor` are next.
 - Docs: invocation + knowledge model (how Claude discovers/uses AI Bridge).
 
 ## [0.1.0] — 2026-05-20
