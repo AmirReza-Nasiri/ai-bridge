@@ -4,6 +4,7 @@
 //! client, and the [`mcp`] stdio server (with a live `consult` tool).
 
 pub mod codex;
+pub mod git;
 pub mod health;
 pub mod mcp;
 

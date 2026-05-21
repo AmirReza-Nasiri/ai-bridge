@@ -69,8 +69,10 @@ impl Server {
                     self.consult(question)
                 }
             }
-            "review_diff" | "review_stop" => {
-                format!("AI Bridge: `{name}` is not wired yet (next increment). `consult` is live.")
+            "review_diff" => self.review_diff(),
+            "review_stop" => {
+                "AI Bridge: `review_stop` (the automatic Stop gate) is not wired yet (next increment)."
+                    .to_string()
             }
             other => format!("AI Bridge: unknown tool '{other}'."),
         };
@@ -99,6 +101,50 @@ impl Server {
                  Proceed without it, retry, or fix the issue?"
             ),
         }
+    }
+
+    fn review_diff(&mut self) -> String {
+        let cwd = std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| ".".to_string());
+        let diff = match crate::git::diff(&cwd) {
+            Ok(d) => d,
+            Err(e) => return format!("AI Bridge: could not read the git diff: {e}"),
+        };
+        if diff.trim().is_empty() {
+            return "AI Bridge: no uncommitted changes to review (git diff is empty).".to_string();
+        }
+        let diff = truncate_for_review(&diff);
+        let prompt = format!(
+            "You are a skeptical peer reviewer. Review this git diff: find bugs, risks, \
+             edge cases, and missing tests; cite file/line; if it looks good, say so \
+             briefly.\n\n```diff\n{diff}\n```"
+        );
+        match self.peer() {
+            Ok(peer) => match peer.ask(&prompt, &cwd) {
+                Ok(reply) if !reply.trim().is_empty() => reply,
+                Ok(_) => "AI Bridge: Codex returned an empty review.".to_string(),
+                Err(e) => format!(
+                    "AI Bridge: review unavailable (Codex error): {e}. \
+                     Proceed without it, retry, or fix the issue?"
+                ),
+            },
+            Err(e) => format!(
+                "AI Bridge: could not start the Codex peer: {e}. \
+                 Proceed without it, retry, or fix the issue?"
+            ),
+        }
+    }
+}
+
+/// Soft cap on diff size sent to the reviewer (avoids huge prompts; rtk-based
+/// shrinking comes later).
+const MAX_DIFF_CHARS: usize = 24_000;
+
+fn truncate_for_review(diff: &str) -> String {
+    match diff.char_indices().nth(MAX_DIFF_CHARS) {
+        Some((idx, _)) => format!("{}\n... [diff truncated for review]", &diff[..idx]),
+        None => diff.to_string(),
     }
 }
 

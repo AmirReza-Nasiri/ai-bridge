@@ -20,8 +20,13 @@ versioning is semver.
   `consult` tool is now live end-to-end — verified on Windows: aibridge →
   `cmd /C codex.cmd` → real Codex reply. Platform gains `command_for` to spawn
   `.cmd`/`.bat` shims correctly (no BatBadBut shell escaping).
-- `review_diff` / `review_stop` / `budget_status` remain honest stubs until the
-  review strategy + Stop-gate land in the next increment.
+- **Engine increment 2b — live `review_diff`.** Computes the uncommitted git
+  diff (`git diff HEAD`, with a no-commit fallback and a size cap) and sends it
+  to the warm Codex peer for a skeptical review. Verified live on Windows: a
+  deliberate `ZeroDivisionError` bug in a scratch repo was correctly flagged
+  with file/line, severity, a fix, and a `REQUEST_CHANGES` verdict.
+- `review_stop` (automatic Stop gate) / `budget_status` remain honest stubs until
+  the gate's allow/block normalization + loop policy land next.
 - Docs: invocation + knowledge model (how Claude discovers/uses AI Bridge).
 
 ## [0.1.0] — 2026-05-20
