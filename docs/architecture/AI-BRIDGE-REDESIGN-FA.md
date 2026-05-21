@@ -482,6 +482,30 @@ ai-bridge/
 
 ---
 
+## ۹-ج. چطور ازش استفاده می‌کنی + Claude چطور می‌داند (invocation + knowledge، تأیید Codex راند ۲۱)
+
+**بازقاب‌بندیِ کلیدی:** جمله‌ی قدیمیِ «برو با کدکس دیالوگ کن» لازم بود چون codex-peer یک skillِ **منفعل** بود که باید صدا زده می‌شد. AI Bridge فرق دارد — **ارزشِ اصلی‌اش خودکار است و هیچ invocationی لازم ندارد.** فقط برای نظرِ on-demandِ اضافه چیزی می‌گویی.
+
+**دو مسیرِ استفاده:**
+- **خودکار (مسیرِ اصلی):** هیچی نمی‌گویی. هر تسک، گیتِ review خودش روی `Stop` شلیک می‌شود. ← تفاوتِ بزرگ با codex-peer (برای ارزشِ اصلی، دانشِ invocation صفر است).
+- **دستی (مکمل، جمله‌ی طبیعی):** Claude به toolهای MCP route می‌کند:
+  | چی می‌گویی | چه صدا می‌زند |
+  |---|---|
+  | «این رو با کدکس review کن» / «قبلِ ship یه review» | `review_diff` |
+  | «یه نظر دوم از کدکس بگیر» / «کدکس چی فکر می‌کنه» | `consult` |
+  | «سلامتِ AI Bridge رو چک کن» | `health` |
+  | «بودجه‌ی review چقدره» | `budget_status` |
+
+**Claude چطور این دانش را دارد (لایه‌ی دانشِ مینیمال، ~۲۳۰–۴۳۰ توکن/session — ناچیز در برابرِ ۴۵Kی که حذف می‌کند):**
+1. **توضیحِ toolهای MCP** (۶ tool، هرکدام <۸۰ توکن) — وقتی aibridge MCP server وصل است، Claude tool و «کِی استفاده شود» را می‌بیند → routeِ دستی. (لازم، ذاتی.)
+2. **یک خط در CLAUDE.md** (~۳۰ توکن):
+   > `An automatic AI peer review gate (AI Bridge) is active. When a Stop hook blocks with peer-review findings, address the findings before completing the task — do not fight or bypass the block.`
+3. **متنِ reasonِ بلاک** (۰ هزینه‌ی upfront) — لحظه‌ی بلاک، findingها را توضیح می‌دهد.
+
+**عمداً در v1 نیست:** `SKILL.md` و `/ai-bridge` slash — چون دقیقاً همان bloatی‌اند که از اولش فرار می‌کردیم. اگر بعداً جمله‌های طبیعی کافی نبودند، در **v2** به‌صورت **MCP prompt** (نه skillِ جدا) اضافه می‌شوند. منطق: اول بسنج جمله‌ها قابل‌اعتماد کار می‌کنند، بعد اضافه کن.
+
+---
+
 ## ۱۰. بنیادین در مقابل اضافه (منوی به‌روزشده)
 
 ### 🟢 بنیادین (در v1)
