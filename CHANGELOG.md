@@ -44,7 +44,16 @@ versioning is semver.
   backs up touched files, and never edits committed config (a `--shared` team
   mode is future). Verified on Windows: after init, `claude mcp get aibridge`
   reports **✓ Connected**.
-- `budget_status` remains a stub; `selftest` / `doctor` are next.
+- **`aibridge doctor` / `selftest` — one comprehensive check.** Fast by default
+  (no model calls): aibridge/claude/codex/rtk/git discovery, a quota-free
+  `codex mcp-server` handshake, MCP-registration + Stop-hook + install-state
+  checks, with a clear PASS/WARN/FAIL summary; exits non-zero on any FAIL.
+  `selftest --full` adds a real Codex round-trip (uses quota). Verified live on
+  Windows.
+- **README rewritten** around the real flow: 3-step setup
+  (`cargo install` → `aibridge init` → restart + `aibridge doctor`), automatic
+  vs on-demand use, and the single-command health check.
+- `budget_status` remains a stub; rtk wiring + `--shared`/`uninit` are next.
 - Docs: invocation + knowledge model (how Claude discovers/uses AI Bridge).
 
 ## [0.1.0] — 2026-05-20

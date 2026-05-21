@@ -63,9 +63,19 @@ fn main() -> Result<()> {
                 not_yet(&format!("profile apply (dry_run={dry_run}, fix={fix})"))
             }
         },
-        Commands::Selftest { full } => not_yet(&format!("selftest (full={full})")),
-        Commands::Doctor => not_yet("doctor"),
+        Commands::Selftest { full } => doctor_cmd(full),
+        Commands::Doctor => doctor_cmd(false),
     }
+}
+
+fn doctor_cmd(full: bool) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let report = aibridge_core::doctor::run(&cwd, full);
+    report.print();
+    if !report.ok() {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 fn not_yet(what: &str) -> Result<()> {
