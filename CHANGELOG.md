@@ -6,6 +6,59 @@ versioning is semver.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Review gate no longer hangs under the VS Code MCP host (Codex R34 + R35).**
+  On Windows the warm Codex child was launched via `cmd /C codex.cmd mcp-server`;
+  spawning that npm batch shim through `cmd.exe` from a parent with **no console**
+  (the Claude Code extension's MCP host) wedged the child, and a blocking
+  `read_line` with no deadline turned that into an infinite hang — `review_stop`
+  logged `INVOKED` and never decided. Fix, in three parts:
+  - **Direct launch.** New `Platform::spawn_plan` resolves the npm `.cmd` shim to
+    a direct `node <entry>.js` launch (parsed from the shim body) with
+    `CREATE_NO_WINDOW`, and only falls back to `cmd /C` as a degraded `cmd-shim`
+    mode. `command_for` (short captured calls) also gets `CREATE_NO_WINDOW`.
+  - **Bounded reads.** `CodexPeer` now reads stdout on a dedicated thread and
+    `request()` waits on an `mpsc` deadline (20s handshake, 90s review). A stuck
+    or silent Codex returns an error the gate turns into fail-ask — never a hang.
+  - **No poisoned-peer reuse (Codex R35 blocker).** A timed-out child is dropped
+    (`Server::ask_peer` + the gate error path) so the next review spawns fresh;
+    reusing a wedged child could re-hang on the next (unbounded) stdin write.
+  - **Observability.** `gate.log` now records a timeline (bundle size → launch
+    line → returned / `FAILED: <cause>`); `runtime/snapshot.json` records
+    `codex_spawn` `{kind, program}`; `doctor` adds a **codex launch mode** check
+    that FAILs on the degraded `cmd-shim` path. Verified live: `doctor` shows
+    `codex launch mode — node-direct …\codex.js` and the handshake connects.
+- **First review no longer times out — background warming (dogfood + Codex R36).**
+  After the hang fix, a real review of a 29.7 KB diff still fail-asked because the
+  *first* Codex turn is cold. Measured driving the live server: cold ≈45–90s vs a
+  warm `codex-reply` ≈6–19s. The MCP server now warms a Codex peer in the
+  background at startup (a tiny primer turn that caches the system prompt), and
+  `peer()` adopts it on the first review — so the user-visible review is a fast
+  cached reply, not a cold turn. Best-effort with a lazy cold fallback; the
+  warming receiver is consumed one-shot so a stale/idle peer is never leaked.
+  `gate.log` now tags each call `[node-direct, warm|cold]`. Verified live:
+  after warm-up, a real `review_stop` ran `[node-direct, warm]` in 6.4s.
+- **Per-session reasoning-effort override + quality-first timeout (dogfood R2).**
+  A real dogfood still timed out: the warm review of a 29.7 KB diff overran the
+  timeout because the user's `~/.codex/config.toml` sets `model_reasoning_effort =
+  "xhigh"` (measured ~286s for one real review). AI Bridge now sets
+  `config.model_reasoning_effort` on the first `codex` turn (inherited by later
+  `codex-reply` turns) — a per-session override that never touches the user's
+  global config. The user prioritizes review depth over speed, so the effort is
+  **`xhigh`** and the timeouts are sized so a thorough review always completes:
+  `CALL_TIMEOUT` is a generous **1500s** backstop (not a quality cutoff — a
+  *crashed* Codex is still caught instantly via EOF, preserving the hang fix), and
+  `init` sets the Stop-hook `timeout` to **1800s**. `REVIEW_REASONING_EFFORT` is
+  one constant to dial back to `high`/`medium`/`low` for a faster, shallower gate
+  (measured `medium` ≈22s vs `xhigh` ≈286s on the same 30 KB diff). The override
+  mechanism is verified live (effort change takes effect and persists through
+  `codex-reply`). Codex-reviewed (APPROVE).
+- **`doctor` reports review reasoning effort.** A new informational check shows
+  the effort AI Bridge uses (and the user's global setting if different) plus the
+  latency expectation — so a multi-minute `xhigh` review is never mistaken for a
+  hang (the exact confusion that masked the root cause during dogfood).
+
 ### Added
 
 - **Engine increment 1 — connectable MCP server.** `aibridge mcp-server` is a

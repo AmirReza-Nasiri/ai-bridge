@@ -194,7 +194,11 @@ fn install_stop_hook(project: &Path, actions: &mut Vec<String>) -> Result<()> {
                     "server": "aibridge",
                     "tool": "review_stop",
                     "statusMessage": "AI Bridge peer review",
-                    "timeout": 120,
+                    // Generous: a thorough xhigh review can take several minutes,
+                    // and the user prioritizes quality over speed. AI Bridge's own
+                    // backstop (CALL_TIMEOUT) fires first; a crashed Codex is caught
+                    // instantly via EOF, so this never masks the hang fix.
+                    "timeout": 1800,
                     "input": {
                         "cwd": "${cwd}",
                         "stop_hook_active": "${stop_hook_active}",

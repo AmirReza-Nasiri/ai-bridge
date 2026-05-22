@@ -141,6 +141,9 @@ pub fn run(project: &Path, full: bool) -> Report {
         None => checks.push(check(Status::Fail, "codex CLI", "not found")),
     }
 
+    checks.push(codex_launch_mode());
+    checks.push(review_effort());
+
     match DefaultPlatform::find_executable("rtk") {
         Ok(p) => checks.push(check(
             Status::Pass,
@@ -173,6 +176,89 @@ pub fn run(project: &Path, full: bool) -> Report {
     }
 
     Report { checks }
+}
+
+/// Report the reasoning effort AI Bridge uses for reviews and the user's global
+/// Codex setting. Informational: it sets the expectation that a thorough review
+/// takes minutes (so a slow review isn't mistaken for a hang — the exact
+/// confusion that masked the root cause during dogfood).
+fn review_effort() -> Check {
+    let effort = crate::codex::review_reasoning_effort();
+    let global = codex_config_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|t| parse_reasoning_effort(&t));
+    let global_note = match global {
+        Some(g) if g != effort => format!("; your global Codex config is '{g}'"),
+        _ => String::new(),
+    };
+    let latency = match effort {
+        "xhigh" | "high" => "thorough — reviews take minutes, no cutoff",
+        "minimal" | "low" => "fast — shallower review",
+        _ => "balanced speed and depth",
+    };
+    check(
+        Status::Pass,
+        "review reasoning effort",
+        format!("{effort} ({latency}){global_note}"),
+    )
+}
+
+/// Path to the user's Codex `config.toml` (`$CODEX_HOME/config.toml`, else
+/// `~/.codex/config.toml`), for reporting their global reasoning effort.
+fn codex_config_path() -> Option<std::path::PathBuf> {
+    if let Ok(home) = std::env::var("CODEX_HOME") {
+        return Some(Path::new(&home).join("config.toml"));
+    }
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .ok()?;
+    Some(Path::new(&home).join(".codex").join("config.toml"))
+}
+
+/// Best-effort scan for `model_reasoning_effort = "<x>"` in a Codex config.toml
+/// (avoids a TOML dependency; only the common top-level form is needed here).
+fn parse_reasoning_effort(toml: &str) -> Option<String> {
+    toml.lines().find_map(|line| {
+        let rest = line.trim().strip_prefix("model_reasoning_effort")?;
+        // Require a real key boundary so `model_reasoning_effort_foo` doesn't match.
+        if !rest.starts_with([' ', '=', '\t']) {
+            return None;
+        }
+        let v = rest
+            .trim_start_matches([' ', '\t', '='])
+            .trim()
+            .trim_matches('"')
+            .to_string();
+        (!v.is_empty()).then_some(v)
+    })
+}
+
+/// How the warm Codex child will be launched. On Windows the npm `.cmd` shim
+/// must resolve to a direct `node <entry>.js` launch; the degraded `cmd /C`
+/// fallback can hang the review gate under the no-console Claude Code MCP host.
+fn codex_launch_mode() -> Check {
+    let exe = match DefaultPlatform::find_executable("codex") {
+        Ok(e) => e,
+        Err(_) => return check(Status::Warn, "codex launch mode", "codex not found"),
+    };
+    let plan = DefaultPlatform::spawn_plan(&exe);
+    if plan.kind.is_safe() {
+        check(
+            Status::Pass,
+            "codex launch mode",
+            format!("{} — {}", plan.kind.as_str(), plan.program),
+        )
+    } else {
+        check(
+            Status::Fail,
+            "codex launch mode",
+            format!(
+                "degraded '{}' — the npm .cmd shim wasn't resolved to a direct node launch, \
+                 so the review gate can hang under Claude Code on Windows. Ensure `node` is on PATH.",
+                plan.kind.as_str()
+            ),
+        )
+    }
 }
 
 fn mcp_registration(project: &Path) -> Check {
@@ -346,4 +432,39 @@ fn has_aibridge_stop_hook(v: &Value) -> bool {
             })
         })
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_reasoning_effort;
+
+    #[test]
+    fn parses_quoted_and_unquoted() {
+        assert_eq!(
+            parse_reasoning_effort("model_reasoning_effort = \"xhigh\"").as_deref(),
+            Some("xhigh")
+        );
+        assert_eq!(
+            parse_reasoning_effort("model_reasoning_effort=\"medium\"").as_deref(),
+            Some("medium")
+        );
+        assert_eq!(
+            parse_reasoning_effort("model = \"gpt-5.5\"\nmodel_reasoning_effort = \"high\"\n")
+                .as_deref(),
+            Some("high")
+        );
+    }
+
+    #[test]
+    fn ignores_lookalike_keys_and_comments() {
+        assert_eq!(
+            parse_reasoning_effort("model_reasoning_effort_extra = \"x\""),
+            None
+        );
+        assert_eq!(
+            parse_reasoning_effort("# model_reasoning_effort = \"high\""),
+            None
+        );
+        assert_eq!(parse_reasoning_effort("model = \"gpt-5.5\""), None);
+    }
 }

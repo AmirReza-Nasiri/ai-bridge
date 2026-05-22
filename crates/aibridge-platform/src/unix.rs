@@ -1,6 +1,6 @@
 //! Unix (macOS/Linux) implementation. macOS maintainer (Mo) owns this file.
 
-use crate::Platform;
+use crate::{Platform, SpawnKind, SpawnPlan};
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -21,5 +21,14 @@ impl Platform for UnixPlatform {
     fn command_for(exe: &Path) -> Command {
         // On Unix, real binaries / shebang scripts run directly.
         Command::new(exe)
+    }
+
+    fn spawn_plan(exe: &Path) -> SpawnPlan {
+        // On Unix there is no batch-shim hazard: launch directly.
+        SpawnPlan::new(
+            Command::new(exe),
+            SpawnKind::Direct,
+            exe.display().to_string(),
+        )
     }
 }

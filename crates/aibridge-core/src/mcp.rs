@@ -18,6 +18,9 @@ enum Handled {
 /// Holds the warm Codex peer + per-(workspace,session) gate state across requests.
 struct Server {
     codex: Option<CodexPeer>,
+    /// A Codex peer being warmed in the background (see `spawn_warming`). Adopted
+    /// by `peer()` the moment it's ready so the first review is a fast cached reply.
+    warm_rx: Option<std::sync::mpsc::Receiver<CodexPeer>>,
     gates: HashMap<String, gate::GateState>,
 }
 
@@ -25,17 +28,44 @@ impl Server {
     fn new() -> Self {
         Server {
             codex: None,
+            warm_rx: None,
             gates: HashMap::new(),
         }
     }
 
     fn peer(&mut self) -> anyhow::Result<&mut CodexPeer> {
         if self.codex.is_none() {
+            // One-shot: consume the warming receiver on first use. If the
+            // background warm-up has finished, adopt that peer so the first review
+            // is a fast cached `codex-reply`. If it isn't ready, dropping the
+            // receiver here lets the warming thread's peer self-clean (its `send`
+            // fails on the closed channel and the child is killed via Drop), so we
+            // never leak a second idle Codex; we then cold-spawn a fresh peer.
+            if let Some(rx) = self.warm_rx.take() {
+                if let Ok(peer) = rx.try_recv() {
+                    self.codex = Some(peer);
+                }
+            }
+        }
+        if self.codex.is_none() {
             self.codex = Some(CodexPeer::spawn()?);
         }
         self.codex
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("codex peer unavailable"))
+    }
+
+    /// Ask the warm peer, spawning it on first use. On ANY error the peer is
+    /// dropped so the next call starts a fresh child: a timed-out or wedged child
+    /// must never be reused — its stdin may no longer drain, and the next
+    /// (synchronous, unbounded) `write_msg` would then block forever, recreating
+    /// the very hang the read deadlines were added to prevent.
+    fn ask_peer(&mut self, prompt: &str, cwd: &str) -> anyhow::Result<String> {
+        let result = self.peer().and_then(|peer| peer.ask(prompt, cwd));
+        if result.is_err() {
+            self.codex = None;
+        }
+        result
     }
 
     fn handle(&mut self, method: &str, msg: &Value) -> Handled {
@@ -90,17 +120,11 @@ impl Server {
             "You are a peer reviewer giving a concise, skeptical second opinion. \
              Be specific and call out risks. Question:\n{question}"
         );
-        match self.peer() {
-            Ok(peer) => match peer.ask(&prompt, &cwd) {
-                Ok(reply) if !reply.trim().is_empty() => reply,
-                Ok(_) => "AI Bridge: Codex returned an empty reply.".to_string(),
-                Err(e) => format!(
-                    "AI Bridge: consult unavailable (Codex error): {e}. \
-                     Proceed without it, retry, or fix the issue?"
-                ),
-            },
+        match self.ask_peer(&prompt, &cwd) {
+            Ok(reply) if !reply.trim().is_empty() => reply,
+            Ok(_) => "AI Bridge: Codex returned an empty reply.".to_string(),
             Err(e) => format!(
-                "AI Bridge: could not start the Codex peer: {e}. \
+                "AI Bridge: consult unavailable (Codex error): {e}. \
                  Proceed without it, retry, or fix the issue?"
             ),
         }
@@ -123,17 +147,11 @@ impl Server {
              edge cases, and missing tests; cite file/line; if it looks good, say so \
              briefly.\n\n```diff\n{diff}\n```"
         );
-        match self.peer() {
-            Ok(peer) => match peer.ask(&prompt, &cwd) {
-                Ok(reply) if !reply.trim().is_empty() => reply,
-                Ok(_) => "AI Bridge: Codex returned an empty review.".to_string(),
-                Err(e) => format!(
-                    "AI Bridge: review unavailable (Codex error): {e}. \
-                     Proceed without it, retry, or fix the issue?"
-                ),
-            },
+        match self.ask_peer(&prompt, &cwd) {
+            Ok(reply) if !reply.trim().is_empty() => reply,
+            Ok(_) => "AI Bridge: Codex returned an empty review.".to_string(),
             Err(e) => format!(
-                "AI Bridge: could not start the Codex peer: {e}. \
+                "AI Bridge: review unavailable (Codex error): {e}. \
                  Proceed without it, retry, or fix the issue?"
             ),
         }
@@ -179,6 +197,10 @@ impl Server {
         if bundle.is_empty {
             return allow();
         }
+        log_gate(
+            cwd,
+            &format!("reviewing diff bundle: {} bytes", bundle.text.len()),
+        );
         let key = format!("{cwd}::{session}");
         let mut state = self.gates.remove(&key).unwrap_or_default();
         let decision = self.gate_decide(&mut state, &bundle, cwd);
@@ -220,18 +242,35 @@ impl Server {
         }
 
         let prompt = gate::prompt(&bundle.text);
-        let review = match self.peer() {
-            Ok(peer) => peer.ask(&prompt, cwd),
-            Err(e) => Err(e),
-        };
-        let review = match review {
-            Ok(r) => r,
-            Err(_) => {
+        // Log how the peer is launched (this also spawns/adopts it). `is_warm()`
+        // is meaningful here only because `spawn_warming` primes the conversation
+        // before handing the peer over, so an adopted peer already has a thread id.
+        if let Ok(peer) = self.peer() {
+            log_gate(
+                cwd,
+                &format!(
+                    "calling Codex [{}, {}] {}",
+                    peer.spawn_kind(),
+                    if peer.is_warm() { "warm" } else { "cold" },
+                    peer.spawn_program()
+                ),
+            );
+        }
+        // Delegate the call AND poisoned-peer invalidation to the single owner.
+        let review = match self.ask_peer(&prompt, cwd) {
+            Ok(r) => {
+                log_gate(cwd, "Codex review returned");
+                r
+            }
+            Err(e) => {
+                // Log the real cause (timeout / EOF / quota) for diagnosis; keep
+                // the user-facing reason short. `ask_peer` already dropped the peer.
+                log_gate(cwd, &format!("Codex review FAILED: {e}"));
                 return self.fail_ask(
                     st,
                     dh,
-                    "peer review couldn't run (Codex unavailable or quota exhausted)",
-                )
+                    "peer review couldn't run (Codex unavailable, timed out, or quota exhausted)",
+                );
             }
         };
         let trace = gate::write_trace(cwd, &bundle.text, &review);
@@ -363,6 +402,12 @@ fn write_runtime_snapshot() {
             .ok()
             .map(|p| p.display().to_string())
     };
+    // How the warm Codex child WOULD be launched here (without spawning it), so
+    // `doctor` can flag the degraded `cmd /C` shim path that hangs the gate.
+    let codex_spawn = DefaultPlatform::find_executable("codex").ok().map(|exe| {
+        let plan = DefaultPlatform::spawn_plan(&exe);
+        json!({ "kind": plan.kind.as_str(), "program": plan.program })
+    });
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
@@ -378,6 +423,7 @@ fn write_runtime_snapshot() {
             "codex": resolve("codex"),
             "rtk": resolve("rtk"),
         },
+        "codex_spawn": codex_spawn,
     });
     let _ = std::fs::write(
         dir.join("snapshot.json"),
@@ -396,10 +442,40 @@ fn truncate_for_review(diff: &str) -> String {
     }
 }
 
+/// Warm a Codex peer in the background so the first real review is a fast cached
+/// `codex-reply` instead of a slow cold `codex` turn (measured ~2.3x faster; a
+/// cold turn on a large diff can exceed the Stop-hook timeout). Best-effort: the
+/// gate falls back to a lazy spawn if this isn't ready in time. One tiny cold
+/// call per server start pays the system-prompt cost once, off the review path.
+fn spawn_warming() -> std::sync::mpsc::Receiver<CodexPeer> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| ".".to_string());
+    std::thread::spawn(move || {
+        if let Ok(mut peer) = CodexPeer::spawn() {
+            // A tiny first turn establishes the conversation and caches the system
+            // prompt; subsequent reviews reuse it. Only hand over a peer that
+            // actually warmed (an errored one is dropped here).
+            if peer
+                .ask(
+                    "You are AI Bridge's peer reviewer. Reply with the single token READY.",
+                    &cwd,
+                )
+                .is_ok()
+            {
+                let _ = tx.send(peer);
+            }
+        }
+    });
+    rx
+}
+
 /// Run the stdio JSON-RPC loop until EOF.
 pub fn serve() -> anyhow::Result<()> {
     let mut server = Server::new();
     write_runtime_snapshot(); // record the spawned-context PATH for `doctor`
+    server.warm_rx = Some(spawn_warming()); // warm Codex while the user works
     let stdin = std::io::stdin();
     let mut reader = stdin.lock();
     let mut stdout = std::io::stdout();
