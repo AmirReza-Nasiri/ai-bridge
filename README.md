@@ -10,10 +10,12 @@
 | Capability | State |
 |---|---|
 | Cargo workspace · CI (Windows + macOS Apple Silicon + Linux + Intel cross-check) | ✅ working |
-| `aibridge mcp-server` — MCP stdio server, 6-tool surface | ✅ working |
+| `aibridge mcp-server` — MCP stdio server, 8-tool surface | ✅ working |
 | `health` / `capability_status` — real CLI discovery | ✅ working |
-| **Warm Codex peer + `consult`** — on-demand second opinion | ✅ working (measured **15.5s cold → 3.1s warm**) |
+| **Warm Codex peer + `consult`** — on-demand second opinion, with continuous **named topics** that persist across sessions | ✅ working (measured **15.5s cold → 3.1s warm**) |
 | **`review_diff`** — review the current git diff | ✅ working |
+| **`implement`** — Codex drafts a unified-diff patch (validated with `git apply --check`) for you to review + apply | ✅ working |
+| **`run`** — structured command/test execution (exit code, duration, capped output, process-tree timeout) | ✅ working |
 | **`review_stop`** — the **automatic** Stop-hook gate (allow/block + no-progress + fail-ask; node-direct spawn, background warming, project-subtree scoped, deadline-bounded) | ✅ working |
 | **`aibridge init`** — one-command local wiring (subdirectory-of-a-repo aware) | ✅ working |
 | **`aibridge doctor` / `selftest`** — one-command health + connection check | ✅ working |
@@ -121,7 +123,11 @@ loops forever.
 **On demand (plain language).** Just ask Claude; it routes to the MCP tools:
 
 - *"get a second opinion from Codex"* / *"what does Codex think?"* → **`consult`**
+  (add *"on topic `<name>`"* for a continuous dialogue that persists across sessions)
 - *"review this with Codex"* / *"review before we ship"* → **`review_diff`**
+- *"have Codex implement / draft a patch for X"* → **`implement`** (returns a
+  validated, untested patch to review + apply)
+- *"run the tests / build and capture the result"* → **`run`** (structured output)
 
 No skill to install, no slash command to memorize: Claude knows these from the
 connected MCP server's tool descriptions plus one line in `CLAUDE.local.md` — a
@@ -139,8 +145,9 @@ aibridge mcp-server          # the warm peer engine Claude connects to (run by C
 aibridge profile apply       # planned — translate ai-bridge.profile.toml -> native config
 ```
 
-MCP tools exposed by `mcp-server`: `consult`, `review_diff`, `review_stop`
-(hook-only), `health`, `capability_status`, `budget_status` (stub).
+MCP tools exposed by `mcp-server`: `consult` (named persisted topics),
+`implement` (validated patch), `run` (structured execution), `review_diff`,
+`review_stop` (hook-only), `health`, `capability_status`, `budget_status` (stub).
 
 ---
 
@@ -223,8 +230,10 @@ reviewها را کم می‌کند. جانشینِ نسل‌چهارِ codex-pee
   که همیشه کامل می‌شود، نه برشِ کیفیت). فقط تغییرِ **کامیت‌نشدهٔ** زیرشاخهٔ پروژه
   ریویو می‌شود، پس **مرتب کامیت کن** تا ریویوها کوچک و چندثانیه‌ای بمانند. تنظیم با
   `REVIEW_REASONING_EFFORT`.
-- **on-demand:** «یه نظر دوم از کدکس بگیر» → `consult`؛ «این رو با کدکس review کن»
-  → `review_diff`.
+- **on-demand:** «یه نظر دوم از کدکس بگیر» → `consult` (با «روی تاپیکِ `<اسم>`» برای
+  دیالوگِ پیوسته‌ای که بین سشن‌ها می‌ماند)؛ «این رو با کدکس review کن» → `review_diff`؛
+  «کدکس برای X یه پچ بنویس» → `implement` (پچِ اعتبارسنجی‌شدهٔ تست‌نشده)؛ «تست‌ها رو
+  اجرا کن و نتیجه رو بگیر» → `run` (خروجیِ ساختارمند).
 
 **پیش‌نیازها:** Claude Code و Codex CLI نصب و لاگین، Git، (برای ساخت) Rust.
 **نصب:** [ویندوز](docs/install/windows.md) · [مک](docs/install/macos.md). طرحِ کامل:

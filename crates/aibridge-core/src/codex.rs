@@ -30,13 +30,19 @@ const INIT_TIMEOUT: Duration = Duration::from_secs(20);
 /// this; it just ensures the editor can't block indefinitely on a frozen child.
 const CALL_TIMEOUT: Duration = Duration::from_secs(1500);
 
-/// Reasoning effort for AI Bridge's own Codex sessions, set on the first turn and
-/// inherited by later `codex-reply` turns. Independent of the user's global
-/// `~/.codex/config.toml`. The user prioritizes accuracy: `xhigh` gives the most
-/// thorough review (measured ~286s on a real ~30KB diff vs ~22s at `medium`) and
-/// the timeout backstop is sized so it always completes. Tune here for a faster,
-/// shallower gate (`high` / `medium` / `low`).
-const REVIEW_REASONING_EFFORT: &str = "xhigh";
+/// Reasoning effort for AI Bridge's review/consult Codex sessions, set on the
+/// first turn and inherited by later `codex-reply` turns. Independent of the
+/// user's global `~/.codex/config.toml`. The user prioritizes accuracy: `xhigh`
+/// gives the most thorough review (measured ~286s on a real ~30KB diff vs ~22s at
+/// `medium`) and the timeout backstop is sized so it always completes. Tune here
+/// for a faster, shallower gate (`high` / `medium` / `low`).
+pub const REVIEW_REASONING_EFFORT: &str = "xhigh";
+
+/// Reasoning effort for the `implement` tool. Lower than the reviewer's `xhigh`:
+/// the implementer only PROPOSES a patch that the gate then reviews at `xhigh`, so
+/// spending the full review budget twice is wasteful. `high` keeps strong drafts
+/// at lower latency/quota.
+pub const IMPLEMENT_REASONING_EFFORT: &str = "high";
 
 /// The reasoning effort AI Bridge applies to its reviews (for `doctor` to report
 /// the expected quality/latency so a slow review isn't mistaken for a hang).
@@ -244,10 +250,16 @@ impl CodexPeer {
     }
 
     /// Open a NEW conversation thread (a cold `codex` turn) and return its
-    /// `threadId` plus the reply text. Reasoning effort is pinned for this thread
-    /// (it persists to later `reply` turns), independent of the user's global
-    /// `~/.codex/config.toml`. See [`REVIEW_REASONING_EFFORT`].
-    pub fn open_thread(&mut self, prompt: &str, cwd: &str) -> Result<(String, String)> {
+    /// `threadId` plus the reply text. `effort` pins the reasoning effort for this
+    /// thread (it persists to later `reply` turns), independent of the user's
+    /// global `~/.codex/config.toml` — pass [`REVIEW_REASONING_EFFORT`] for
+    /// reviews/consults or [`IMPLEMENT_REASONING_EFFORT`] for the implementer.
+    pub fn open_thread(
+        &mut self,
+        prompt: &str,
+        cwd: &str,
+        effort: &str,
+    ) -> Result<(String, String)> {
         let result = self.request(
             "tools/call",
             json!({
@@ -257,7 +269,7 @@ impl CodexPeer {
                     "sandbox": "read-only",
                     "approval-policy": "never",
                     "cwd": cwd,
-                    "config": { "model_reasoning_effort": REVIEW_REASONING_EFFORT }
+                    "config": { "model_reasoning_effort": effort }
                 }
             }),
             CALL_TIMEOUT,

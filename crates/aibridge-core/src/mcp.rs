@@ -1,10 +1,12 @@
 //! MCP stdio server: newline-delimited JSON-RPC 2.0.
 //!
-//! Tool surface: `consult` (isolated topic dialogues), `review_diff` and the
-//! automatic `review_stop` gate (both share the warm Codex peer's reserved review
-//! thread), plus `health` / `capability_status` / `budget_status`. `review_diff`
-//! and `review_stop` capture the change set through the same `git::diff_bundle`
-//! path so on-demand and automatic review judge an identical set of changes.
+//! Tool surface: `consult` (isolated, persisted topic dialogues), `implement`
+//! (Codex returns a validated patch), `run` (structured command execution),
+//! `review_diff` and the automatic `review_stop` gate (both share the warm Codex
+//! peer's reserved review thread), plus `health` / `capability_status` /
+//! `budget_status`. `review_diff` and `review_stop` capture the change set through
+//! the same `git::diff_bundle` path so on-demand and automatic review judge an
+//! identical set of changes.
 
 use crate::codex::CodexPeer;
 use crate::{gate, health};
@@ -126,7 +128,7 @@ impl Server {
                 .codex
                 .as_mut()
                 .ok_or_else(|| anyhow::anyhow!("codex peer unavailable"))?;
-            peer.open_thread(prompt, cwd)
+            peer.open_thread(prompt, cwd, crate::codex::REVIEW_REASONING_EFFORT)
         };
         match opened {
             Ok((tid, text)) => {
@@ -222,6 +224,30 @@ impl Server {
                 }
             }
             "review_diff" => self.review_diff(),
+            "implement" => {
+                let task = msg
+                    .pointer("/params/arguments/task")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim();
+                if task.is_empty() {
+                    "AI Bridge: `implement` requires a non-empty 'task' argument.".to_string()
+                } else {
+                    self.implement(task)
+                }
+            }
+            "run" => {
+                let command = msg
+                    .pointer("/params/arguments/command")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim();
+                if command.is_empty() {
+                    "AI Bridge: `run` requires a non-empty 'command' argument.".to_string()
+                } else {
+                    run_command(command)
+                }
+            }
             "review_stop" => self.review_stop(msg),
             other => format!("AI Bridge: unknown tool '{other}'."),
         };
@@ -326,6 +352,81 @@ impl Server {
             Err(e) => format!(
                 "AI Bridge: review unavailable (Codex error): {e}. \
                  Proceed without it, retry, or fix the issue?"
+            ),
+        }
+    }
+
+    /// Ask Codex on a one-off EPHEMERAL thread (not tracked; isolated from consult
+    /// topics and the gate). On error the peer is invalidated. Used by the
+    /// implementer, whose calls must not pollute or anchor any persistent thread.
+    /// The codex-internal thread lingers in the child (we discard its id), but is
+    /// flushed on the next child restart (periodic gate reset / error invalidation).
+    fn ask_ephemeral(&mut self, prompt: &str, cwd: &str) -> anyhow::Result<String> {
+        self.ensure_peer()?;
+        let opened = {
+            let peer = self
+                .codex
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("codex peer unavailable"))?;
+            peer.open_thread(prompt, cwd, crate::codex::IMPLEMENT_REASONING_EFFORT)
+        };
+        match opened {
+            Ok((_tid, text)) => Ok(text), // discard threadId: ephemeral, never reused
+            Err(e) => {
+                self.invalidate_peer();
+                Err(e)
+            }
+        }
+    }
+
+    /// Implementer: ask Codex for a single unified-diff patch implementing `task`,
+    /// validate it (`git apply --check` when in a repo), retry once on failure, and
+    /// return it for Claude to apply. Codex stays read-only — it PROPOSES; Claude
+    /// applies; the Stop gate reviews afterwards. The patch is always PROPOSED/
+    /// UNTESTED (a read-only peer can't run it).
+    fn implement(&mut self, task: &str) -> String {
+        // Claude-originated tool call: the server runs in the project dir, so
+        // current_dir() is correct here (unlike the Stop hook, which needs
+        // resolve_cwd for an unsubstituted ${cwd}). Same as review_diff.
+        let cwd = std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| ".".to_string());
+        let base = implement_prompt(task);
+        // First attempt.
+        let raw = match self.ask_ephemeral(&base, &cwd) {
+            Ok(t) => t,
+            Err(e) => return format!("AI Bridge: implement unavailable (Codex error): {e}."),
+        };
+        let patch = match patch_or_message(&raw) {
+            Ok(p) => p,
+            Err(msg) => return msg, // BLOCKED / NEEDS-INFO / no envelope
+        };
+        let why = match check_patch(&patch, &cwd) {
+            PatchCheck::Applies => return format_patch(&patch, true),
+            PatchCheck::Unchecked => return format_patch(&patch, false),
+            PatchCheck::Rejected(why) => why,
+        };
+        // One retry, feeding back git's validator error.
+        let retry = format!(
+            "{base}\n\nYOUR PREVIOUS PATCH FAILED `git apply --check`:\n{why}\n\
+             Return a corrected patch in the SAME envelope."
+        );
+        let raw2 = match self.ask_ephemeral(&retry, &cwd) {
+            Ok(t) => t,
+            Err(e) => return format!("AI Bridge: implement retry failed (Codex error): {e}."),
+        };
+        // patch_or_message on the RETRY too, so a BLOCKED/NEEDS-INFO answer to the
+        // feedback is surfaced cleanly rather than as "no patch".
+        let patch2 = match patch_or_message(&raw2) {
+            Ok(p) => p,
+            Err(msg) => return msg,
+        };
+        match check_patch(&patch2, &cwd) {
+            PatchCheck::Applies => format_patch(&patch2, true),
+            PatchCheck::Unchecked => format_patch(&patch2, false),
+            PatchCheck::Rejected(why2) => format!(
+                "AI Bridge: Codex's patch still does not apply cleanly ({why2}). \
+                 Returning it for MANUAL review — DO NOT apply blind:\n\n```diff\n{patch2}\n```"
             ),
         }
     }
@@ -561,6 +662,307 @@ fn normalize_topic(raw: &str) -> Result<String, String> {
     Ok(t)
 }
 
+/// Outcome of validating a proposed patch with `git apply --check`.
+enum PatchCheck {
+    /// Applies cleanly.
+    Applies,
+    /// Rejected, with the reason from git.
+    Rejected(String),
+    /// Could not validate (not a git repo / git missing) — returned as-is.
+    Unchecked,
+}
+
+/// Implementer prompt: demand a single unified-diff patch in a strict envelope and
+/// nothing else, so the output is machine-extractable and applyable.
+fn implement_prompt(task: &str) -> String {
+    format!(
+        "You are an implementer. Produce a fix for the TASK as a SINGLE git unified \
+         diff and NOTHING else outside the envelope.\n\n\
+         Output EXACTLY this shape:\n\
+         <AI-BRIDGE-PATCH>\n\
+         diff --git a/path b/path\n\
+         ...real hunks, paths relative to the repo root...\n\
+         </AI-BRIDGE-PATCH>\n\
+         then a final line that is EXACTLY one of:\n\
+         <AI-BRIDGE-IMPLEMENTED/>  (a patch is provided)\n\
+         <AI-BRIDGE-BLOCKED/>      (cannot do it safely — one-line reason after it)\n\
+         <AI-BRIDGE-NEEDS-INFO/>   (missing context — one-line question after it)\n\n\
+         Rules: no prose outside the envelope; only real `diff --git` hunks; never \
+         invent contents of files you didn't inspect. If blocked or needing info, \
+         emit an EMPTY <AI-BRIDGE-PATCH></AI-BRIDGE-PATCH> and the matching tag.\n\n\
+         TASK:\n{task}"
+    )
+}
+
+/// Extract the patch body from the `<AI-BRIDGE-PATCH>…</AI-BRIDGE-PATCH>` envelope,
+/// stripping an optional ``` fence. None if the envelope is absent or empty.
+fn extract_patch(raw: &str) -> Option<String> {
+    const OPEN: &str = "<AI-BRIDGE-PATCH>";
+    const CLOSE: &str = "</AI-BRIDGE-PATCH>";
+    let start = raw.find(OPEN)? + OPEN.len();
+    let rest = &raw[start..];
+    let end = rest.find(CLOSE)?;
+    let mut body = rest[..end].trim();
+    if let Some(s) = body.strip_prefix("```diff") {
+        body = s.trim();
+    } else if let Some(s) = body.strip_prefix("```") {
+        body = s.trim();
+    }
+    // Strip a CLOSING fence only when it's on its own line, so a stray ``` inside
+    // trailing prose isn't mistaken for the fence (git apply would reject prose
+    // anyway, but this avoids a confusing retry).
+    if let Some(s) = body.strip_suffix("```") {
+        if s.is_empty() || s.ends_with('\n') {
+            body = s.trim();
+        }
+    }
+    if body.is_empty() {
+        return None;
+    }
+    // `git apply` requires the patch to end with a newline; the trims above
+    // removed it, which makes git report "corrupt patch at line N". Restore one.
+    let mut patch = body.to_string();
+    if !patch.ends_with('\n') {
+        patch.push('\n');
+    }
+    Some(patch)
+}
+
+/// Extract a patch from Codex's reply, or render a caller-facing message when
+/// there is none — a BLOCKED/NEEDS-INFO decline, or a missing envelope. ONE
+/// extraction point, shared by the first attempt AND the retry (so a decline on
+/// either is surfaced cleanly, not mislabeled "no patch").
+fn patch_or_message(raw: &str) -> Result<String, String> {
+    if let Some(patch) = extract_patch(raw) {
+        return Ok(patch);
+    }
+    if raw.contains("<AI-BRIDGE-BLOCKED/>") {
+        Err(format!(
+            "AI Bridge: Codex BLOCKED the implementation.\n\n{}",
+            raw.trim()
+        ))
+    } else if raw.contains("<AI-BRIDGE-NEEDS-INFO/>") {
+        Err(format!(
+            "AI Bridge: Codex needs more info to implement this.\n\n{}",
+            raw.trim()
+        ))
+    } else {
+        Err(format!(
+            "AI Bridge: Codex returned no patch envelope. Raw reply:\n\n{}",
+            raw.trim()
+        ))
+    }
+}
+
+/// Validate a patch with `git apply --check` (via stdin, no temp file). Only runs
+/// inside a git work tree; otherwise returns `Unchecked`.
+fn check_patch(patch: &str, cwd: &str) -> PatchCheck {
+    use std::process::Stdio;
+    let git = match DefaultPlatform::find_executable("git") {
+        Ok(g) => g,
+        Err(_) => return PatchCheck::Unchecked,
+    };
+    let in_repo = DefaultPlatform::command_for(&git)
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .current_dir(cwd)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !in_repo {
+        return PatchCheck::Unchecked;
+    }
+    let mut child = match DefaultPlatform::command_for(&git)
+        .args(["apply", "--check", "-"])
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => return PatchCheck::Rejected(e.to_string()),
+    };
+    if let Some(mut sin) = child.stdin.take() {
+        let _ = sin.write_all(patch.as_bytes());
+        if !patch.ends_with('\n') {
+            let _ = sin.write_all(b"\n"); // git apply needs a trailing newline
+        }
+        // `sin` dropped here → stdin closed so git can finish.
+    }
+    match child.wait_with_output() {
+        Ok(o) if o.status.success() => PatchCheck::Applies,
+        Ok(o) => PatchCheck::Rejected(String::from_utf8_lossy(&o.stderr).trim().to_string()),
+        Err(e) => PatchCheck::Rejected(e.to_string()),
+    }
+}
+
+/// Wrap a proposed patch with a clear banner for Claude, stating whether it was
+/// validated (`git apply --check`) or validation was skipped (not a git repo).
+fn format_patch(patch: &str, validated: bool) -> String {
+    let v = if validated {
+        "validated with `git apply --check`"
+    } else {
+        "validation SKIPPED (not in a git repo / git not found)"
+    };
+    format!(
+        "AI Bridge implementer — PROPOSED patch ({v}; UNTESTED: a read-only peer can't run it — \
+         review and run tests after applying):\n\n```diff\n{patch}\n```"
+    )
+}
+
+/// Hard wall-clock cap for a `run` command (tests/builds finish well within this;
+/// a hung command is killed rather than blocking forever).
+const RUN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+/// Per-stream output cap (bytes) so a noisy command can't flood the context or
+/// buffer unbounded; the rest is read-and-discarded with a truncation marker.
+const RUN_OUTPUT_CAP: usize = 16_000;
+
+/// Runner: execute a shell command in the project dir and return a STRUCTURED
+/// result (exit code, duration, capped stdout/stderr, timeout marker). It is only
+/// reachable by the MCP client (Claude — which already has Bash, so this adds no
+/// new privilege), never by the read-only Codex peer. stdin is null; output is
+/// drained on threads (no pipe-full deadlock) and the child is killed on timeout.
+fn run_command(command: &str) -> String {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| ".".to_string());
+
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut c = Command::new("cmd");
+        c.arg("/C").arg(command);
+        use std::os::windows::process::CommandExt;
+        c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        c
+    };
+    #[cfg(not(windows))]
+    let mut cmd = {
+        let mut c = Command::new("sh");
+        c.arg("-c").arg(command);
+        // Own process group so a timeout kills the whole tree (the shell's children
+        // — the real `cargo test`/`npm`/etc.), not just the `sh` wrapper.
+        use std::os::unix::process::CommandExt;
+        c.process_group(0);
+        c
+    };
+    cmd.current_dir(&cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let start = Instant::now();
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return format!("AI Bridge run — failed to start `{command}`: {e}"),
+    };
+    let pid = child.id();
+
+    // Drain both pipes on threads so output never deadlocks the wait, AND cap while
+    // reading: take up to RUN_OUTPUT_CAP bytes, then discard the rest (so we never
+    // buffer unbounded output, and the child isn't backpressured into hanging).
+    // Returns (capped_lossy_text, was_truncated).
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let mut truncated = false;
+            if let Some(mut p) = pipe {
+                let _ = p.by_ref().take(RUN_OUTPUT_CAP as u64).read_to_end(&mut buf);
+                let extra = std::io::copy(&mut p, &mut std::io::sink()).unwrap_or(0);
+                truncated = extra > 0;
+            }
+            let _ = tx.send((String::from_utf8_lossy(&buf).into_owned(), truncated));
+        });
+        rx
+    };
+    let orx = drain(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let erx = drain(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+
+    let deadline = start + RUN_TIMEOUT;
+    let mut timed_out = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break Some(st),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    kill_tree(pid); // kill the whole tree, not just the shell wrapper
+                    let _ = child.kill(); // belt-and-suspenders on the direct child
+                    let _ = child.wait();
+                    timed_out = true;
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(_) => break None,
+        }
+    };
+    let dur = start.elapsed();
+    // Bound the wait for the drain threads: if a DETACHED/daemonized descendant
+    // escaped the tree/group kill above and still holds the pipe open, the capped
+    // read never hits EOF — don't freeze the server. We accept a leaked drain
+    // thread + partial output in that rare case (per stream, so ≤10s total).
+    let grace = Duration::from_secs(5);
+    let (mut stdout, otrunc) = orx.recv_timeout(grace).unwrap_or_default();
+    let (mut stderr, etrunc) = erx.recv_timeout(grace).unwrap_or_default();
+    if otrunc {
+        stdout.push_str("\n…[output truncated]");
+    }
+    if etrunc {
+        stderr.push_str("\n…[output truncated]");
+    }
+    let head = if timed_out {
+        format!(
+            "AI Bridge run — TIMED OUT after {}s (process tree killed)",
+            RUN_TIMEOUT.as_secs()
+        )
+    } else {
+        let exit = status
+            .and_then(|s| s.code())
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "terminated-by-signal".to_string());
+        format!("AI Bridge run — exit {exit} in {:.1}s", dur.as_secs_f64())
+    };
+    format!("{head}\ncmd: {command}\ncwd: {cwd}\n\n--- stdout ---\n{stdout}\n\n--- stderr ---\n{stderr}")
+}
+
+/// Kill an entire process tree by root pid — on timeout the shell's children (the
+/// real test/build process) must die too, not just the `cmd /C` / `sh -c` wrapper.
+fn kill_tree(pid: u32) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    #[cfg(not(windows))]
+    {
+        // The child leads its own process group (process_group(0)), so the group id
+        // equals its pid; a negative pid signals the whole group.
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", &format!("-{pid}")])
+            .status();
+    }
+}
+
 /// Allow decision (let Claude finish).
 fn allow() -> String {
     "{}".to_string()
@@ -686,7 +1088,9 @@ fn spawn_warming() -> std::sync::mpsc::Receiver<(CodexPeer, String)> {
     std::thread::spawn(move || {
         if let Ok(mut peer) = CodexPeer::spawn() {
             // Only hand over a child whose gate thread actually opened.
-            if let Ok((gate_tid, _)) = peer.open_thread(GATE_PRIMER, &cwd) {
+            if let Ok((gate_tid, _)) =
+                peer.open_thread(GATE_PRIMER, &cwd, crate::codex::REVIEW_REASONING_EFFORT)
+            {
                 let _ = tx.send((peer, gate_tid));
             }
         }
@@ -760,6 +1164,33 @@ fn tools() -> Value {
                     "reset": { "type": "boolean", "description": "Start this topic fresh, discarding prior turns." }
                 },
                 "required": ["question"]
+            })
+        ),
+        tool_with(
+            "implement",
+            "Ask AI Bridge/Codex to IMPLEMENT a focused task as a proposed unified-diff \
+             patch (validated with `git apply --check` when in a git repo). Returns the \
+             patch for you to review + apply; it is UNTESTED. Use for a second-model \
+             implementation or when you want Codex to draft a fix.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "task": { "type": "string", "description": "What to implement (be specific; reference files/symbols)." }
+                },
+                "required": ["task"]
+            })
+        ),
+        tool_with(
+            "run",
+            "Run a shell command in the project dir and return a STRUCTURED result \
+             (exit code, duration, capped stdout/stderr, timeout marker). Useful for \
+             tests/builds when you want a bounded, captured result.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string", "description": "The shell command to run (e.g. 'cargo test', 'npm test')." }
+                },
+                "required": ["command"]
             })
         ),
         tool_with(
@@ -839,6 +1270,42 @@ mod tests {
         assert!(!is_session_lost(
             "secret-alpha = LION; I do not know secret-beta."
         ));
+    }
+
+    #[test]
+    fn extract_patch_pulls_envelope_and_strips_fences() {
+        let raw = "prose\n<AI-BRIDGE-PATCH>\ndiff --git a/x b/x\n+line\n</AI-BRIDGE-PATCH>\n<AI-BRIDGE-IMPLEMENTED/>";
+        let p = extract_patch(raw).unwrap();
+        assert!(p.contains("diff --git a/x b/x") && p.contains("+line"));
+        assert!(!p.contains("AI-BRIDGE"), "envelope tags must be stripped");
+        assert!(p.ends_with('\n'), "git apply requires a trailing newline");
+
+        let fenced = "<AI-BRIDGE-PATCH>\n```diff\ndiff --git a/y b/y\n```\n</AI-BRIDGE-PATCH>";
+        assert!(extract_patch(fenced).unwrap().starts_with("diff --git a/y"));
+        assert!(!extract_patch(fenced).unwrap().contains("```"));
+
+        assert_eq!(extract_patch("<AI-BRIDGE-PATCH></AI-BRIDGE-PATCH>"), None); // empty body
+        assert_eq!(extract_patch("no envelope at all"), None);
+    }
+
+    #[test]
+    fn patch_or_message_extracts_or_explains() {
+        // A real patch present → Ok(patch).
+        assert!(patch_or_message(
+            "<AI-BRIDGE-PATCH>\ndiff --git a/z b/z\n</AI-BRIDGE-PATCH>\n<AI-BRIDGE-IMPLEMENTED/>"
+        )
+        .is_ok());
+        // Declines (empty envelope + tag) → Err with a labeled message. This is the
+        // path that must ALSO work on the retry response.
+        let blocked =
+            patch_or_message("<AI-BRIDGE-PATCH></AI-BRIDGE-PATCH>\n<AI-BRIDGE-BLOCKED/> nope");
+        assert!(blocked.is_err() && blocked.unwrap_err().contains("BLOCKED"));
+        let needs = patch_or_message(
+            "<AI-BRIDGE-PATCH></AI-BRIDGE-PATCH>\n<AI-BRIDGE-NEEDS-INFO/> which file?",
+        );
+        assert!(needs.is_err() && needs.unwrap_err().contains("more info"));
+        // No envelope at all → Err.
+        assert!(patch_or_message("just prose, no tags").is_err());
     }
 
     #[test]

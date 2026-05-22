@@ -8,6 +8,21 @@ versioning is semver.
 
 ### Added
 
+- **`implement` + `run` tools (Phase 2 — standalone parity with codex-peer).**
+  `implement(task)` asks Codex on an isolated EPHEMERAL thread (separate effort:
+  `high`, not the reviewer's `xhigh`) for a single unified-diff patch in a strict
+  envelope, extracts it, validates with `git apply --check` (when in a repo),
+  retries once on failure, and returns it banner'd PROPOSED/UNTESTED for Claude to
+  apply (Codex stays read-only; the gate reviews after). `run(command)` executes a
+  shell command in the project dir and returns a STRUCTURED result — exit code,
+  duration, per-stream output capped while reading (no unbounded buffering),
+  process-TREE kill on a 300s timeout (own process group on Unix / `taskkill /T`
+  on Windows). Only the Claude client can call these (the read-only Codex peer
+  cannot). With cross-session `consult` topics, this brings AI Bridge to parity
+  with codex-peer's `[IMPLEMENTER]`/`[RUNNER]`/`[DIALOGUE]` — it can now stand
+  alone. Codex-reviewed (multiple rounds: patch-newline, retry-decline signal,
+  recv deadlock, process-tree kill, streaming cap → all fixed).
+
 - **Cross-session consult persistence (Phase 2 — toward standalone).** A named
   consult `topic` now survives a Claude/codex restart: each completed turn is
   appended to `.ai-bridge/topics/<topic>.jsonl`, and resuming a topic (no live

@@ -398,6 +398,7 @@ fn e2e_roundtrip(project: &Path) -> Check {
         p.open_thread(
             "Reply with exactly this token and nothing else: AIBRIDGE_FULL_OK",
             &cwd,
+            "low", // connectivity check only — fastest effort
         )
         .map(|(_thread_id, text)| text)
     });
