@@ -17,7 +17,7 @@
 | لایه | چه می‌کند | مکانیزم |
 |---|---|---|
 | **۱. Warm Peer Engine** | حذف سربار ~۴۵K در هر فراخوانیِ peer | یک `aibridge mcp-server` که child گرمِ `codex mcp-server` را نگه می‌دارد → cache-hit |
-| **۲. rtk** | فشرده‌سازی خروجیِ پرحرفِ دستورات (۶۰–۹۰٪) | hook نوع PreToolUse که `git status` → `rtk git status` (ابزار بالادست، نه بازنویسی) |
+| **۲. rtk** (اختیاری) | فشرده‌سازیِ خروجیِ دستوراتِ **ناوبریِ امن** (git status/log/branch, ls/tree) | hook نوع PreToolUse؛ AI Bridge **خودش allowlist را اعمال می‌کند** و فقط دستوراتِ امن را به `rtk` می‌سپارد (نه diff/test/build) |
 | **۳. Quality Orchestration** | review خودکارِ هر تسک توسط Codex | Stop-hook نوع `mcp_tool` → `aibridge.review_stop` → Codex گرم |
 
 **تصمیمات کلیدیِ معماری:**
@@ -110,7 +110,7 @@ codex-peer امروز سه transport پراکنده دارد:
                     │     health, budget_status, rtk_status         │
                     └──────────────────────────────────────────────┘
 
-   PreToolUse hook ──▶ rtk (پروکسیِ مستقل) ──▶ فشرده‌سازی خروجیِ `git/cargo/npm/...`
+   PreToolUse hook ──▶ rtk (پروکسیِ مستقل) ──▶ فشرده‌سازیِ allowlistِ ناوبری (git status/log/branch, ls/tree)
 ```
 
 ### لایه ۱ — Warm Peer Engine (موتور سرعت + هزینه)
@@ -392,6 +392,14 @@ ai-bridge/
 ---
 
 ## ۹. ادغام rtk — جزئیات
+
+> **وضعیتِ پیاده‌سازیِ v1 (سند را با کد بخوان — این بخش طرحِ کامل است، نه چیزی که ship شده).**
+> پس از دیالوگِ دوراندی با Codex و اندازه‌گیریِ واقعی، آنچه واقعاً ساخته شده **باریک** است:
+> - **allowlistِ ناوبری‌محور** که AI Bridge **خودش، قبل از فراخوانیِ rtk، اعمال می‌کند** (`git status`, `git diff --stat`, `git log`, `git branch`, `ls`/`dir`/`tree`) — نه واگذاریِ پوششِ دستورات به rtk. (کد: `aibridge-core/src/optimizer.rs::is_rtk_safe`.)
+> - **فقط Claude** (PreToolUse)، **opt-in** با `aibridge init --rtk`. wiringِ سمتِ **Codex** و زیرفرمان‌های `rtk enable|disable` **در v1 نیستند** (آینده).
+> - **عمداً مستثنی:** `git diff` کامل، test/build/lint، خواندنِ فایل، و هر خروجیِ محتوایی که مدل روش استدلال می‌کند (دقت‌محوری). افزون بر آن، چون hook **قبل از اجرا** بازنویسی می‌کند، اندازهٔ خروجی از پیش معلوم نیست → **size-guard ممکن نیست**؛ پس دستوراتِ با خروجیِ متغیر/کوچک (مثلِ `cargo test` که کش‌شده ~۴۷B می‌شود و rtk بزرگ‌ترش می‌کند) مستثنی‌اند.
+> - **اندازه‌گیریِ واقعی:** git diff بزرگ ۹۳٪ (ولی دقت‌خطرناک → مستثنی)؛ لاگ ۹۲٪ (اکثراً امن ولی از Bash-hook کم‌دسترس)؛ git status ۵۹٪، ls ۷۵٪ (امن، نگه‌داشته). جمع‌بندیِ Codex: **KEEP-narrow** — برد متوسط ولی opt-in و بی‌خطر؛ هزینهٔ اصلیِ توکنِ AI Bridge (ریویوی Codex) را rtk لمس نمی‌کند.
+> - **آینده، نه v1:** size-guard مبتنی بر `PostToolUse`/`updatedToolOutput`، dedupِ لاگ، wiringِ Codex. `CargoTestFilter`/`OutputFilter`ِ build-specِ قدیمی **منسوخ‌اند**.
 
 **موضع: orchestrate/bundle، نه reimplement.** rtk یک ابزار بالغِ Apache-2.0 است که دقیقاً همین کار را روی ۱۰۰+ دستور و ۱۳+ ایجنت انجام می‌دهد؛ بازنویسی‌اش اتلاف است.
 
