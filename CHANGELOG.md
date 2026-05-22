@@ -62,9 +62,16 @@ versioning is semver.
   Bridge project is a SUBDIRECTORY of a larger git repo, the review bundle's
   `git status --porcelain` was repo-wide and pulled in sibling projects' churn
   (verified: 44 noisy lines vs 0 when scoped). `diff_bundle` now scopes status to
-  `-- .` (matching the staged/unstaged diffs) and resolves untracked-file paths
-  against the repo root (`git rev-parse --show-toplevel`), since porcelain prints
-  root-relative paths — so untracked content is read correctly from a subdir too.
+  `-- .` (matching the staged/unstaged diffs) and sources untracked-file content
+  from `git ls-files --others --exclude-standard -z` (lists individual files —
+  porcelain collapses a new dir to `?? dir/` — honors ignore rules, and avoids
+  porcelain's C-quoting of odd paths). Codex-reviewed (3 findings → APPROVE).
+- **`init` git-exclude works for a subdirectory project.** `git_exclude` assumed
+  the project was the repo root (`project/.git/info/exclude` + a bare pattern), so
+  for a subdir project it did nothing and left `.ai-bridge/` / `CLAUDE.local.md`
+  showing as untracked (which then leaked into reviews). It now resolves the real
+  exclude file via `git rev-parse --git-path info/exclude` and anchors the pattern
+  with `--show-prefix` (e.g. `sub/dir/.ai-bridge/`), idempotently.
 
 ### Added
 

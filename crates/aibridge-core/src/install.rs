@@ -260,25 +260,62 @@ fn add_gate_line(project: &Path, actions: &mut Vec<String>) -> Result<()> {
     Ok(())
 }
 
-/// Best-effort: add `entry` to `.git/info/exclude` so a local-only file stays
-/// untracked without editing the committed `.gitignore`.
+/// Best-effort: add `entry` to the repo's `.git/info/exclude` so a local-only
+/// file stays untracked without editing the committed `.gitignore`.
+///
+/// Works when `project` is a SUBDIRECTORY of the repo: the exclude file lives at
+/// the repo root (not `project/.git`) and its patterns match relative to that
+/// root, so we resolve the file via `git rev-parse --git-path` and prefix `entry`
+/// with the project's path-from-root (`--show-prefix`, empty at the root).
 fn git_exclude(project: &Path, entry: &str, actions: &mut Vec<String>) {
-    let exclude = project.join(".git").join("info").join("exclude");
-    if !exclude.parent().map(Path::exists).unwrap_or(false) {
-        return; // not a git repo
-    }
+    let git = match DefaultPlatform::find_executable("git") {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    let run = |args: &[&str]| -> Option<String> {
+        let out = DefaultPlatform::command_for(&git)
+            .args(args)
+            .current_dir(project)
+            .output()
+            .ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+
+    // Locate the exclude file (handles subdirs and linked worktrees).
+    let exclude = match run(&["rev-parse", "--git-path", "info/exclude"]) {
+        Some(p) if !p.is_empty() => {
+            let pb = Path::new(&p);
+            if pb.is_absolute() {
+                pb.to_path_buf()
+            } else {
+                project.join(pb)
+            }
+        }
+        _ => return, // not a git repo
+    };
+
+    // Anchor the pattern to the repo root: empty prefix for a top-level project,
+    // e.g. "sub/dir/" for a subdirectory project.
+    let prefix = run(&["rev-parse", "--show-prefix"]).unwrap_or_default();
+    let pattern = format!("{prefix}{entry}");
+
     let current = std::fs::read_to_string(&exclude).unwrap_or_default();
-    if current.lines().any(|l| l.trim() == entry) {
+    if current.lines().any(|l| l.trim() == pattern) {
         return;
+    }
+    if let Some(parent) = exclude.parent() {
+        let _ = std::fs::create_dir_all(parent);
     }
     let mut next = current;
     if !next.is_empty() && !next.ends_with('\n') {
         next.push('\n');
     }
-    next.push_str(entry);
+    next.push_str(&pattern);
     next.push('\n');
     if std::fs::write(&exclude, next).is_ok() {
-        actions.push(format!("git-ignored {entry} via .git/info/exclude"));
+        actions.push(format!("git-ignored {pattern} via .git/info/exclude"));
     }
 }
 

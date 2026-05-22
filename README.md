@@ -14,10 +14,11 @@
 | `health` / `capability_status` — real CLI discovery | ✅ working |
 | **Warm Codex peer + `consult`** — on-demand second opinion | ✅ working (measured **15.5s cold → 3.1s warm**) |
 | **`review_diff`** — review the current git diff | ✅ working |
-| **`review_stop`** — the **automatic** Stop-hook gate (allow/block + no-progress + fail-ask) | ✅ working |
-| **`aibridge init`** — one-command local wiring | ✅ working |
+| **`review_stop`** — the **automatic** Stop-hook gate (allow/block + no-progress + fail-ask; node-direct spawn, background warming, project-subtree scoped, deadline-bounded) | ✅ working |
+| **`aibridge init`** — one-command local wiring (subdirectory-of-a-repo aware) | ✅ working |
 | **`aibridge doctor` / `selftest`** — one-command health + connection check | ✅ working |
-| rtk output-compression wiring · `--shared` team install · `uninit` · TUI | 🔭 planned |
+| **rtk output-compression** — opt-in via `aibridge init --rtk` (safe-mode allowlist) | ✅ working |
+| `--shared` team install · `uninit` · TUI | 🔭 planned |
 
 ---
 
@@ -32,7 +33,7 @@ three small, independent layers:
 |---|---|---|
 | **Warm Peer Engine** | Keeps one `codex mcp-server` warm and reuses its conversation (`codex-reply`, ~99% prompt-cache) so a review costs ~one warm turn instead of a ~45K cold start | ✅ live |
 | **Quality gate** | A Claude Code `Stop` hook sends each task's diff to Codex, so work gets a peer review *before it's finished* — no cap, with no-progress detection and fail-ask | ✅ live |
-| **rtk** | Wire the [Rust Token Killer](https://github.com/rtk-ai/rtk) (orchestrated, not reimplemented) to compress noisy command output 60–90% | 🔭 planned |
+| **rtk** | Wire the [Rust Token Killer](https://github.com/rtk-ai/rtk) (orchestrated, not reimplemented) to compress noisy command output 60–90% — opt-in via `init --rtk`, narrow safe-mode allowlist | ✅ live (opt-in) |
 
 Full design (Persian): [`docs/architecture/AI-BRIDGE-REDESIGN-FA.md`](docs/architecture/AI-BRIDGE-REDESIGN-FA.md).
 
@@ -80,6 +81,8 @@ AI Bridge doctor (windows)
   [ ok ] claude CLI — 2.1.145
   [ ok ] codex CLI — codex-cli 0.130.0
   [ ok ] codex mcp-server handshake — connects (quota-free)
+  [ ok ] codex launch mode — node-direct — ...\node.exe ...\codex.js
+  [ ok ] review reasoning effort — xhigh (thorough — reviews take minutes, no cutoff)
   [ ok ] aibridge MCP registration — registered + connected
   [ ok ] Stop review hook — installed (.claude/settings.local.json)
   ...
@@ -104,6 +107,16 @@ Claude is sent back to fix it before finishing. The loop has **no artificial
 round cap**; it only pauses to ask *you* when it's genuinely stuck (no progress)
 or when Codex is unavailable — it never silently ships unreviewed work and never
 loops forever.
+
+> **Review depth & latency.** Reviews run at Codex `xhigh` reasoning by default —
+> thorough, but a real review takes **minutes** (a generous internal deadline
+> ensures it always completes; it is *not* a cutoff). This is independent of your
+> global `~/.codex/config.toml`. Two practical notes: (1) `aibridge doctor` prints
+> the effort so a slow review is never mistaken for a hang; (2) the gate reviews
+> only **uncommitted** change in the project subtree, so **commit often** — small
+> incremental diffs review in seconds, and a clean tree is allowed instantly.
+> Tune the speed/depth tradeoff with `REVIEW_REASONING_EFFORT` (`xhigh` → `high`
+> → `medium` → `low`).
 
 **On demand (plain language).** Just ask Claude; it routes to the MCP tools:
 
@@ -138,7 +151,8 @@ MCP tools exposed by `mcp-server`: `consult`, `review_diff`, `review_stop`
   `%APPDATA%\npm\codex.cmd` shim is auto-discovered).
 - **Git** on PATH (the gate and `review_diff` diff the working tree).
 - **Rust toolchain** — only to build/install from source.
-- **rtk** — optional; its wiring is planned (not required today).
+- **rtk** — optional output compressor; wired in safe-mode, opt-in via
+  `aibridge init --rtk` (not required).
 - Platforms: Windows, macOS (Apple Silicon native; Intel via cross-compile +
   manual runtime check), Linux.
 
@@ -191,7 +205,7 @@ reviewها را کم می‌کند. جانشینِ نسل‌چهارِ codex-pee
 **سه لایه:** (۱) Warm Peer Engine — یک `codex mcp-server` گرم + بازاستفاده با
 `codex-reply` (~۹۹٪ cache، اندازه‌گیری: ۱۵.۵s→۳.۱s)؛ (۲) گیتِ کیفیت — یک Stop-hook
 که دیفِ هر تسک را قبل از پایان به Codex می‌دهد (بدونِ سقفِ راند، با تشخیصِ
-عدم‌پیشرفت و fail-ask)؛ (۳) rtk (planned).
+عدم‌پیشرفت و fail-ask)؛ (۳) rtk — فشرده‌سازیِ خروجی، اختیاری با `init --rtk` (فعال).
 
 **راه‌اندازی (سه قدم):**
 1. `cargo install --path crates/aibridge` (یک‌بار، تا `aibridge` روی PATH باشد).
@@ -204,6 +218,10 @@ reviewها را کم می‌کند. جانشینِ نسل‌چهارِ codex-pee
 **استفاده‌ی روزمره:**
 - **خودکار:** هیچی نمی‌گویی؛ آخرِ هر تسک، گیت دیف را به Codex می‌دهد و اگر ایراد
   بود Claude را برمی‌گرداند (بدونِ سقف؛ فقط در بن‌بست/خطا از تو می‌پرسد).
+  ریویو با `xhigh` اجرا می‌شود — دقیق ولی **چند دقیقه‌ای** (تایم‌اوتِ سخاوتمندانه
+  که همیشه کامل می‌شود، نه برشِ کیفیت). فقط تغییرِ **کامیت‌نشدهٔ** زیرشاخهٔ پروژه
+  ریویو می‌شود، پس **مرتب کامیت کن** تا ریویوها کوچک و چندثانیه‌ای بمانند. تنظیم با
+  `REVIEW_REASONING_EFFORT`.
 - **on-demand:** «یه نظر دوم از کدکس بگیر» → `consult`؛ «این رو با کدکس review کن»
   → `review_diff`.
 
