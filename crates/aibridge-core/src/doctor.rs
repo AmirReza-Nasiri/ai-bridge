@@ -395,10 +395,11 @@ fn spawned_context(project: &Path) -> Check {
 fn e2e_roundtrip(project: &Path) -> Check {
     let cwd = project.display().to_string();
     let result = crate::codex::CodexPeer::spawn().and_then(|mut p| {
-        p.ask(
+        p.open_thread(
             "Reply with exactly this token and nothing else: AIBRIDGE_FULL_OK",
             &cwd,
         )
+        .map(|(_thread_id, text)| text)
     });
     match result {
         Ok(r) if r.contains("AIBRIDGE_FULL_OK") => check(

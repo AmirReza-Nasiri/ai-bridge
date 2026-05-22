@@ -34,8 +34,9 @@ pub const NO_PROGRESS_THRESHOLD: u32 = 2;
 pub fn prompt(diff_bundle: &str) -> String {
     format!(
         "You are AI Bridge's Stop-gate peer reviewer.\n\
-         Review ONLY the current uncommitted changes below. Treat earlier conversation as \
-         context, not as evidence of the current code state.\n\n\
+         Review ONLY the current uncommitted changes below. Any earlier turns in this \
+         conversation reviewed DIFFERENT, now-superseded diffs — do NOT carry their findings or \
+         assumptions into this review; judge strictly the changes shown here.\n\n\
          Write:\n\
          1. FINDINGS: if no blocking issues, write \"No blocking findings.\"; otherwise list \
          concise, actionable findings with path/line where possible.\n\

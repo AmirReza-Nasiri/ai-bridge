@@ -6,6 +6,24 @@ versioning is semver.
 
 ## [Unreleased]
 
+### Added
+
+- **Continuous, topic-based `consult` + isolated review gate (Phase 1).** `consult`
+  now takes an optional `topic` (+ `reset`): each stable kebab-case topic is its
+  own warm, isolated Codex conversation that continues across calls (a real
+  multi-round dialogue, not single-shot); a blank topic uses a shared `scratch`
+  channel. The Stop-gate and `review_diff` now run on a RESERVED review thread,
+  kept isolated from consult topics so review reasoning can't be cross-contaminated
+  (the "context bleed" a 2-round Codex dialogue flagged). Implementation: `CodexPeer`
+  is multi-thread (`open_thread`/`reply`); the server keeps a `topic→threadId`
+  registry for the current child (cleared on every respawn — codex threadIds don't
+  survive a restart, verified); topic names are validated (reject vague/hash-shaped);
+  the review thread auto-resets every 10 reviews (shared bound across the gate AND
+  `review_diff`, Codex-reviewed) to bound anchoring while keeping warm-cache speed.
+  Verified live: two named consult topics stayed isolated end-to-end (warm recalls
+  ~5s) and the gate still blocks real bugs on its reserved thread. Cross-session
+  persistence + per-task gate threads remain future work.
+
 ### Fixed
 
 - **Review gate no longer hangs under the VS Code MCP host (Codex R34 + R35).**

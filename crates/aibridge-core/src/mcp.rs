@@ -15,12 +15,37 @@ enum Handled {
     Notification,
 }
 
-/// Holds the warm Codex peer + per-(workspace,session) gate state across requests.
+/// Which conversation thread a call uses. Reviews (the Stop-gate + on-demand
+/// `review_diff`) share a reserved thread, kept ISOLATED from consult topics so
+/// review reasoning is never contaminated by consult context (or vice versa).
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum TopicKey {
+    /// The reserved review thread (Stop-gate + `review_diff`).
+    Gate,
+    /// A named, isolated consult dialogue.
+    Consult(String),
+}
+
+/// Cap on simultaneously-tracked consult topics so a long session can't grow the
+/// registry without bound. (The gate slot is separate and never evicted here.)
+const MAX_CONSULT_TOPICS: usize = 32;
+
+/// Reset the reserved review thread after this many reviews — bounds anchoring on
+/// stale prior-diff findings while keeping warm-cache speed in between.
+const GATE_RESET_EVERY: u32 = 10;
+
+/// Holds the warm Codex child + a topic→threadId registry + per-(workspace,session)
+/// gate state. ONE child hosts many ISOLATED threads (verified: distinct threadIds
+/// don't leak into each other).
 struct Server {
     codex: Option<CodexPeer>,
-    /// A Codex peer being warmed in the background (see `spawn_warming`). Adopted
-    /// by `peer()` the moment it's ready so the first review is a fast cached reply.
-    warm_rx: Option<std::sync::mpsc::Receiver<CodexPeer>>,
+    /// A Codex child warmed in the background (see `spawn_warming`), arriving with
+    /// a pre-opened gate thread so the first review is warm. Adopted lazily.
+    warm_rx: Option<std::sync::mpsc::Receiver<(CodexPeer, String)>>,
+    /// topic → threadId for the CURRENT child ONLY (codex threadIds do not survive
+    /// a child restart, so this is cleared on every (re)spawn).
+    threads: HashMap<TopicKey, String>,
+    gate_reviews: u32,
     gates: HashMap<String, gate::GateState>,
 }
 
@@ -29,43 +54,121 @@ impl Server {
         Server {
             codex: None,
             warm_rx: None,
+            threads: HashMap::new(),
+            gate_reviews: 0,
             gates: HashMap::new(),
         }
     }
 
-    fn peer(&mut self) -> anyhow::Result<&mut CodexPeer> {
-        if self.codex.is_none() {
-            // One-shot: consume the warming receiver on first use. If the
-            // background warm-up has finished, adopt that peer so the first review
-            // is a fast cached `codex-reply`. If it isn't ready, dropping the
-            // receiver here lets the warming thread's peer self-clean (its `send`
-            // fails on the closed channel and the child is killed via Drop), so we
-            // never leak a second idle Codex; we then cold-spawn a fresh peer.
-            if let Some(rx) = self.warm_rx.take() {
-                if let Ok(peer) = rx.try_recv() {
-                    self.codex = Some(peer);
+    /// Ensure a live Codex child, preferring the background-warmed one (which
+    /// arrives with a pre-warmed gate thread). Invariant: `self.threads` only ever
+    /// holds threadIds for the CURRENT child, so it is cleared on every (re)spawn.
+    fn ensure_peer(&mut self) -> anyhow::Result<()> {
+        if self.codex.is_some() {
+            return Ok(());
+        }
+        // One-shot: consume the warming receiver. If ready, adopt the warmed child
+        // + register its pre-opened gate thread. If not, dropping the rx lets the
+        // warming child self-clean (its `send` fails on the closed channel) — no
+        // leak — and we cold-spawn instead.
+        if let Some(rx) = self.warm_rx.take() {
+            if let Ok((peer, gate_tid)) = rx.try_recv() {
+                self.codex = Some(peer);
+                self.threads.clear();
+                self.threads.insert(TopicKey::Gate, gate_tid);
+                return Ok(());
+            }
+        }
+        self.codex = Some(CodexPeer::spawn()?);
+        self.threads.clear();
+        Ok(())
+    }
+
+    /// Drop the child + all its (now-dead) thread mappings so the next call spawns
+    /// fresh. A timed-out/wedged child must never be reused — its stdin may no
+    /// longer drain, and the next (synchronous, unbounded) write would then hang.
+    fn invalidate_peer(&mut self) {
+        self.codex = None;
+        self.threads.clear();
+    }
+
+    /// Ask Codex on `key`'s thread: continue it if known (warm `codex-reply`) or
+    /// open a fresh one. A transport error invalidates the peer and propagates; a
+    /// stale thread ("Session not found") transparently reopens.
+    fn ask_topic(&mut self, key: TopicKey, prompt: &str, cwd: &str) -> anyhow::Result<String> {
+        self.ensure_peer()?;
+        if let Some(tid) = self.threads.get(&key).cloned() {
+            let reply = {
+                let peer = self
+                    .codex
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("codex peer unavailable"))?;
+                peer.reply(&tid, prompt)
+            };
+            match reply {
+                Ok(text) if !is_session_lost(&text) => return Ok(text),
+                Ok(_) => {
+                    self.threads.remove(&key); // stale thread → reopen below
+                }
+                Err(e) => {
+                    self.invalidate_peer();
+                    return Err(e);
                 }
             }
         }
-        if self.codex.is_none() {
-            self.codex = Some(CodexPeer::spawn()?);
+        self.ensure_peer()?;
+        let opened = {
+            let peer = self
+                .codex
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("codex peer unavailable"))?;
+            peer.open_thread(prompt, cwd)
+        };
+        match opened {
+            Ok((tid, text)) => {
+                if matches!(key, TopicKey::Consult(_)) {
+                    self.evict_consult_if_full();
+                }
+                self.threads.insert(key, tid);
+                Ok(text)
+            }
+            Err(e) => {
+                self.invalidate_peer();
+                Err(e)
+            }
         }
-        self.codex
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("codex peer unavailable"))
     }
 
-    /// Ask the warm peer, spawning it on first use. On ANY error the peer is
-    /// dropped so the next call starts a fresh child: a timed-out or wedged child
-    /// must never be reused — its stdin may no longer drain, and the next
-    /// (synchronous, unbounded) `write_msg` would then block forever, recreating
-    /// the very hang the read deadlines were added to prevent.
-    fn ask_peer(&mut self, prompt: &str, cwd: &str) -> anyhow::Result<String> {
-        let result = self.peer().and_then(|peer| peer.ask(prompt, cwd));
-        if result.is_err() {
-            self.codex = None;
+    /// Apply the periodic anti-anchoring reset of the reserved Gate thread. MUST be
+    /// called before EVERY review on the Gate thread — both the automatic Stop gate
+    /// AND manual `review_diff` — so the bound holds across both (otherwise a run of
+    /// manual reviews would anchor the very thread the Stop gate later reuses).
+    fn tick_gate_reset(&mut self) {
+        self.gate_reviews += 1;
+        if self.gate_reviews >= GATE_RESET_EVERY {
+            self.threads.remove(&TopicKey::Gate);
+            self.gate_reviews = 0;
         }
-        result
+    }
+
+    /// Keep the consult-topic count bounded (drops one tracked topic when full;
+    /// that topic simply reopens cold next time it's used). Gate slot is exempt.
+    fn evict_consult_if_full(&mut self) {
+        let count = self
+            .threads
+            .keys()
+            .filter(|k| matches!(k, TopicKey::Consult(_)))
+            .count();
+        if count >= MAX_CONSULT_TOPICS {
+            if let Some(victim) = self
+                .threads
+                .keys()
+                .find(|k| matches!(k, TopicKey::Consult(_)))
+                .cloned()
+            {
+                self.threads.remove(&victim);
+            }
+        }
     }
 
     fn handle(&mut self, method: &str, msg: &Value) -> Handled {
@@ -94,15 +197,24 @@ impl Server {
                 "AI Bridge: no active review budget state yet (foundation).".to_string()
             }
             "consult" => {
-                let question = msg
-                    .pointer("/params/arguments/question")
+                let args = msg.pointer("/params/arguments");
+                let question = args
+                    .and_then(|a| a.get("question"))
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .trim();
+                let topic = args
+                    .and_then(|a| a.get("topic"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let reset = args
+                    .and_then(|a| a.get("reset"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
                 if question.is_empty() {
                     "AI Bridge: `consult` requires a non-empty 'question' argument.".to_string()
                 } else {
-                    self.consult(question)
+                    self.consult(question, topic, reset)
                 }
             }
             "review_diff" => self.review_diff(),
@@ -112,16 +224,28 @@ impl Server {
         json!({ "content": [{ "type": "text", "text": text }] })
     }
 
-    fn consult(&mut self, question: &str) -> String {
+    /// On-demand second opinion on an isolated, named topic thread (continuous
+    /// across calls in this session). Omitted/blank topic → shared `scratch`.
+    fn consult(&mut self, question: &str, topic: &str, reset: bool) -> String {
         let cwd = std::env::current_dir()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| ".".to_string());
+        let topic = match normalize_topic(topic) {
+            Ok(t) => t,
+            Err(e) => return format!("AI Bridge: invalid consult topic — {e}"),
+        };
+        let key = TopicKey::Consult(topic.clone());
+        if reset {
+            self.threads.remove(&key); // start this topic cold again
+        }
         let prompt = format!(
             "You are a peer reviewer giving a concise, skeptical second opinion. \
              Be specific and call out risks. Question:\n{question}"
         );
-        match self.ask_peer(&prompt, &cwd) {
-            Ok(reply) if !reply.trim().is_empty() => reply,
+        match self.ask_topic(key, &prompt, &cwd) {
+            Ok(reply) if !reply.trim().is_empty() => {
+                format!("{reply}\n\n— AI Bridge consult (topic: {topic})")
+            }
             Ok(_) => "AI Bridge: Codex returned an empty reply.".to_string(),
             Err(e) => format!(
                 "AI Bridge: consult unavailable (Codex error): {e}. \
@@ -147,7 +271,10 @@ impl Server {
              edge cases, and missing tests; cite file/line; if it looks good, say so \
              briefly.\n\n```diff\n{diff}\n```"
         );
-        match self.ask_peer(&prompt, &cwd) {
+        // On-demand review shares the reserved review thread (isolated from consults)
+        // and counts toward the same anti-anchoring reset bound as the Stop gate.
+        self.tick_gate_reset();
+        match self.ask_topic(TopicKey::Gate, &prompt, &cwd) {
             Ok(reply) if !reply.trim().is_empty() => reply,
             Ok(_) => "AI Bridge: Codex returned an empty review.".to_string(),
             Err(e) => format!(
@@ -242,29 +369,36 @@ impl Server {
         }
 
         let prompt = gate::prompt(&bundle.text);
-        // Log how the peer is launched (this also spawns/adopts it). `is_warm()`
-        // is meaningful here only because `spawn_warming` primes the conversation
-        // before handing the peer over, so an adopted peer already has a thread id.
-        if let Ok(peer) = self.peer() {
-            log_gate(
-                cwd,
-                &format!(
-                    "calling Codex [{}, {}] {}",
-                    peer.spawn_kind(),
-                    if peer.is_warm() { "warm" } else { "cold" },
-                    peer.spawn_program()
-                ),
+        // Periodic anti-anchoring reset of the reserved review thread (shared bound
+        // with manual review_diff; warm-cache speed is kept for the runs between).
+        self.tick_gate_reset();
+        // Ensure the child (also adopts the warmed one) so we can log how it launched.
+        if let Err(e) = self.ensure_peer() {
+            log_gate(cwd, &format!("Codex review FAILED: {e}"));
+            return self.fail_ask(
+                st,
+                dh,
+                "peer review couldn't run (Codex unavailable, timed out, or quota exhausted)",
             );
         }
-        // Delegate the call AND poisoned-peer invalidation to the single owner.
-        let review = match self.ask_peer(&prompt, cwd) {
+        let warm = self.threads.contains_key(&TopicKey::Gate);
+        let kind = self.codex.as_ref().map(|p| p.spawn_kind()).unwrap_or("?");
+        log_gate(
+            cwd,
+            &format!(
+                "calling Codex [{kind}, {}]",
+                if warm { "warm" } else { "cold" }
+            ),
+        );
+        // ask_topic owns peer-invalidation on transport error.
+        let review = match self.ask_topic(TopicKey::Gate, &prompt, cwd) {
             Ok(r) => {
                 log_gate(cwd, "Codex review returned");
                 r
             }
             Err(e) => {
                 // Log the real cause (timeout / EOF / quota) for diagnosis; keep
-                // the user-facing reason short. `ask_peer` already dropped the peer.
+                // the user-facing reason short. `ask_topic` already dropped the peer.
                 log_gate(cwd, &format!("Codex review FAILED: {e}"));
                 return self.fail_ask(
                     st,
@@ -324,6 +458,50 @@ impl Server {
              allowed so you can deliver that question."
         ))
     }
+}
+
+/// True when a `codex-reply` came back as a stale-thread notice rather than a real
+/// reply. Codex returns this as normal result TEXT (not a JSON-RPC error) when the
+/// threadId is unknown to the current child (e.g. after a restart).
+fn is_session_lost(text: &str) -> bool {
+    let t = text.trim_start();
+    t.starts_with("Session not found") || t.contains("Session not found for thread_id")
+}
+
+/// Normalize + validate a consult topic. Blank → the shared `scratch` channel.
+/// Otherwise enforce a stable, semantic kebab-case name (mirrors the predecessor's
+/// rules) so Claude can't fragment or collide topics with vague/auto-generated ids.
+fn normalize_topic(raw: &str) -> Result<String, String> {
+    let t = raw.trim().to_lowercase();
+    if t.is_empty() {
+        return Ok("scratch".to_string());
+    }
+    if t.len() < 3 || t.len() > 64 {
+        return Err("topic length must be 3..64 characters".to_string());
+    }
+    if !t
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        return Err("topic must be kebab-case (a-z, 0-9, '-')".to_string());
+    }
+    if t.starts_with('-') || t.ends_with('-') || t.contains("--") {
+        return Err("topic must not start/end with '-' or contain '--'".to_string());
+    }
+    // Reject hash-shaped ids (long all-hex) — they aren't semantic.
+    if t.len() >= 12 && t.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+        return Err("topic looks hash-shaped; use a semantic name".to_string());
+    }
+    const VAGUE: &[&str] = &[
+        "review", "fix", "task", "default", "misc", "temp", "tmp", "test", "stuff", "work", "todo",
+        "scratch",
+    ];
+    if VAGUE.contains(&t.as_str()) {
+        return Err(format!(
+            "topic '{t}' is too vague; use a specific kebab-case name like repo-feature-phase"
+        ));
+    }
+    Ok(t)
 }
 
 /// Allow decision (let Claude finish).
@@ -442,29 +620,28 @@ fn truncate_for_review(diff: &str) -> String {
     }
 }
 
-/// Warm a Codex peer in the background so the first real review is a fast cached
-/// `codex-reply` instead of a slow cold `codex` turn (measured ~2.3x faster; a
-/// cold turn on a large diff can exceed the Stop-hook timeout). Best-effort: the
-/// gate falls back to a lazy spawn if this isn't ready in time. One tiny cold
-/// call per server start pays the system-prompt cost once, off the review path.
-fn spawn_warming() -> std::sync::mpsc::Receiver<CodexPeer> {
+/// Primer for the reserved review thread: a tiny cold turn that establishes the
+/// reviewer conversation and caches Codex's system prompt, so the first real
+/// review is a fast `codex-reply` (measured ~2.3x faster; a cold turn on a large
+/// diff can exceed the Stop-hook timeout).
+const GATE_PRIMER: &str =
+    "You are AI Bridge's strict code reviewer for this project. Each turn supplies \
+     its own diff to review. Reply with the single token READY.";
+
+/// Warm a Codex child in the background and pre-open the reserved GATE thread, so
+/// the first review is warm. Hands back `(child, gate_threadId)`. Best-effort: the
+/// gate cold-spawns lazily if this isn't ready in time. One tiny cold call per
+/// server start pays the system-prompt cost once, off the review path.
+fn spawn_warming() -> std::sync::mpsc::Receiver<(CodexPeer, String)> {
     let (tx, rx) = std::sync::mpsc::channel();
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| ".".to_string());
     std::thread::spawn(move || {
         if let Ok(mut peer) = CodexPeer::spawn() {
-            // A tiny first turn establishes the conversation and caches the system
-            // prompt; subsequent reviews reuse it. Only hand over a peer that
-            // actually warmed (an errored one is dropped here).
-            if peer
-                .ask(
-                    "You are AI Bridge's peer reviewer. Reply with the single token READY.",
-                    &cwd,
-                )
-                .is_ok()
-            {
-                let _ = tx.send(peer);
+            // Only hand over a child whose gate thread actually opened.
+            if let Ok((gate_tid, _)) = peer.open_thread(GATE_PRIMER, &cwd) {
+                let _ = tx.send((peer, gate_tid));
             }
         }
     });
@@ -527,10 +704,15 @@ fn tools() -> Value {
         tool_with(
             "consult",
             "Ask AI Bridge/Codex for a read-only second opinion on a plan, design, bug, or \
-             tradeoff. Does not gate final output.",
+             tradeoff. Does not gate final output. Pass a stable `topic` to keep a continuous, \
+             isolated dialogue across calls — reuse the SAME topic for follow-ups on one subject.",
             json!({
                 "type": "object",
-                "properties": { "question": { "type": "string", "description": "What to ask the Codex peer." } },
+                "properties": {
+                    "question": { "type": "string", "description": "What to ask the Codex peer." },
+                    "topic": { "type": "string", "description": "Stable kebab-case dialogue topic for this subject (e.g. 'repo-feature-phase'). Reuse it for follow-ups so Codex keeps context. Omit for a one-off (shared 'scratch' channel)." },
+                    "reset": { "type": "boolean", "description": "Start this topic fresh, discarding prior turns." }
+                },
                 "required": ["question"]
             })
         ),
@@ -560,4 +742,61 @@ fn tools() -> Value {
 
 fn tool_with(name: &str, description: &str, input_schema: Value) -> Value {
     json!({ "name": name, "description": description, "inputSchema": input_schema })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blank_topic_defaults_to_scratch() {
+        assert_eq!(normalize_topic("").unwrap(), "scratch");
+        assert_eq!(normalize_topic("   ").unwrap(), "scratch");
+    }
+
+    #[test]
+    fn accepts_semantic_kebab_topics() {
+        assert_eq!(
+            normalize_topic("VoiceTyper-history-fix").unwrap(),
+            "voicetyper-history-fix"
+        );
+        assert_eq!(
+            normalize_topic("repo-feature-phase").unwrap(),
+            "repo-feature-phase"
+        );
+    }
+
+    #[test]
+    fn rejects_vague_hash_and_malformed_topics() {
+        assert!(normalize_topic("fix").is_err()); // vague
+        assert!(normalize_topic("review").is_err()); // vague
+        assert!(normalize_topic("a").is_err()); // too short
+        assert!(normalize_topic("has space").is_err()); // not kebab
+        assert!(normalize_topic("snake_case_topic").is_err()); // underscore not allowed
+        assert!(normalize_topic("-leading").is_err());
+        assert!(normalize_topic("double--dash").is_err());
+        assert!(normalize_topic("deadbeefcafe123").is_err()); // hash-shaped
+    }
+
+    #[test]
+    fn detects_stale_thread_notice() {
+        assert!(is_session_lost(
+            "Session not found for thread_id: 019e5051-9606-7870"
+        ));
+        assert!(is_session_lost("  Session not found"));
+        assert!(!is_session_lost(
+            "secret-alpha = LION; I do not know secret-beta."
+        ));
+    }
+
+    #[test]
+    fn topic_keys_are_distinct() {
+        use std::collections::HashSet;
+        let mut s = HashSet::new();
+        s.insert(TopicKey::Gate);
+        s.insert(TopicKey::Consult("alpha-x".into()));
+        s.insert(TopicKey::Consult("beta-y".into()));
+        s.insert(TopicKey::Consult("alpha-x".into())); // dup
+        assert_eq!(s.len(), 3);
+    }
 }

@@ -52,13 +52,15 @@ enum FromCodex {
     Eof,
 }
 
-/// A warm, reusable connection to a `codex mcp-server` child process.
+/// A warm, reusable connection to a `codex mcp-server` child process. One child
+/// can host MANY isolated conversation threads (verified: distinct `threadId`s
+/// stay isolated); the caller (`Server`) maps topics → threadIds and uses
+/// [`CodexPeer::open_thread`] / [`CodexPeer::reply`].
 pub struct CodexPeer {
     child: Child,
     stdin: ChildStdin,
     rx: Receiver<FromCodex>,
     next_id: i64,
-    thread_id: Option<String>,
     spawn_kind: &'static str,
     spawn_program: String,
 }
@@ -141,7 +143,6 @@ impl CodexPeer {
             stdin,
             rx,
             next_id: 1,
-            thread_id: None,
             spawn_kind,
             spawn_program,
         };
@@ -157,12 +158,6 @@ impl CodexPeer {
     /// The resolved launch line, for diagnostics/logging.
     pub fn spawn_program(&self) -> &str {
         &self.spawn_program
-    }
-
-    /// True once a conversation is established, so the next call reuses Codex's
-    /// prompt cache via `codex-reply` (warm) instead of a cold `codex` turn.
-    pub fn is_warm(&self) -> bool {
-        self.thread_id.is_some()
     }
 
     fn initialize(&mut self) -> Result<()> {
@@ -248,48 +243,47 @@ impl CodexPeer {
         }
     }
 
-    /// Send a prompt to the warm peer and return its text reply. Uses `codex`
-    /// for the first turn (capturing the conversation id) and `codex-reply`
-    /// afterwards for cache reuse.
-    pub fn ask(&mut self, prompt: &str, cwd: &str) -> Result<String> {
-        let result = match self.thread_id.clone() {
-            Some(thread_id) => self.request(
-                "tools/call",
-                json!({
-                    "name": "codex-reply",
-                    "arguments": { "threadId": thread_id, "prompt": prompt }
-                }),
-                CALL_TIMEOUT,
-            )?,
-            None => {
-                let result = self.request(
-                    "tools/call",
-                    json!({
-                        "name": "codex",
-                        "arguments": {
-                            "prompt": prompt,
-                            "sandbox": "read-only",
-                            "approval-policy": "never",
-                            "cwd": cwd,
-                            // Pin reasoning effort for THIS session only (it
-                            // persists to later codex-reply turns), independent of
-                            // the user's global ~/.codex/config.toml. See
-                            // REVIEW_REASONING_EFFORT for the quality/latency tradeoff.
-                            "config": { "model_reasoning_effort": REVIEW_REASONING_EFFORT }
-                        }
-                    }),
-                    CALL_TIMEOUT,
-                )?;
-                if let Some(tid) = result
-                    .pointer("/structuredContent/threadId")
-                    .or_else(|| result.pointer("/structuredContent/conversationId"))
-                    .and_then(Value::as_str)
-                {
-                    self.thread_id = Some(tid.to_string());
+    /// Open a NEW conversation thread (a cold `codex` turn) and return its
+    /// `threadId` plus the reply text. Reasoning effort is pinned for this thread
+    /// (it persists to later `reply` turns), independent of the user's global
+    /// `~/.codex/config.toml`. See [`REVIEW_REASONING_EFFORT`].
+    pub fn open_thread(&mut self, prompt: &str, cwd: &str) -> Result<(String, String)> {
+        let result = self.request(
+            "tools/call",
+            json!({
+                "name": "codex",
+                "arguments": {
+                    "prompt": prompt,
+                    "sandbox": "read-only",
+                    "approval-policy": "never",
+                    "cwd": cwd,
+                    "config": { "model_reasoning_effort": REVIEW_REASONING_EFFORT }
                 }
-                result
-            }
-        };
+            }),
+            CALL_TIMEOUT,
+        )?;
+        let thread_id = result
+            .pointer("/structuredContent/threadId")
+            .or_else(|| result.pointer("/structuredContent/conversationId"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("codex did not return a threadId"))?
+            .to_string();
+        Ok((thread_id, extract_text(&result)))
+    }
+
+    /// Continue an existing thread via `codex-reply` (warm: reuses Codex's prompt
+    /// cache for that conversation). NOTE: if `thread_id` is stale (e.g. the child
+    /// restarted), Codex returns a normal result whose TEXT is "Session not found
+    /// for thread_id: …" rather than a JSON-RPC error — the caller detects that.
+    pub fn reply(&mut self, thread_id: &str, prompt: &str) -> Result<String> {
+        let result = self.request(
+            "tools/call",
+            json!({
+                "name": "codex-reply",
+                "arguments": { "threadId": thread_id, "prompt": prompt }
+            }),
+            CALL_TIMEOUT,
+        )?;
         Ok(extract_text(&result))
     }
 }
