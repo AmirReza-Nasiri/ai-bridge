@@ -254,11 +254,11 @@ impl Server {
         json!({ "content": [{ "type": "text", "text": text }] })
     }
 
-    /// On-demand second opinion on an isolated, named topic thread. Continuous
-    /// across calls AND across sessions: a named topic's turns are persisted, so
-    /// resuming it after a Claude restart replays recent context (codex threadIds
-    /// don't survive a restart). Omitted/blank topic → ephemeral shared `scratch`
-    /// (not persisted). `reset` archives the topic and starts cold.
+    /// On-demand second opinion on an isolated, named topic thread. A topic is
+    /// REQUIRED. Continuous across calls AND across sessions: every topic's turns
+    /// are persisted, so resuming it after a Claude restart replays recent context
+    /// (codex threadIds don't survive a restart). `reset` archives the topic and
+    /// starts cold.
     fn consult(&mut self, question: &str, topic: &str, reset: bool) -> String {
         let cwd = std::env::current_dir()
             .map(|p| p.display().to_string())
@@ -268,12 +268,9 @@ impl Server {
             Err(e) => return format!("AI Bridge: invalid consult topic — {e}"),
         };
         let key = TopicKey::Consult(topic.clone());
-        let persisted = topic != "scratch";
         if reset {
             self.threads.remove(&key);
-            if persisted {
-                crate::topics::archive(&cwd, &topic); // keep history, start cold
-            }
+            crate::topics::archive(&cwd, &topic); // keep history, start cold
         }
         let base = "You are a peer reviewer giving a concise, skeptical second opinion. \
                     Be specific and call out risks.";
@@ -284,8 +281,7 @@ impl Server {
         // topic-correct recall), but that ambient context still rides along. If a
         // codex `--no-resume`/`--fresh` option appears, pass it in `open_thread`
         // to drop the ambient injection entirely.
-        let resuming =
-            persisted && !self.threads.contains_key(&key) && crate::topics::exists(&cwd, &topic);
+        let resuming = !self.threads.contains_key(&key) && crate::topics::exists(&cwd, &topic);
         let prompt = if resuming {
             let replay = crate::topics::replay(&cwd, &topic, crate::topics::REPLAY_BUDGET);
             format!(
@@ -297,10 +293,8 @@ impl Server {
         };
         match self.ask_topic(key, &prompt, &cwd) {
             Ok(reply) if !reply.trim().is_empty() => {
-                if persisted {
-                    // Persist the RAW question + reply (not the seeded prompt).
-                    crate::topics::append_turn(&cwd, &topic, question, &reply);
-                }
+                // Persist the RAW question + reply (not the seeded prompt).
+                crate::topics::append_turn(&cwd, &topic, question, &reply);
                 format!("{reply}\n\n— AI Bridge consult (topic: {topic})")
             }
             Ok(_) => "AI Bridge: Codex returned an empty reply.".to_string(),
@@ -615,13 +609,19 @@ fn is_session_lost(text: &str) -> bool {
     t.starts_with("Session not found") || t.contains("Session not found for thread_id")
 }
 
-/// Normalize + validate a consult topic. Blank → the shared `scratch` channel.
-/// Otherwise enforce a stable, semantic kebab-case name (mirrors the predecessor's
-/// rules) so Claude can't fragment or collide topics with vague/auto-generated ids.
+/// Normalize + validate a consult topic. A topic is REQUIRED (blank is rejected) —
+/// there is no anonymous fallback channel: every consult is a stable, isolated,
+/// persisted dialogue so context is never mixed across unrelated subjects. Enforces
+/// a semantic kebab-case name (mirrors the predecessor's rules) so Claude can't
+/// fragment or collide topics with vague/auto-generated ids.
 fn normalize_topic(raw: &str) -> Result<String, String> {
     let t = raw.trim().to_lowercase();
     if t.is_empty() {
-        return Ok("scratch".to_string());
+        return Err(
+            "a 'topic' is required — pass a stable kebab-case name like repo-feature-phase \
+             (each topic is an isolated, persisted dialogue)"
+                .to_string(),
+        );
     }
     if t.len() < 3 || t.len() > 64 {
         return Err("topic length must be 3..64 characters".to_string());
@@ -835,8 +835,22 @@ fn run_command(command: &str) -> String {
     #[cfg(windows)]
     let mut cmd = {
         let mut c = Command::new("cmd");
-        c.arg("/C").arg(command);
         use std::os::windows::process::CommandExt;
+        // `raw_arg`, NOT `arg`: `Command::arg` applies MSVCRT quoting (wraps in
+        // `"..."` and escapes embedded quotes as `\"`), which `cmd.exe` does not
+        // understand — so a command containing a quoted path with spaces (e.g.
+        // `node --check "d:\Cursor Projects\…"`) gets split at the first space.
+        //
+        // `/D /S /C "<command>"` is the robust form: `/D` skips AutoRun registry
+        // hooks; `/S` + our own outer quote pair makes cmd strip ONLY that outer
+        // pair and pass the command through verbatim — so it survives even when the
+        // command itself starts with a quoted exe path AND has quoted args (e.g.
+        // `"C:\Program Files\nodejs\node.exe" "C:\a b\x.js"`), which a bare `/C`
+        // would mangle via cmd's first/last-quote stripping rule.
+        c.raw_arg("/D")
+            .raw_arg("/S")
+            .raw_arg("/C")
+            .raw_arg(format!("\"{command}\""));
         c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
         c
     };
@@ -1154,16 +1168,17 @@ fn tools() -> Value {
         tool_with(
             "consult",
             "Ask AI Bridge/Codex for a read-only second opinion on a plan, design, bug, or \
-             tradeoff. Does not gate final output. Pass a stable `topic` to keep a continuous, \
-             isolated dialogue across calls — reuse the SAME topic for follow-ups on one subject.",
+             tradeoff. Does not gate final output. A stable `topic` is REQUIRED: each topic is a \
+             continuous, isolated, persisted dialogue — reuse the SAME topic for every follow-up \
+             on one subject so Codex keeps context (there is no anonymous channel).",
             json!({
                 "type": "object",
                 "properties": {
                     "question": { "type": "string", "description": "What to ask the Codex peer." },
-                    "topic": { "type": "string", "description": "Stable kebab-case dialogue topic for this subject (e.g. 'repo-feature-phase'). Reuse it for follow-ups so Codex keeps context. Omit for a one-off (shared 'scratch' channel)." },
+                    "topic": { "type": "string", "description": "REQUIRED. Stable kebab-case dialogue topic for this subject (e.g. 'repo-feature-phase'). Reuse the same topic for every follow-up so Codex keeps context across calls and sessions." },
                     "reset": { "type": "boolean", "description": "Start this topic fresh, discarding prior turns." }
                 },
-                "required": ["question"]
+                "required": ["question", "topic"]
             })
         ),
         tool_with(
@@ -1226,9 +1241,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn blank_topic_defaults_to_scratch() {
-        assert_eq!(normalize_topic("").unwrap(), "scratch");
-        assert_eq!(normalize_topic("   ").unwrap(), "scratch");
+    fn blank_topic_rejected() {
+        // A topic is mandatory now — there is no anonymous/scratch fallback.
+        assert!(normalize_topic("").is_err());
+        assert!(normalize_topic("   ").is_err());
+    }
+
+    // Guards the Windows `run` bug: a command containing a quoted path with spaces
+    // must survive `cmd /D /S /C` quoting (it was mangled by the old `arg` form).
+    #[cfg(windows)]
+    #[test]
+    fn run_command_handles_quoted_paths_with_spaces() {
+        use std::io::Write as _;
+        let dir = std::env::temp_dir().join(format!("ai bridge run test {}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("hello file.txt");
+        std::fs::File::create(&file)
+            .unwrap()
+            .write_all(b"QUOTED_SPACE_OK\n")
+            .unwrap();
+        // `type` is a cmd builtin; the absolute path has spaces in both the dir and
+        // the filename, so it only succeeds if the quotes reach cmd intact.
+        let out = run_command(&format!("type \"{}\"", file.display()));
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(out.contains("exit 0"), "expected exit 0, got:\n{out}");
+        assert!(
+            out.contains("QUOTED_SPACE_OK"),
+            "quoted space-path was mangled; output:\n{out}"
+        );
     }
 
     #[test]
@@ -1256,7 +1296,7 @@ mod tests {
         assert!(normalize_topic("con").is_err()); // Windows reserved
         assert!(normalize_topic("com1").is_err()); // Windows reserved
         assert!(normalize_topic("nul").is_err()); // Windows reserved
-        assert!(normalize_topic("scratch").is_err()); // internal-only sentinel
+        assert!(normalize_topic("scratch").is_err()); // too vague a name
                                                       // a reserved name as a SUBSTRING is fine (only the exact base is reserved)
         assert!(normalize_topic("con-figuration").is_ok());
     }

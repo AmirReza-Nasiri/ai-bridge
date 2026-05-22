@@ -123,7 +123,7 @@ loops forever.
 **On demand (plain language).** Just ask Claude; it routes to the MCP tools:
 
 - *"get a second opinion from Codex"* / *"what does Codex think?"* → **`consult`**
-  (add *"on topic `<name>`"* for a continuous dialogue that persists across sessions)
+  (always on a `topic <name>` — a continuous, isolated dialogue that persists across sessions)
 - *"review this with Codex"* / *"review before we ship"* → **`review_diff`**
 - *"have Codex implement / draft a patch for X"* → **`implement`** (returns a
   validated, untested patch to review + apply)

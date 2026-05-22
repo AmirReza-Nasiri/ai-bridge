@@ -6,6 +6,26 @@ versioning is semver.
 
 ## [Unreleased]
 
+### Changed
+
+- **`consult` now REQUIRES a `topic` — the anonymous `scratch` channel is removed.**
+  Previously an omitted/blank topic fell back to a shared, non-persisted `scratch`
+  thread that mixed unrelated subjects into one context (lower-quality, anchoring,
+  lost on restart). Every consult is now a stable, isolated, persisted dialogue;
+  a blank topic returns a clear "a 'topic' is required" error and the tool schema
+  marks `topic` required. Keeps the intelligence of continuous, context-preserving
+  dialogue as the only mode. (Codex-reviewed.)
+
+### Fixed
+
+- **`run` on Windows mangled commands containing quoted paths with spaces.**
+  `Command::new("cmd").arg("/C").arg(command)` applied MSVCRT quoting (escaping
+  embedded `"` as `\"`) that `cmd.exe` cannot parse, so a command like
+  `node --check "d:\Cursor Projects\…"` split at the first space. Now uses
+  `cmd /D /S /C "<command>"` via `raw_arg`, which passes the command through
+  verbatim and survives even a quoted-exe-path + quoted-args command. Guarded by a
+  Windows integration test. (Codex-reviewed: upgraded from a bare `/C` to `/D /S /C`.)
+
 ### Added
 
 - **`implement` + `run` tools (Phase 2 — standalone parity with codex-peer).**
