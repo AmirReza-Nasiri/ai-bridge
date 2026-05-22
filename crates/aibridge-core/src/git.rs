@@ -8,26 +8,6 @@ use std::path::Path;
 /// Cap on total untracked-file content pulled into a review bundle.
 const MAX_UNTRACKED_CHARS: usize = 8_000;
 
-/// Return the uncommitted diff for tracked files in `cwd` (`git diff HEAD`,
-/// with a `git diff` fallback when there is no `HEAD` yet).
-pub fn diff(cwd: &str) -> Result<String> {
-    let git = DefaultPlatform::find_executable("git").context("locating git")?;
-    let primary = DefaultPlatform::command_for(&git)
-        .args(["--no-pager", "diff", "HEAD"])
-        .current_dir(cwd)
-        .output()
-        .context("running `git diff HEAD`")?;
-    if primary.status.success() {
-        return Ok(String::from_utf8_lossy(&primary.stdout).into_owned());
-    }
-    let fallback = DefaultPlatform::command_for(&git)
-        .args(["--no-pager", "diff"])
-        .current_dir(cwd)
-        .output()
-        .context("running `git diff`")?;
-    Ok(String::from_utf8_lossy(&fallback.stdout).into_owned())
-}
-
 /// A normalized snapshot of all uncommitted change in a workspace, plus a hash
 /// for cheap change detection. Includes untracked files so brand-new-file bugs
 /// can't bypass the review gate.
@@ -88,16 +68,28 @@ pub fn diff_bundle(cwd: &str) -> Result<DiffBundle> {
     ]);
     let mut untracked = String::new();
     let mut budget = MAX_UNTRACKED_CHARS;
+    let mut truncated = false;
     for path in untracked_list.split('\0').filter(|s| !s.is_empty()) {
         if budget == 0 {
-            untracked.push_str("\n[untracked content truncated]");
+            // More untracked files remain but the budget is spent.
+            truncated = true;
             break;
         }
         if let Ok(content) = std::fs::read_to_string(Path::new(cwd).join(path)) {
+            let full_len = content.chars().count();
             let snippet: String = content.chars().take(budget).collect();
-            budget = budget.saturating_sub(snippet.chars().count());
+            let took = snippet.chars().count();
+            if took < full_len {
+                // THIS file was itself cut off — mark it even when it's the only one
+                // (the marker must not depend on a later iteration existing).
+                truncated = true;
+            }
+            budget -= took;
             untracked.push_str(&format!("\n--- untracked: {path} ---\n{snippet}\n"));
         }
+    }
+    if truncated {
+        untracked.push_str("\n[untracked content truncated]");
     }
 
     let is_empty =
@@ -115,4 +107,132 @@ pub fn diff_bundle(cwd: &str) -> Result<DiffBundle> {
         hash,
         is_empty,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let ok = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .expect("spawn git")
+            .success();
+        assert!(ok, "git {args:?} failed");
+    }
+
+    /// A throwaway git repo under the temp dir, removed on drop.
+    struct TempRepo(std::path::PathBuf);
+    impl Drop for TempRepo {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    // Monotonic per-process counter so concurrently-running tests (cargo's default)
+    // never collide on a temp-dir name — a same-nanosecond clash made this flaky.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn temp_repo() -> TempRepo {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "aibridge-git-test-{}-{nanos}-{seq}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"]);
+        git(&dir, &["config", "user.email", "t@t.t"]);
+        git(&dir, &["config", "user.name", "t"]);
+        // Establish HEAD so the staged/unstaged queries hit the normal path.
+        std::fs::write(dir.join("seed.txt"), "seed\n").unwrap();
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-qm", "init"]);
+        TempRepo(dir)
+    }
+
+    #[test]
+    fn clean_tree_is_empty() {
+        let repo = temp_repo();
+        let b = diff_bundle(repo.0.to_str().unwrap()).unwrap();
+        assert!(b.is_empty, "a clean tree must report empty");
+    }
+
+    #[test]
+    fn untracked_only_is_not_empty_and_included() {
+        // The regression this guards: a brand-new (untracked) file must be visible
+        // to the bundle, so on-demand `review_diff` (which now shares this path)
+        // can't report "nothing to review" while the gate would review it.
+        let repo = temp_repo();
+        std::fs::write(
+            repo.0.join("brand_new.rs"),
+            "fn boom() { let _x = nope; }\n",
+        )
+        .unwrap();
+        let b = diff_bundle(repo.0.to_str().unwrap()).unwrap();
+        assert!(!b.is_empty, "untracked-only change must not be empty");
+        assert!(
+            b.text.contains("brand_new.rs"),
+            "untracked path should appear"
+        );
+        assert!(b.text.contains("nope"), "untracked content should appear");
+    }
+
+    #[test]
+    fn ai_bridge_dir_is_excluded() {
+        // The gate's own trace dir must never churn the review/bundle.
+        let repo = temp_repo();
+        std::fs::create_dir_all(repo.0.join(".ai-bridge")).unwrap();
+        std::fs::write(repo.0.join(".ai-bridge/trace.txt"), "noise\n").unwrap();
+        let b = diff_bundle(repo.0.to_str().unwrap()).unwrap();
+        assert!(
+            b.is_empty,
+            ".ai-bridge-only change must be excluded → empty"
+        );
+        assert!(
+            !b.text.contains("trace.txt"),
+            ".ai-bridge content must not leak in"
+        );
+    }
+
+    #[test]
+    fn large_untracked_content_is_truncated() {
+        let repo = temp_repo();
+        // First file (alphabetically) consumes the whole budget; the second then
+        // confirms the marker fires when more files remain past the budget.
+        std::fs::write(
+            repo.0.join("a_big.txt"),
+            "x".repeat(MAX_UNTRACKED_CHARS + 100),
+        )
+        .unwrap();
+        std::fs::write(repo.0.join("b_small.txt"), "y\n").unwrap();
+        let b = diff_bundle(repo.0.to_str().unwrap()).unwrap();
+        assert!(
+            b.text.contains("[untracked content truncated]"),
+            "oversized untracked content should be marked truncated"
+        );
+    }
+
+    #[test]
+    fn single_oversized_untracked_is_marked() {
+        // Regression: a SINGLE untracked file bigger than the budget must still be
+        // marked truncated — the marker must not depend on a second file existing.
+        let repo = temp_repo();
+        std::fs::write(
+            repo.0.join("only_big.txt"),
+            "z".repeat(MAX_UNTRACKED_CHARS + 100),
+        )
+        .unwrap();
+        let b = diff_bundle(repo.0.to_str().unwrap()).unwrap();
+        assert!(
+            b.text.contains("[untracked content truncated]"),
+            "a single oversized untracked file must be marked truncated"
+        );
+    }
 }

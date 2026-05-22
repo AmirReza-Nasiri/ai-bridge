@@ -20,7 +20,10 @@ pub fn report() -> String {
         s.push_str(&find_line(tool));
         s.push('\n');
     }
-    s.push_str("Note: warm Codex peer + review gate are wired in a later increment.");
+    s.push_str(
+        "Note: this checks CLI discovery only. For engine status (warm Codex peer, \
+         MCP registration, Stop-hook wiring, install state) run `aibridge doctor`.",
+    );
     s
 }
 

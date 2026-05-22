@@ -1,6 +1,10 @@
 //! MCP stdio server: newline-delimited JSON-RPC 2.0.
 //!
-//! Increment: `consult` is wired to the warm Codex peer; review tools land next.
+//! Tool surface: `consult` (isolated topic dialogues), `review_diff` and the
+//! automatic `review_stop` gate (both share the warm Codex peer's reserved review
+//! thread), plus `health` / `capability_status` / `budget_status`. `review_diff`
+//! and `review_stop` capture the change set through the same `git::diff_bundle`
+//! path so on-demand and automatic review judge an identical set of changes.
 
 use crate::codex::CodexPeer;
 use crate::{gate, health};
@@ -258,18 +262,33 @@ impl Server {
         let cwd = std::env::current_dir()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| ".".to_string());
-        let diff = match crate::git::diff(&cwd) {
-            Ok(d) => d,
+        // Capture the change set via the SAME path as the automatic Stop gate
+        // (`diff_bundle`: status + staged + unstaged + UNTRACKED file contents,
+        // project-subtree scoped, `.ai-bridge` excluded). A tracked-only
+        // `git diff HEAD` here used to make on-demand `review_diff` report
+        // "nothing to review" for brand-new (untracked) files that the gate WOULD
+        // review/block — one source of truth avoids that drift.
+        let bundle = match crate::git::diff_bundle(&cwd) {
+            Ok(b) => b,
             Err(e) => return format!("AI Bridge: could not read the git diff: {e}"),
         };
-        if diff.trim().is_empty() {
-            return "AI Bridge: no uncommitted changes to review (git diff is empty).".to_string();
+        if bundle.is_empty {
+            return "AI Bridge: no uncommitted changes to review (working tree clean).".to_string();
         }
-        let diff = truncate_for_review(&diff);
+        // Send the bundle verbatim — exactly as the Stop gate does (`gate::prompt`
+        // also passes `bundle.text` with no size cap) — so on-demand and automatic
+        // review judge a byte-for-byte identical change set. Deliberate trade-off:
+        // only the UNTRACKED content is size-capped (inside `diff_bundle`); the
+        // staged/unstaged patch is intentionally NOT size-capped on either path,
+        // because a thorough review must see the whole change. A very large diff is
+        // bounded by the Codex call DEADLINE (`CALL_TIMEOUT`), never by silently
+        // dropping content (which would under-review). Accepted latency/quota cost.
         let prompt = format!(
-            "You are a skeptical peer reviewer. Review this git diff: find bugs, risks, \
-             edge cases, and missing tests; cite file/line; if it looks good, say so \
-             briefly.\n\n```diff\n{diff}\n```"
+            "You are a skeptical peer reviewer. Review the current uncommitted changes \
+             below (git status + staged + unstaged + untracked file contents): find bugs, \
+             risks, edge cases, and missing tests; cite file/line; if it looks good, say \
+             so briefly.\n\n{}",
+            bundle.text
         );
         // On-demand review shares the reserved review thread (isolated from consults)
         // and counts toward the same anti-anchoring reset bound as the Stop gate.
@@ -607,17 +626,6 @@ fn write_runtime_snapshot() {
         dir.join("snapshot.json"),
         serde_json::to_string_pretty(&snapshot).unwrap_or_default(),
     );
-}
-
-/// Soft cap on diff size sent to the reviewer (avoids huge prompts; rtk-based
-/// shrinking comes later).
-const MAX_DIFF_CHARS: usize = 24_000;
-
-fn truncate_for_review(diff: &str) -> String {
-    match diff.char_indices().nth(MAX_DIFF_CHARS) {
-        Some((idx, _)) => format!("{}\n... [diff truncated for review]", &diff[..idx]),
-        None => diff.to_string(),
-    }
 }
 
 /// Primer for the reserved review thread: a tiny cold turn that establishes the
