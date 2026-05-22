@@ -403,6 +403,13 @@ ai-bridge/
 
 **موضع: orchestrate/bundle، نه reimplement.** rtk یک ابزار بالغِ Apache-2.0 است که دقیقاً همین کار را روی ۱۰۰+ دستور و ۱۳+ ایجنت انجام می‌دهد؛ بازنویسی‌اش اتلاف است.
 
+> **وضعیتِ پیاده‌سازیِ v1 (سند را با کد بخوان — این بخش طرحِ کامل را توصیف می‌کند، نه آنچه ship شده):** آنچه واقعاً ساخته شده **باریک‌تر و دقت‌محورتر** است (تصمیمِ نهایی پس از دیالوگ با Codex: **KEEP-narrow**):
+> - AI Bridge **خودش یک allowlistِ ناوبری‌محور را قبل از فراخوانیِ rtk اعمال می‌کند** (`git status`, `git diff --stat`, `git log`, `git branch`, `ls`/`dir`/`tree`) — نه اینکه پوششِ دستورات را به rtk بسپارد.
+> - **فقط Claude (PreToolUse)، opt-in** با `aibridge init --rtk`. wiringِ سمتِ **Codex** و زیرفرمان‌های `rtk enable|disable` **در v1 نیستند** (آینده).
+> - **عمداً مستثنی:** `git diff` کامل، test/build، خواندنِ فایل، و هر خروجیِ محتوایی که مدل روش استدلال می‌کند. چون hook **قبل از اجرا** بازنویسی می‌کند، اندازهٔ خروجی معلوم نیست → «size-guard» ممکن نیست؛ پس دستوراتِ با خروجیِ متغیر/کوچک (مثل `cargo test`ِ کش‌شده که rtk بزرگ‌ترش می‌کند) مستثنی‌اند.
+> - `OutputFilter`/`CargoTestFilter`ِ build-specِ قدیمی **منسوخ‌اند**؛ size-guard + PostToolUse + dedupِ لاگ = آینده، نه v1.
+> - **چرا باریک:** بردهای بزرگِ rtk یا دقت را می‌شکنند (diff ۹۳٪) یا در مدلِ PreToolUse امن‌برداشت نیستند (test/log)؛ بزرگ‌ترین هزینهٔ توکنِ AI Bridge = ریویوی Codex است که rtk لمسش نمی‌کند. پس rtk یک بهینه‌سازیِ اختیاریِ متوسط است، نه هسته.
+
 **مسئولیت‌های AI Bridge نسبت به rtk:**
 - نصب/تأیید/تعمیرِ hookِ rtk برای **هم Claude (PreToolUse) هم Codex** (rtk یک مسیر integration مخصوص Codex دارد — در فاز ۲ probe شود).
 - نگه‌داشتنِ rtk **اختیاری و قابل‌عیب‌یابی:** `aibridge doctor rtk`, `aibridge rtk enable|disable`, و یک bypass مثل `aibridge rtk raw-next`.
