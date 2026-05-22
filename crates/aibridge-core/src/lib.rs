@@ -11,6 +11,7 @@ pub mod health;
 pub mod install;
 pub mod mcp;
 pub mod optimizer;
+pub mod plan_gate;
 pub mod topics;
 
 /// The crate (and product) version.

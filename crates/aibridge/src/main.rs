@@ -28,6 +28,10 @@ enum Commands {
         /// Also wire the rtk output-optimizer PreToolUse hook (safe mode).
         #[arg(long)]
         rtk: bool,
+        /// Also wire the OPT-IN pre-execution plan gate: before any write/Bash in a
+        /// task, Codex must approve the plan (UserPromptSubmit + PreToolUse hooks).
+        #[arg(long = "plan-gate")]
+        plan_gate: bool,
     },
     /// Translate `ai-bridge.profile.toml` into native per-CLI config.
     Profile {
@@ -51,8 +55,10 @@ enum Commands {
 
 #[derive(Subcommand, Debug)]
 enum HookAction {
-    /// PreToolUse rewrite that routes safe noisy commands through rtk.
+    /// PreToolUse: plan-gate enforcement (deny writes until approved) + rtk rewrite.
     Pretooluse,
+    /// UserPromptSubmit: start a fresh plan-gate task epoch for the new prompt.
+    UserPromptSubmit,
 }
 
 #[derive(Subcommand, Debug)]
@@ -72,7 +78,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::McpServer => aibridge_core::mcp::serve(),
-        Commands::Init { rtk } => init(rtk),
+        Commands::Init { rtk, plan_gate } => init(rtk, plan_gate),
         Commands::Profile { action } => match action {
             ProfileAction::Apply { dry_run, fix } => {
                 not_yet(&format!("profile apply (dry_run={dry_run}, fix={fix})"))
@@ -82,6 +88,7 @@ fn main() -> Result<()> {
         Commands::Doctor => doctor_cmd(false),
         Commands::Hook { action } => match action {
             HookAction::Pretooluse => hook_pretooluse(),
+            HookAction::UserPromptSubmit => hook_user_prompt_submit(),
         },
     }
 }
@@ -91,6 +98,16 @@ fn hook_pretooluse() -> Result<()> {
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input)?;
     print!("{}", aibridge_core::optimizer::pretooluse_str(&input));
+    Ok(())
+}
+
+fn hook_user_prompt_submit() -> Result<()> {
+    use std::io::Read;
+    let mut input = String::new();
+    std::io::stdin().read_to_string(&mut input)?;
+    // Start a fresh plan-gate epoch for this prompt; never block the prompt.
+    aibridge_core::plan_gate::on_user_prompt(&input);
+    print!("{{}}");
     Ok(())
 }
 
@@ -114,9 +131,9 @@ fn not_yet(what: &str) -> Result<()> {
     Ok(())
 }
 
-fn init(rtk: bool) -> Result<()> {
+fn init(rtk: bool, plan_gate: bool) -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let report = aibridge_core::install::init(&cwd, rtk)?;
+    let report = aibridge_core::install::init(&cwd, rtk, plan_gate)?;
     println!("AI Bridge: wired into {}", cwd.display());
     for action in &report.actions {
         println!("  • {action}");

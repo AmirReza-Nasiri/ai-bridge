@@ -28,6 +28,9 @@ enum Handled {
 enum TopicKey {
     /// The reserved review thread (Stop-gate + `review_diff`).
     Gate,
+    /// The reserved PRE-execution plan-gate thread (isolated from the review Gate
+    /// so plan-dialogue history never anchors result reviews, or vice versa).
+    PlanGate,
     /// A named, isolated consult dialogue.
     Consult(String),
 }
@@ -53,6 +56,10 @@ struct Server {
     threads: HashMap<TopicKey, String>,
     gate_reviews: u32,
     gates: HashMap<String, gate::GateState>,
+    /// The plan-gate epoch the PlanGate thread currently holds context for. When
+    /// the on-disk epoch changes (a new task started), the thread is dropped so a
+    /// new task's plan dialogue never anchors on the previous task's plan.
+    plan_epoch: Option<String>,
 }
 
 impl Server {
@@ -63,6 +70,7 @@ impl Server {
             threads: HashMap::new(),
             gate_reviews: 0,
             gates: HashMap::new(),
+            plan_epoch: None,
         }
     }
 
@@ -242,10 +250,33 @@ impl Server {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .trim();
+                let cwd = std::env::current_dir()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| ".".to_string());
                 if command.is_empty() {
                     "AI Bridge: `run` requires a non-empty 'command' argument.".to_string()
+                } else if crate::plan_gate::blocks_writes(&cwd) {
+                    // In-tool defense: `run` executes arbitrary shell, so it must
+                    // honor the plan gate even if the PreToolUse matcher missed it.
+                    "AI Bridge: `run` is blocked by the plan gate — this task has no approved \
+                     plan yet. Call `plan_gate` with your plan and retry after <AI-BRIDGE-APPROVE/>."
+                        .to_string()
                 } else {
                     run_command(command)
+                }
+            }
+            "plan_gate" => {
+                let plan = msg
+                    .pointer("/params/arguments/plan")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim();
+                if plan.is_empty() {
+                    "AI Bridge: `plan_gate` requires a non-empty 'plan' argument \
+                     (todos, approach, intended_files, risk_surfaces, test_plan)."
+                        .to_string()
+                } else {
+                    self.plan_gate(plan)
                 }
             }
             "review_stop" => self.review_stop(msg),
@@ -421,6 +452,56 @@ impl Server {
             PatchCheck::Rejected(why2) => format!(
                 "AI Bridge: Codex's patch still does not apply cleanly ({why2}). \
                  Returning it for MANUAL review — DO NOT apply blind:\n\n```diff\n{patch2}\n```"
+            ),
+        }
+    }
+
+    /// The PRE-execution plan gate (Claude-called). Runs a Codex review round on
+    /// the proposed plan over an isolated thread, records the verdict, and on
+    /// APPROVE unlocks writes for the current task epoch. Multi-round: Claude
+    /// revises and calls again until approved. Mirrors the Stop-gate's verdict
+    /// machinery (same sentinel parser) but at the planning→execution boundary.
+    fn plan_gate(&mut self, plan: &str) -> String {
+        let cwd = std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| ".".to_string());
+        // Capture the epoch BEFORE the (minutes-long) Codex call so `record` can
+        // refuse to approve if a new task started meanwhile (TOCTOU guard).
+        let epoch = crate::plan_gate::current_epoch(&cwd);
+        // New task epoch → drop the prior plan dialogue so it can't anchor.
+        if self.plan_epoch.as_deref() != Some(epoch.as_str()) {
+            self.threads.remove(&TopicKey::PlanGate);
+            self.plan_epoch = Some(epoch.clone());
+        }
+        let prompt = crate::plan_gate::prompt(plan);
+        let review = match self.ask_topic(TopicKey::PlanGate, &prompt, &cwd) {
+            Ok(r) if !r.trim().is_empty() => r,
+            Ok(_) => return "AI Bridge: Codex returned an empty plan review.".to_string(),
+            Err(e) => {
+                return format!(
+                    "AI Bridge: plan review unavailable (Codex error): {e}. \
+                     Ask the user how to proceed (plan without review / retry / fix the issue)."
+                )
+            }
+        };
+        let verdict = gate::parse_verdict(&review);
+        let findings = gate::findings(&review);
+        match crate::plan_gate::record(&cwd, &epoch, plan, &verdict, &findings) {
+            crate::plan_gate::Outcome::Approved => format!(
+                "<AI-BRIDGE-APPROVE/> Codex APPROVED the plan — writes/Bash are now unlocked for \
+                 this task. Proceed with execution.\n\n{findings}"
+            ),
+            crate::plan_gate::Outcome::Revise(f) => format!(
+                "Codex REQUESTED CHANGES to the plan. Revise the plan to address these, then call \
+                 `plan_gate` again (writes stay blocked until APPROVE):\n\n{f}"
+            ),
+            crate::plan_gate::Outcome::Stuck(f) => format!(
+                "AI Bridge: the plan still has the same unresolved concerns after revision. \
+                 STOP and ask the user how to proceed — do not keep retrying.\n\n{f}"
+            ),
+            crate::plan_gate::Outcome::NeedsInfo(f) => format!(
+                "AI Bridge: Codex needs more information to judge the plan (or is blocked). \
+                 Provide what it asks or check with the user, then call `plan_gate` again:\n\n{f}"
             ),
         }
     }
@@ -1206,6 +1287,22 @@ fn tools() -> Value {
                     "command": { "type": "string", "description": "The shell command to run (e.g. 'cargo test', 'npm test')." }
                 },
                 "required": ["command"]
+            })
+        ),
+        tool_with(
+            "plan_gate",
+            "PRE-execution plan review: before you start CODING a task, submit your todolist/plan \
+             here for a Codex second opinion. Returns a verdict — APPROVE, REQUEST_CHANGES \
+             (revise and call again), or needs-info. When the (opt-in) plan gate is active, \
+             writes (Write/Edit/MultiEdit/NotebookEdit) and Bash are BLOCKED until this returns \
+             <AI-BRIDGE-APPROVE/> for the current task. Do read-only discovery (Read/Grep/Glob) \
+             first, then submit a concrete plan.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "plan": { "type": "string", "description": "The structured plan to review: todos, approach, intended_files, risk_surfaces, and test_plan. Be concrete." }
+                },
+                "required": ["plan"]
             })
         ),
         tool_with(

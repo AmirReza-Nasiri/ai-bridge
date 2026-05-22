@@ -30,25 +30,32 @@ pub struct InitReport {
 }
 
 /// Wire AI Bridge into the project rooted at `project`. With `rtk`, also wire the
-/// rtk output-optimizer PreToolUse hook (safe mode).
-pub fn init(project: &Path, rtk: bool) -> Result<InitReport> {
+/// rtk output-optimizer PreToolUse hook (safe mode). With `plan_gate`, wire the
+/// opt-in pre-execution plan gate (UserPromptSubmit + a broad PreToolUse hook that
+/// denies writes/Bash until the plan is approved — that hook also does rtk).
+pub fn init(project: &Path, rtk: bool, plan_gate: bool) -> Result<InitReport> {
     let exe = std::env::current_exe().context("resolving the aibridge executable path")?;
     let exe_str = exe.to_string_lossy().to_string();
     let mut actions = Vec::new();
 
     register_mcp_server(project, &exe_str, &mut actions)?;
     install_stop_hook(project, &mut actions)?;
-    if rtk {
+    if plan_gate {
+        // The plan-gate's PreToolUse hook uses a BROAD matcher (write tools + Bash)
+        // and the shared `pretooluse` handler does rtk too, so it subsumes the
+        // rtk-only Bash hook. Don't also wire that narrower one.
+        install_plan_gate(project, &exe_str, &mut actions)?;
+    } else if rtk {
         install_rtk_hook(project, &exe_str, &mut actions)?;
+    }
+    if (rtk || plan_gate) && DefaultPlatform::find_executable("rtk").is_err() {
         // Detect + nudge (never auto-download a third-party binary): the hook is
         // wired and fails open, but tell the user how to get the actual binary.
-        if DefaultPlatform::find_executable("rtk").is_err() {
-            actions.push(format!(
-                "NOTE: rtk hook wired, but `rtk` isn't on PATH yet — compression \
-                 stays off (fail-open) until you install it: {}",
-                rtk_install_hint()
-            ));
-        }
+        actions.push(format!(
+            "NOTE: PreToolUse hook wired, but `rtk` isn't on PATH yet — output \
+             compression stays off (fail-open) until you install it: {}",
+            rtk_install_hint()
+        ));
     }
     add_gate_line(project, &mut actions)?;
     write_install_state(project, &exe_str, &mut actions)?;
@@ -125,6 +132,135 @@ fn install_rtk_hook(project: &Path, exe: &str, actions: &mut Vec<String>) -> Res
     } else {
         actions.push("rtk PreToolUse hook already present".to_string());
     }
+    Ok(())
+}
+
+const PLAN_GATE_NOTE: &str = "AI Bridge PLAN GATE is active here. Coding habit: for any task that will change files, FIRST do read-only discovery (Read/Grep/Glob), form a short todolist, then call `mcp__aibridge__plan_gate` with your plan (todos, approach, intended_files, risk_surfaces, test_plan) and iterate until it returns <AI-BRIDGE-APPROVE/>. Writes (Write/Edit/MultiEdit/NotebookEdit) and Bash are BLOCKED until the plan is approved for the current task.";
+
+/// Install the OPT-IN plan gate: an `enabled` marker, a `UserPromptSubmit` hook
+/// that starts a fresh task epoch, a broad `PreToolUse` hook that denies
+/// writes/Bash until the plan is approved (the shared `pretooluse` handler also
+/// does rtk), and a coding-habit note in `CLAUDE.local.md`.
+fn install_plan_gate(project: &Path, exe: &str, actions: &mut Vec<String>) -> Result<()> {
+    crate::plan_gate::enable(&project.to_string_lossy())
+        .context("writing the plan-gate enabled marker")?;
+
+    let path = project.join(".claude").join("settings.local.json");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("creating {}", display(parent)))?;
+    }
+    let mut root = read_json(&path)?;
+    if !root.is_object() {
+        root = json!({});
+    }
+    let mut changed = false;
+    {
+        let obj = root.as_object_mut().expect("object");
+        let hooks = obj.entry("hooks").or_insert_with(|| json!({}));
+        if !hooks.is_object() {
+            *hooks = json!({});
+        }
+        let hooks = hooks.as_object_mut().expect("object");
+
+        // PreToolUse: a broad matcher covering the write tools + Bash + the
+        // in-repo `run` MCP tool (arbitrary shell — a bypass otherwise).
+        let pre = hooks.entry("PreToolUse").or_insert_with(|| json!([]));
+        if !pre.is_array() {
+            *pre = json!([]);
+        }
+        let arr = pre.as_array_mut().expect("array");
+        // De-dupe by ownership: drop EVERY AI Bridge `pretooluse` group (the
+        // rtk-only Bash one, or any prior plan-gate matcher) and re-add the single
+        // canonical broad group. Leaving two would double-run the hook with
+        // unspecified ordering; matching by "calls our pretooluse" survives matcher
+        // string changes across versions.
+        let snapshot = arr.clone();
+        arr.retain(|g| {
+            !g.pointer("/hooks")
+                .and_then(Value::as_array)
+                .map(|hs| {
+                    hs.iter().any(|h| {
+                        h.get("args")
+                            .and_then(Value::as_array)
+                            .map(|a| a.iter().any(|x| x.as_str() == Some("pretooluse")))
+                            .unwrap_or(false)
+                    })
+                })
+                .unwrap_or(false)
+        });
+        arr.push(json!({
+            "matcher": "Write|Edit|MultiEdit|NotebookEdit|Bash|mcp__aibridge__run",
+            "hooks": [{
+                "type": "command",
+                "command": exe,
+                "args": ["hook", "pretooluse"],
+                "timeout": 30
+            }]
+        }));
+        if *arr != snapshot {
+            changed = true;
+        }
+
+        // UserPromptSubmit: start a fresh task epoch on each new prompt.
+        let ups = hooks.entry("UserPromptSubmit").or_insert_with(|| json!([]));
+        if !ups.is_array() {
+            *ups = json!([]);
+        }
+        let arr = ups.as_array_mut().expect("array");
+        let present = arr.iter().any(|g| {
+            g.pointer("/hooks")
+                .and_then(Value::as_array)
+                .map(|hs| {
+                    hs.iter().any(|h| {
+                        h.get("args")
+                            .and_then(Value::as_array)
+                            .map(|a| a.iter().any(|x| x.as_str() == Some("user-prompt-submit")))
+                            .unwrap_or(false)
+                    })
+                })
+                .unwrap_or(false)
+        });
+        if !present {
+            arr.push(json!({
+                "hooks": [{
+                    "type": "command",
+                    "command": exe,
+                    "args": ["hook", "user-prompt-submit"],
+                    "timeout": 10
+                }]
+            }));
+            changed = true;
+        }
+    }
+    if changed {
+        backup_if_exists(&path, actions)?;
+        write_json(&path, &root)?;
+        actions.push(format!(
+            "wired the OPT-IN plan gate (UserPromptSubmit + broad PreToolUse) in {}",
+            display(&path)
+        ));
+    } else {
+        actions.push("plan-gate hooks already present".to_string());
+    }
+
+    // Coding-habit note so Claude proactively calls plan_gate (not just after a deny).
+    let note_path = project.join("CLAUDE.local.md");
+    let existing = std::fs::read_to_string(&note_path).unwrap_or_default();
+    if !existing.contains("AI Bridge PLAN GATE is active") {
+        let mut content = existing;
+        if !content.is_empty() && !content.ends_with('\n') {
+            content.push('\n');
+        }
+        content.push_str(PLAN_GATE_NOTE);
+        content.push('\n');
+        std::fs::write(&note_path, content)
+            .with_context(|| format!("writing {}", display(&note_path)))?;
+        actions.push(format!(
+            "added the plan-gate habit note to {}",
+            display(&note_path)
+        ));
+    }
+    git_exclude(project, "CLAUDE.local.md", actions);
     Ok(())
 }
 

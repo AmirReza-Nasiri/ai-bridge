@@ -32,11 +32,22 @@ pub fn pretooluse_str(stdin: &str) -> String {
     pretooluse(&v)
 }
 
-/// Decide a PreToolUse rewrite. Returns `{}` (no change) or an `updatedInput`
-/// rewrite that routes the command through `rtk`.
+/// Decide a PreToolUse outcome. First enforces the (opt-in) plan gate — denying a
+/// write/Bash tool until the task's plan is Codex-approved — then, for an allowed
+/// Bash command, returns `{}` (no change) or an `updatedInput` rtk rewrite.
 pub fn pretooluse(hook_input: &Value) -> String {
     let no_change = "{}".to_string();
-    if hook_input.get("tool_name").and_then(Value::as_str) != Some("Bash") {
+    let tool_name = hook_input
+        .get("tool_name")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    // Plan-gate enforcement (deny wins; merged here so a denied pre-approval Bash
+    // is never also rtk-rewritten, per Codex review). The hook payload carries cwd.
+    let cwd = hook_input.get("cwd").and_then(Value::as_str).unwrap_or(".");
+    if let Some(deny) = crate::plan_gate::enforce(cwd, tool_name) {
+        return deny;
+    }
+    if tool_name != "Bash" {
         return no_change;
     }
     let tool_input = match hook_input.get("tool_input") {
