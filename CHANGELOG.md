@@ -8,6 +8,20 @@ versioning is semver.
 
 ### Added
 
+- **Cross-session consult persistence (Phase 2 — toward standalone).** A named
+  consult `topic` now survives a Claude/codex restart: each completed turn is
+  appended to `.ai-bridge/topics/<topic>.jsonl`, and resuming a topic (no live
+  thread, but a transcript exists) seeds a fresh codex thread with a bounded
+  replay of recent turns (codex threadIds don't survive a restart, so dialogue is
+  reconstructed by replay). Verified the replay is TOPIC-scoped and beats codex's
+  own latest-cwd-session resume (stored α=LION then β=TIGER; a new process
+  resuming α correctly recalled LION, not TIGER). Crash-safe (only complete turns
+  written; corrupt lines skipped; zero-byte files not treated as resumable),
+  best-effort (never breaks a consult), `reset` archives rather than deletes, and
+  topic names also reject Windows reserved device names. The review gate never
+  persists. Codex-reviewed. (Brings AI Bridge to parity with codex-peer's durable
+  `[DIALOGUE]`/`[PAIR]`; `[IMPLEMENTER]` + `[RUNNER]` parity next.)
+
 - **Continuous, topic-based `consult` + isolated review gate (Phase 1).** `consult`
   now takes an optional `topic` (+ `reset`): each stable kebab-case topic is its
   own warm, isolated Codex conversation that continues across calls (a real

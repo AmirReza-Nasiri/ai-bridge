@@ -228,8 +228,11 @@ impl Server {
         json!({ "content": [{ "type": "text", "text": text }] })
     }
 
-    /// On-demand second opinion on an isolated, named topic thread (continuous
-    /// across calls in this session). Omitted/blank topic → shared `scratch`.
+    /// On-demand second opinion on an isolated, named topic thread. Continuous
+    /// across calls AND across sessions: a named topic's turns are persisted, so
+    /// resuming it after a Claude restart replays recent context (codex threadIds
+    /// don't survive a restart). Omitted/blank topic → ephemeral shared `scratch`
+    /// (not persisted). `reset` archives the topic and starts cold.
     fn consult(&mut self, question: &str, topic: &str, reset: bool) -> String {
         let cwd = std::env::current_dir()
             .map(|p| p.display().to_string())
@@ -239,15 +242,39 @@ impl Server {
             Err(e) => return format!("AI Bridge: invalid consult topic — {e}"),
         };
         let key = TopicKey::Consult(topic.clone());
+        let persisted = topic != "scratch";
         if reset {
-            self.threads.remove(&key); // start this topic cold again
+            self.threads.remove(&key);
+            if persisted {
+                crate::topics::archive(&cwd, &topic); // keep history, start cold
+            }
         }
-        let prompt = format!(
-            "You are a peer reviewer giving a concise, skeptical second opinion. \
-             Be specific and call out risks. Question:\n{question}"
-        );
+        let base = "You are a peer reviewer giving a concise, skeptical second opinion. \
+                    Be specific and call out risks.";
+        // Resume across sessions: no live thread for this topic but a transcript
+        // exists → seed the fresh thread with a bounded replay of recent turns.
+        // NOTE: codex's own tool appears to resume the latest CWD session on a
+        // fresh process's first call; our explicit replay dominates (verified:
+        // topic-correct recall), but that ambient context still rides along. If a
+        // codex `--no-resume`/`--fresh` option appears, pass it in `open_thread`
+        // to drop the ambient injection entirely.
+        let resuming =
+            persisted && !self.threads.contains_key(&key) && crate::topics::exists(&cwd, &topic);
+        let prompt = if resuming {
+            let replay = crate::topics::replay(&cwd, &topic, crate::topics::REPLAY_BUDGET);
+            format!(
+                "{base}\n\n[Resuming dialogue topic '{topic}'. Prior exchange for context:]\n\
+                 {replay}\n\n[End prior context. New question:]\n{question}"
+            )
+        } else {
+            format!("{base} Question:\n{question}")
+        };
         match self.ask_topic(key, &prompt, &cwd) {
             Ok(reply) if !reply.trim().is_empty() => {
+                if persisted {
+                    // Persist the RAW question + reply (not the seeded prompt).
+                    crate::topics::append_turn(&cwd, &topic, question, &reply);
+                }
                 format!("{reply}\n\n— AI Bridge consult (topic: {topic})")
             }
             Ok(_) => "AI Bridge: Codex returned an empty reply.".to_string(),
@@ -520,6 +547,17 @@ fn normalize_topic(raw: &str) -> Result<String, String> {
             "topic '{t}' is too vague; use a specific kebab-case name like repo-feature-phase"
         ));
     }
+    // The topic becomes a filename (`<topic>.jsonl`); reject Windows reserved
+    // device names (case-insensitive, reserved even with an extension).
+    const RESERVED: &[&str] = &[
+        "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
+        "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+    ];
+    if RESERVED.contains(&t.as_str()) {
+        return Err(format!(
+            "topic '{t}' is a reserved device name; pick another"
+        ));
+    }
     Ok(t)
 }
 
@@ -784,6 +822,12 @@ mod tests {
         assert!(normalize_topic("-leading").is_err());
         assert!(normalize_topic("double--dash").is_err());
         assert!(normalize_topic("deadbeefcafe123").is_err()); // hash-shaped
+        assert!(normalize_topic("con").is_err()); // Windows reserved
+        assert!(normalize_topic("com1").is_err()); // Windows reserved
+        assert!(normalize_topic("nul").is_err()); // Windows reserved
+        assert!(normalize_topic("scratch").is_err()); // internal-only sentinel
+                                                      // a reserved name as a SUBSTRING is fine (only the exact base is reserved)
+        assert!(normalize_topic("con-figuration").is_ok());
     }
 
     #[test]
