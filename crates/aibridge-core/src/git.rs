@@ -50,13 +50,18 @@ pub fn diff_bundle(cwd: &str) -> Result<DiffBundle> {
             .unwrap_or_default()
     };
 
-    // Exclude AI Bridge's own trace dir so reviews don't see (and choke on) our
-    // `.ai-bridge/` output, which would also change the diff hash every review.
-    let status = run(&["--no-pager", "status", "--porcelain"])
-        .lines()
-        .filter(|l| !l.contains(".ai-bridge"))
-        .collect::<Vec<_>>()
-        .join("\n");
+    // Scope every query to the project subtree (`-- .`) so a sibling project in
+    // the SAME git repo can't pollute the review, and exclude AI Bridge's own
+    // `.ai-bridge/` trace dir via pathspec (it would otherwise churn the diff
+    // hash every review). Without `-- .` the porcelain status is repo-wide.
+    let status = run(&[
+        "--no-pager",
+        "status",
+        "--porcelain",
+        "--",
+        ".",
+        ":(exclude).ai-bridge",
+    ]);
     let staged = run(&[
         "--no-pager",
         "diff",
@@ -67,20 +72,31 @@ pub fn diff_bundle(cwd: &str) -> Result<DiffBundle> {
     ]);
     let unstaged = run(&["--no-pager", "diff", "--", ".", ":(exclude).ai-bridge"]);
 
+    // Untracked file CONTENTS via NUL-delimited `ls-files`: it lists individual
+    // files (porcelain status collapses a brand-new dir to `?? dir/`), honors
+    // ignore rules (`--exclude-standard`), and prints cwd-relative, UNquoted paths
+    // (porcelain C-quotes names with spaces/newlines, which broke the path join).
+    let untracked_list = run(&[
+        "--no-pager",
+        "ls-files",
+        "--others",
+        "--exclude-standard",
+        "-z",
+        "--",
+        ".",
+        ":(exclude).ai-bridge",
+    ]);
     let mut untracked = String::new();
     let mut budget = MAX_UNTRACKED_CHARS;
-    for line in status.lines() {
+    for path in untracked_list.split('\0').filter(|s| !s.is_empty()) {
         if budget == 0 {
             untracked.push_str("\n[untracked content truncated]");
             break;
         }
-        if let Some(path) = line.strip_prefix("?? ") {
-            let path = path.trim();
-            if let Ok(content) = std::fs::read_to_string(Path::new(cwd).join(path)) {
-                let snippet: String = content.chars().take(budget).collect();
-                budget = budget.saturating_sub(snippet.chars().count());
-                untracked.push_str(&format!("\n--- untracked: {path} ---\n{snippet}\n"));
-            }
+        if let Ok(content) = std::fs::read_to_string(Path::new(cwd).join(path)) {
+            let snippet: String = content.chars().take(budget).collect();
+            budget = budget.saturating_sub(snippet.chars().count());
+            untracked.push_str(&format!("\n--- untracked: {path} ---\n{snippet}\n"));
         }
     }
 

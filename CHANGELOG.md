@@ -58,6 +58,13 @@ versioning is semver.
   the effort AI Bridge uses (and the user's global setting if different) plus the
   latency expectation — so a multi-minute `xhigh` review is never mistaken for a
   hang (the exact confusion that masked the root cause during dogfood).
+- **Gate scopes to the project subtree in a multi-project repo.** When the AI
+  Bridge project is a SUBDIRECTORY of a larger git repo, the review bundle's
+  `git status --porcelain` was repo-wide and pulled in sibling projects' churn
+  (verified: 44 noisy lines vs 0 when scoped). `diff_bundle` now scopes status to
+  `-- .` (matching the staged/unstaged diffs) and resolves untracked-file paths
+  against the repo root (`git rev-parse --show-toplevel`), since porcelain prints
+  root-relative paths — so untracked content is read correctly from a subdir too.
 
 ### Added
 
