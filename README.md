@@ -152,7 +152,8 @@ MCP tools exposed by `mcp-server`: `consult`, `review_diff`, `review_stop`
 - **Git** on PATH (the gate and `review_diff` diff the working tree).
 - **Rust toolchain** — only to build/install from source.
 - **rtk** — optional output compressor; wired in safe-mode, opt-in via
-  `aibridge init --rtk` (not required).
+  `aibridge init --rtk` (not required). AI Bridge never auto-downloads it;
+  `aibridge doctor` prints the OS-specific install command if you want it.
 - Platforms: Windows, macOS (Apple Silicon native; Intel via cross-compile +
   manual runtime check), Linux.
 

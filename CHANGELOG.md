@@ -58,6 +58,13 @@ versioning is semver.
   the effort AI Bridge uses (and the user's global setting if different) plus the
   latency expectation — so a multi-minute `xhigh` review is never mistaken for a
   hang (the exact confusion that masked the root cause during dogfood).
+- **rtk install: detect + nudge (never auto-download).** After a two-round Codex
+  dialogue + real measurement, rtk stays a narrow, accuracy-safe, opt-in
+  navigation-only optimizer (`KEEP-narrow`). AI Bridge does NOT auto-install the
+  third-party rtk binary (trust + cross-platform fragility + modest ROI). Instead
+  `aibridge doctor` now prints the OS-specific install command when rtk is absent,
+  and `aibridge init --rtk` warns (with the same hint) if the binary isn't on PATH
+  yet (the hook is wired and fails open until then). New `install::rtk_install_hint`.
 - **Gate scopes to the project subtree in a multi-project repo.** When the AI
   Bridge project is a SUBDIRECTORY of a larger git repo, the review bundle's
   `git status --porcelain` was repo-wide and pulled in sibling projects' churn

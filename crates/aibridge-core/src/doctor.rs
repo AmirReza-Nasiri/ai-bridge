@@ -153,7 +153,10 @@ pub fn run(project: &Path, full: bool) -> Report {
         Err(_) => checks.push(check(
             Status::Warn,
             "rtk (output optimizer)",
-            "not installed (optional)",
+            format!(
+                "not installed (optional). To enable safe command-output compression: {}, then `aibridge init --rtk`",
+                crate::install::rtk_install_hint()
+            ),
         )),
     }
 

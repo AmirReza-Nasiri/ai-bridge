@@ -40,6 +40,15 @@ pub fn init(project: &Path, rtk: bool) -> Result<InitReport> {
     install_stop_hook(project, &mut actions)?;
     if rtk {
         install_rtk_hook(project, &exe_str, &mut actions)?;
+        // Detect + nudge (never auto-download a third-party binary): the hook is
+        // wired and fails open, but tell the user how to get the actual binary.
+        if DefaultPlatform::find_executable("rtk").is_err() {
+            actions.push(format!(
+                "NOTE: rtk hook wired, but `rtk` isn't on PATH yet — compression \
+                 stays off (fail-open) until you install it: {}",
+                rtk_install_hint()
+            ));
+        }
     }
     add_gate_line(project, &mut actions)?;
     write_install_state(project, &exe_str, &mut actions)?;
@@ -237,6 +246,22 @@ fn is_aibridge_stop_group(group: &Value) -> bool {
             })
         })
         .unwrap_or(false)
+}
+
+/// OS-appropriate command to install the OPTIONAL rtk binary. AI Bridge never
+/// auto-downloads it (it's third-party); `doctor` and `init --rtk` print this so
+/// the user can install it themselves.
+pub fn rtk_install_hint() -> String {
+    match aibridge_platform::platform_name() {
+        "windows" => "download `rtk-x86_64-pc-windows-msvc` from \
+                      https://github.com/rtk-ai/rtk/releases and put rtk.exe on PATH \
+                      (e.g. ~/.local/bin)"
+            .to_string(),
+        "macos" => "`brew install rtk` (or `cargo install --git \
+                    https://github.com/rtk-ai/rtk rtk`)"
+            .to_string(),
+        _ => "`brew install rtk` (or see https://github.com/rtk-ai/rtk)".to_string(),
+    }
 }
 
 /// Write the gate-awareness note to `CLAUDE.local.md` and keep it git-ignored.
