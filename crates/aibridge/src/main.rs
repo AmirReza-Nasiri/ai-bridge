@@ -1,6 +1,6 @@
 //! AI Bridge — warm peer-review orchestrator for AI coding CLIs.
 //!
-//! v4 successor to `codex-peer`. Design: `docs/architecture/AI-BRIDGE-REDESIGN-FA.md`.
+//! v4 successor to `codex-peer`. Design + usage: see `README.md`.
 //!
 //! This is the Phase-0 foundation: the CLI surface is wired as stubs so the
 //! shape is real and `--version` works. Functionality lands in later phases.

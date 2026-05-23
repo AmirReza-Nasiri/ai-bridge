@@ -10,14 +10,15 @@
 | Capability | State |
 |---|---|
 | Cargo workspace · CI (Windows + macOS Apple Silicon + Linux + Intel cross-check) | ✅ working |
-| `aibridge mcp-server` — MCP stdio server, 8-tool surface | ✅ working |
+| `aibridge mcp-server` — MCP stdio server, 9-tool surface | ✅ working |
 | `health` / `capability_status` — real CLI discovery | ✅ working |
 | **Warm Codex peer + `consult`** — on-demand second opinion, with continuous **named topics** that persist across sessions | ✅ working (measured **15.5s cold → 3.1s warm**) |
 | **`review_diff`** — review the current git diff | ✅ working |
 | **`implement`** — Codex drafts a unified-diff patch (validated with `git apply --check`) for you to review + apply | ✅ working |
 | **`run`** — structured command/test execution (exit code, duration, capped output, process-tree timeout) | ✅ working |
+| **`plan_gate`** — the **automatic** PRE-execution plan gate (Codex must approve the task's plan before any write/Bash; default-on, mirror of the Stop gate) | ✅ working |
 | **`review_stop`** — the **automatic** Stop-hook gate (allow/block + no-progress + fail-ask; node-direct spawn, background warming, project-subtree scoped, deadline-bounded) | ✅ working |
-| **`aibridge init`** — one-command local wiring (subdirectory-of-a-repo aware) | ✅ working |
+| **`aibridge init`** — one-command local wiring, both gates by default (subdirectory-of-a-repo aware) | ✅ working |
 | **`aibridge doctor` / `selftest`** — one-command health + connection check | ✅ working |
 | **rtk output-compression** — opt-in via `aibridge init --rtk` (safe-mode allowlist) | ✅ working |
 | `--shared` team install · `uninit` · TUI | 🔭 planned |
@@ -34,10 +35,8 @@ three small, independent layers:
 | Layer | What it does | Status |
 |---|---|---|
 | **Warm Peer Engine** | Keeps one `codex mcp-server` warm and reuses its conversation (`codex-reply`, ~99% prompt-cache) so a review costs ~one warm turn instead of a ~45K cold start | ✅ live |
-| **Quality gate** | A Claude Code `Stop` hook sends each task's diff to Codex, so work gets a peer review *before it's finished* — no cap, with no-progress detection and fail-ask | ✅ live |
+| **Two quality gates** | A `UserPromptSubmit`/`PreToolUse` **plan gate** makes Codex approve the task's plan *before* any code is written, and a `Stop` **review gate** sends the resulting diff to Codex *before the task finishes* — both automatic, no cap, with no-progress detection and fail-ask | ✅ live |
 | **rtk** | Wire the [Rust Token Killer](https://github.com/rtk-ai/rtk) (orchestrated, not reimplemented) to compress noisy command output 60–90% — opt-in via `init --rtk`, narrow safe-mode allowlist | ✅ live (opt-in) |
-
-Full design (Persian): [`docs/architecture/AI-BRIDGE-REDESIGN-FA.md`](docs/architecture/AI-BRIDGE-REDESIGN-FA.md).
 
 ---
 
@@ -103,12 +102,21 @@ Platform guides (with gotchas): [Windows](docs/install/windows.md) · [macOS](do
 AI Bridge is **not a skill you invoke** — it's an engine Claude reaches. Two ways
 it works:
 
-**Automatic (no words needed).** When Claude finishes a task, the `Stop` hook
-sends the current diff to the warm Codex peer. If Codex finds a real problem,
-Claude is sent back to fix it before finishing. The loop has **no artificial
-round cap**; it only pauses to ask *you* when it's genuinely stuck (no progress)
-or when Codex is unavailable — it never silently ships unreviewed work and never
-loops forever.
+**Automatic (no words needed).** Two gates bracket every task, both hands-free:
+
+- **Before coding — the plan gate.** On a new task, Claude does read-only
+  discovery (Read/Grep/Glob) and forms a plan; the first write/Bash is blocked
+  until Codex approves that plan via a short multi-round dialogue (`plan_gate`).
+  So the *approach* is vetted before a line is written. On by default; skip a
+  trivial task with `AIBRIDGE_PLAN_GATE=0`, or turn the gate off at install with
+  `aibridge init --no-plan-gate`.
+- **Before finishing — the review gate.** When Claude finishes, the `Stop` hook
+  sends the resulting diff to the warm Codex peer. If Codex finds a real problem,
+  Claude is sent back to fix it before finishing.
+
+Both loops have **no artificial round cap**; they only pause to ask *you* when
+genuinely stuck (no progress) or when Codex is unavailable — never silently
+shipping unreviewed work, never looping forever.
 
 > **Review depth & latency.** Reviews run at Codex `xhigh` reasoning by default —
 > thorough, but a real review takes **minutes** (a generous internal deadline
@@ -138,16 +146,22 @@ tiny fixed cost, far below the startup overhead the warm engine removes.
 ## Commands
 
 ```
-aibridge init                # wire this project (local scope) — run once per project
+aibridge init                # wire this project (local scope) — both gates on by default
+aibridge init --no-plan-gate # wire it WITHOUT the pre-execution plan gate (Stop gate only)
+aibridge init --rtk          # also wire the rtk output-optimizer hook (safe mode)
 aibridge doctor              # one-command health + connection check (no quota)
 aibridge selftest [--full]   # same checks; --full adds a real Codex round-trip (uses quota)
 aibridge mcp-server          # the warm peer engine Claude connects to (run by Claude, not you)
 aibridge profile apply       # planned — translate ai-bridge.profile.toml -> native config
 ```
 
+Per-session escape hatch (skip the plan gate for a trivial task — set it before
+launching Claude Code): `AIBRIDGE_PLAN_GATE=0`.
+
 MCP tools exposed by `mcp-server`: `consult` (named persisted topics),
-`implement` (validated patch), `run` (structured execution), `review_diff`,
-`review_stop` (hook-only), `health`, `capability_status`, `budget_status` (stub).
+`plan_gate` (pre-execution plan review), `implement` (validated patch),
+`run` (structured execution), `review_diff`, `review_stop` (hook-only),
+`health`, `capability_status`, `budget_status` (stub).
 
 ---
 
@@ -201,40 +215,3 @@ macOS Intel: covered by cross-compile + clippy on the Apple Silicon runner
 
 MIT — see [LICENSE](LICENSE). Orchestrated third-party tools (`rtk`, the `codex`
 CLI, Claude Code) keep their own licenses and auth.
-
----
-
-## فارسی
-
-**AI Bridge چیست؟** یک باینریِ Rust (MCP server) که **Codex را گرم نگه می‌دارد تا
-peer-reviewerِ سریعِ Claude Code باشد** — هم on-demand هم خودکار — و سربارِ این
-reviewها را کم می‌کند. جانشینِ نسل‌چهارِ codex-peer.
-
-**سه لایه:** (۱) Warm Peer Engine — یک `codex mcp-server` گرم + بازاستفاده با
-`codex-reply` (~۹۹٪ cache، اندازه‌گیری: ۱۵.۵s→۳.۱s)؛ (۲) گیتِ کیفیت — یک Stop-hook
-که دیفِ هر تسک را قبل از پایان به Codex می‌دهد (بدونِ سقفِ راند، با تشخیصِ
-عدم‌پیشرفت و fail-ask)؛ (۳) rtk — فشرده‌سازیِ خروجی، اختیاری با `init --rtk` (فعال).
-
-**راه‌اندازی (سه قدم):**
-1. `cargo install --path crates/aibridge` (یک‌بار، تا `aibridge` روی PATH باشد).
-2. در هر پروژه: `cd <پروژه>` و `aibridge init` (محلی/untracked — MCP server +
-   Stop hook + `CLAUDE.local.md`).
-3. **Claude را restart کن**، بعد `aibridge doctor` — **یک دستورِ جامع** که
-   همه‌چیز را چک می‌کند (باینری‌ها، handshakeِ codex، ثبتِ MCP، hook، state).
-   نسخه‌ی عمیق‌تر با فراخوانیِ واقعیِ Codex: `aibridge selftest --full`.
-
-**استفاده‌ی روزمره:**
-- **خودکار:** هیچی نمی‌گویی؛ آخرِ هر تسک، گیت دیف را به Codex می‌دهد و اگر ایراد
-  بود Claude را برمی‌گرداند (بدونِ سقف؛ فقط در بن‌بست/خطا از تو می‌پرسد).
-  ریویو با `xhigh` اجرا می‌شود — دقیق ولی **چند دقیقه‌ای** (تایم‌اوتِ سخاوتمندانه
-  که همیشه کامل می‌شود، نه برشِ کیفیت). فقط تغییرِ **کامیت‌نشدهٔ** زیرشاخهٔ پروژه
-  ریویو می‌شود، پس **مرتب کامیت کن** تا ریویوها کوچک و چندثانیه‌ای بمانند. تنظیم با
-  `REVIEW_REASONING_EFFORT`.
-- **on-demand:** «یه نظر دوم از کدکس بگیر» → `consult` (با «روی تاپیکِ `<اسم>`» برای
-  دیالوگِ پیوسته‌ای که بین سشن‌ها می‌ماند)؛ «این رو با کدکس review کن» → `review_diff`؛
-  «کدکس برای X یه پچ بنویس» → `implement` (پچِ اعتبارسنجی‌شدهٔ تست‌نشده)؛ «تست‌ها رو
-  اجرا کن و نتیجه رو بگیر» → `run` (خروجیِ ساختارمند).
-
-**پیش‌نیازها:** Claude Code و Codex CLI نصب و لاگین، Git، (برای ساخت) Rust.
-**نصب:** [ویندوز](docs/install/windows.md) · [مک](docs/install/macos.md). طرحِ کامل:
-[`docs/architecture/AI-BRIDGE-REDESIGN-FA.md`](docs/architecture/AI-BRIDGE-REDESIGN-FA.md). **لایسنس:** MIT.

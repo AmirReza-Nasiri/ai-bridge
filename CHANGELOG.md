@@ -30,6 +30,13 @@ versioning is semver.
   Codex-vetted (2 rounds → APPROVE); implementation Codex-vetted (3 rounds →
   APPROVE: run-bypass, atomic state, TOCTOU, root anchoring, hook de-dupe).
 
+### Removed
+
+- **Persian content — the project is now English-only.** Deleted the Persian
+  `## فارسی` section from the README and the `docs/architecture/AI-BRIDGE-REDESIGN-FA.md`
+  design doc; the English README is the canonical reference. Code/CHANGELOG/git
+  history already capture the design.
+
 ### Changed
 
 - **`consult` now REQUIRES a `topic` — the anonymous `scratch` channel is removed.**
@@ -259,10 +266,10 @@ versioning is semver.
     including Windows `%APPDATA%\npm` executable fallback.
 - CI matrix (Windows + macOS Apple Silicon + macOS Intel + Linux): fmt, clippy,
   build, test.
-- Project metadata: README (EN+FA), MAINTAINERS, LICENSE (MIT), rustfmt/clippy
+- Project metadata: README, MAINTAINERS, LICENSE (MIT), rustfmt/clippy
   config, `.gitignore`, `.editorconfig`.
-- Locked architecture doc: `docs/architecture/AI-BRIDGE-REDESIGN-FA.md`
-  (Warm Peer Engine + rtk + Stop-hook review gate; 3 orthogonal layers).
+- Locked architecture: Warm Peer Engine + rtk + Stop-hook review gate
+  (3 orthogonal layers).
 
 ### Validated (pre-build probes, on Windows)
 
