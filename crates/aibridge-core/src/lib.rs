@@ -14,10 +14,27 @@ pub mod optimizer;
 pub mod plan_gate;
 pub mod topics;
 
-/// The crate (and product) version.
+/// The crate (and product) semver version (from `Cargo.toml`).
 pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
+
+/// Git short SHA of the build (with a `-dirty` suffix for uncommitted builds), or
+/// "unknown" if built without git. Embedded by `build.rs`.
+pub const GIT_SHA: &str = env!("AIBRIDGE_GIT_SHA");
+
+/// Commit date (YYYY-MM-DD) of the build, or "unknown". Embedded by `build.rs`.
+pub const BUILD_DATE: &str = env!("AIBRIDGE_BUILD_DATE");
+
+/// Full version string for `--version` / `doctor`: `0.2.0 (git 8f2c9da, 2026-05-23)`.
+pub const VERSION_FULL: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (git ",
+    env!("AIBRIDGE_GIT_SHA"),
+    ", ",
+    env!("AIBRIDGE_BUILD_DATE"),
+    ")"
+);
 
 #[cfg(test)]
 mod tests {

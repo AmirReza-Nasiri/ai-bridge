@@ -6,7 +6,21 @@ versioning is semver.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-05-23
+
 ### Added
+
+- **Version provenance + a `doctor` install-shape guard (foundation for `aibridge
+  update`).** The crate version is bumped to 0.2.0 and `build.rs` embeds the git
+  short SHA + commit date (with a `-dirty` suffix for uncommitted builds, or
+  "unknown" without git), so `aibridge --version` now prints
+  `aibridge 0.2.0 (git <sha>, <date>)` and `doctor` shows the same. `doctor` also
+  gained an **install-shape check** that warns when the MCP server is registered to
+  a Cargo build artifact (`target/release` / `target/debug`) instead of a stable
+  path like `~/.local/bin` — a setup that breaks on rebuild / `cargo clean` (and
+  locks the binary so a release rebuild fails). Update mechanism Codex-vetted
+  (release-first hybrid via GitHub Releases, semver + SHA, install metadata,
+  Windows staged replacement, offline doctor); the `update` command lands next.
 
 - **Pre-execution plan gate (`plan_gate` tool + hooks) — the planning-phase
   mirror of the Stop-gate, now DEFAULT-ON.** Before any file change in a task, Codex

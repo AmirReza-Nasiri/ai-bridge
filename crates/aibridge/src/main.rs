@@ -11,7 +11,7 @@ use clap::{Parser, Subcommand};
 #[derive(Parser, Debug)]
 #[command(
     name = "aibridge",
-    version,
+    version = aibridge_core::VERSION_FULL,
     about = "AI Bridge — warm peer-review orchestrator for AI CLIs"
 )]
 struct Cli {

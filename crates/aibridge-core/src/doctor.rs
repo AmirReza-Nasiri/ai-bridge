@@ -105,8 +105,8 @@ pub fn run(project: &Path, full: bool) -> Report {
         .unwrap_or_default();
     checks.push(check(
         Status::Pass,
-        "aibridge",
-        format!("v{} ({exe})", crate::version()),
+        "aibridge version",
+        format!("{} ({exe})", crate::VERSION_FULL),
     ));
 
     match version_of("claude") {
@@ -170,6 +170,7 @@ pub fn run(project: &Path, full: bool) -> Report {
     }
 
     checks.push(mcp_registration(project));
+    checks.push(mcp_binary_path(project));
     checks.push(stop_hook(project));
     checks.push(install_state(project));
     checks.push(spawned_context(project));
@@ -296,6 +297,58 @@ fn mcp_registration(project: &Path) -> Check {
             "aibridge MCP registration",
             "not registered — run `aibridge init`",
         ),
+    }
+}
+
+/// Flag a fragile install shape: the MCP server registered to a Cargo build
+/// artifact (`target/release` or `target/debug`) instead of a stable path like
+/// `~/.local/bin`. A rebuild or `cargo clean` would then break the running server
+/// (Codex flagged this during the update-command design review).
+fn mcp_binary_path(project: &Path) -> Check {
+    let out = DefaultPlatform::find_executable("claude")
+        .ok()
+        .and_then(|c| {
+            DefaultPlatform::command_for(&c)
+                .args(["mcp", "get", "aibridge"])
+                .current_dir(project)
+                .output()
+                .ok()
+        });
+    let text = match out {
+        Some(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_lowercase(),
+        _ => {
+            return check(
+                Status::Warn,
+                "aibridge binary path",
+                "could not read the MCP registration (run `aibridge init`)",
+            )
+        }
+    };
+    // Match `target` + sep + `release`/`debug` with a LEADING separator so it only
+    // fires on a real path component (not a dir merely named "…target…"); the
+    // trailing `\aibridge.exe` guarantees a bounded fragment is present.
+    let in_build_dir = [
+        "/target/release",
+        "\\target\\release",
+        "/target/debug",
+        "\\target\\debug",
+    ]
+    .iter()
+    .any(|m| text.contains(m));
+    if in_build_dir {
+        check(
+            Status::Warn,
+            "aibridge binary path",
+            "MCP points at a Cargo build artifact (target/…) — re-register to a stable path so a \
+             rebuild or `cargo clean` can't break it: `claude mcp remove aibridge -s user` then \
+             `claude mcp add aibridge -s user -- <dir>/aibridge.exe mcp-server`",
+        )
+    } else {
+        check(
+            Status::Pass,
+            "aibridge binary path",
+            "registered to a stable path (not a build artifact)",
+        )
     }
 }
 
