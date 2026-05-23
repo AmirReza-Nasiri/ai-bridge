@@ -6,6 +6,32 @@ versioning is semver.
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-05-23
+
+### Changed
+
+- **Hardened live review-progress (peer-reviewed).** Following a Codex review of
+  0.5.1's `aibridge status`:
+  - **Correct JSON-RPC notification classification.** A notification is detected by
+    key presence (`method` present, no `id` member) instead of an `id: null` check,
+    so a server request (`method` + `id`) is never misread as a turn event.
+  - **Path-prioritized extraction.** Event type reads `params.msg.type` →
+    `params.type` → JSON-RPC `method` (→ `unknown`); the token count reads known
+    `total_token_usage.total_tokens` paths first, with a narrow recursive fallback
+    for ONLY the exact `total_tokens` key — so a stray `rate_limits.tokens` can't be
+    mistaken for the running total. The chosen path is recorded in `tokens_source`.
+  - **Race-free status writes.** Disk writes happen off the sink lock; each snapshot
+    carries a monotonic `seq` stamped under the lock, and a dedicated write-gate
+    drops a delayed older snapshot — so a late heartbeat can never revert a finished
+    review back to `active`. Per-write unique temp names; gate keyed by canonical path.
+  - **Bridge heartbeat vs codex silence.** A heartbeat thread proves the bridge is
+    alive even while the model reasons silently, so `aibridge status` flags a ⚠ stall
+    only when the *bridge* heartbeat is stale (>30s); a long codex-event gap shows as
+    "thinking", not a stall (a real ~47s reasoning gap previously false-flagged).
+  - **Recent-events ring + terminal status.** The status file keeps the last 8 events
+    and a terminal `completed`/`error` outcome; a `Drop` guard finishes any in-flight
+    review so the file never stays stuck `active`.
+
 ## [0.5.1] - 2026-05-23
 
 ### Added

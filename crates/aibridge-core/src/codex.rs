@@ -9,25 +9,31 @@
 //! `.cmd` shim to `node <entry>.js`) so a no-console MCP host never deadlocks on
 //! `cmd /C` (see `aibridge_platform::Platform::spawn_plan`).
 
-use crate::progress::ProgressSink;
+use crate::progress::{write_status, ProgressSink};
 use aibridge_platform::{DefaultPlatform, Platform};
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// Shared in-flight review progress: the reader thread folds codex's streamed
-/// `codex/event` notifications into it while a call is active (set by
+/// Shared in-flight review progress: the reader + heartbeat threads fold codex's
+/// streamed events / liveness into it while a call is active (set by
 /// [`CodexPeer::begin_progress`] / cleared by [`CodexPeer::end_progress`]).
 type Progress = Arc<Mutex<Option<ProgressSink>>>;
 
-/// Is this parsed line a JSON-RPC NOTIFICATION (has `method`, no/`null` `id`)?
-/// Codex streams its turn events as notifications; responses carry an `id`.
+/// Is this parsed line a JSON-RPC NOTIFICATION? A notification has a `method` and
+/// NO `id` MEMBER at all. A `method` WITH an `id` (even `id: null`) is a server
+/// request, not a notification — classify by key presence, not by null (Codex
+/// review). Responses have an `id` and no `method`.
 fn is_notification(v: &Value) -> bool {
-    v.get("method").is_some() && v.get("id").map(Value::is_null).unwrap_or(true)
+    match v.as_object() {
+        Some(o) => o.contains_key("method") && !o.contains_key("id"),
+        None => false,
+    }
 }
 
 /// Deadline for the MCP handshake (`initialize`). Generous enough for a cold
@@ -82,8 +88,10 @@ pub struct CodexPeer {
     next_id: i64,
     spawn_kind: &'static str,
     spawn_program: String,
-    /// Live review-progress sink the reader thread updates from codex events.
+    /// Live review-progress sink the reader + heartbeat threads update.
     progress: Progress,
+    /// Set on drop to stop the heartbeat thread.
+    hb_shutdown: Arc<AtomicBool>,
 }
 
 impl CodexPeer {
@@ -148,13 +156,17 @@ impl CodexPeer {
                         match serde_json::from_str::<Value>(trimmed) {
                             // Relay turn-event notifications to the live progress
                             // sink, then forward JSON; stop if the request side has
-                            // gone away.
+                            // gone away. The disk write happens AFTER the lock is
+                            // released (snapshot pattern) so file I/O never blocks
+                            // the reader while holding the shared mutex.
                             Ok(v) => {
                                 if is_notification(&v) {
-                                    if let Ok(mut g) = reader_progress.lock() {
-                                        if let Some(sink) = g.as_mut() {
-                                            sink.note(&v);
-                                        }
+                                    let snap = reader_progress
+                                        .lock()
+                                        .ok()
+                                        .and_then(|mut g| g.as_mut().and_then(|s| s.note(&v)));
+                                    if let Some(snap) = snap {
+                                        write_status(&snap);
                                     }
                                 }
                                 if tx.send(FromCodex::Message(v)).is_err() {
@@ -173,6 +185,26 @@ impl CodexPeer {
             }
         });
 
+        // Heartbeat thread: while a review is active, refresh its elapsed/bridge
+        // heartbeat (~every second, throttled) even when Codex emits nothing — so a
+        // long silent reasoning gap reads as "thinking", not "hung", and a watcher
+        // sees the clock move. Exits when the peer is dropped.
+        let hb_shutdown = Arc::new(AtomicBool::new(false));
+        let hb_progress = Arc::clone(&progress);
+        let hb_flag = Arc::clone(&hb_shutdown);
+        std::thread::spawn(move || {
+            while !hb_flag.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_secs(1));
+                let snap = hb_progress
+                    .lock()
+                    .ok()
+                    .and_then(|mut g| g.as_mut().and_then(|s| s.heartbeat()));
+                if let Some(snap) = snap {
+                    write_status(&snap);
+                }
+            }
+        });
+
         let mut peer = CodexPeer {
             child,
             stdin,
@@ -181,6 +213,7 @@ impl CodexPeer {
             spawn_kind,
             spawn_program,
             progress,
+            hb_shutdown,
         };
         peer.initialize()?;
         Ok(peer)
@@ -197,21 +230,28 @@ impl CodexPeer {
     }
 
     /// Start live progress tracking for a review in `cwd` (`phase` labels it, e.g.
-    /// `plan-gate` / `review` / `consult:<topic>`). The reader thread then streams
-    /// codex's turn events into `.ai-bridge/review-status.json`. Pair with
-    /// [`end_progress`](Self::end_progress).
+    /// `plan-gate` / `review` / `consult:<topic>`). The reader + heartbeat threads
+    /// then stream codex's turn events / liveness into `.ai-bridge/review-status.json`.
+    /// Pair with [`end_progress`](Self::end_progress). `ProgressSink::new` writes the
+    /// initial status itself (before the sink is shared), so no I/O under the lock.
     pub fn begin_progress(&self, cwd: &str, phase: &str) {
+        let sink = ProgressSink::new(cwd, phase);
         if let Ok(mut g) = self.progress.lock() {
-            *g = Some(ProgressSink::new(cwd, phase));
+            *g = Some(sink);
         }
     }
 
-    /// Stop tracking the current review (writes a final inactive snapshot).
-    pub fn end_progress(&self) {
-        if let Ok(mut g) = self.progress.lock() {
-            if let Some(mut sink) = g.take() {
-                sink.finish();
-            }
+    /// Stop tracking the current review and write a final snapshot with the terminal
+    /// `outcome` (`completed` / `error` / `timeout`). The disk write happens after
+    /// the lock is released.
+    pub fn end_progress(&self, outcome: &str) {
+        let snap = self
+            .progress
+            .lock()
+            .ok()
+            .and_then(|mut g| g.take().map(|mut s| s.finish(outcome)));
+        if let Some(snap) = snap {
+            write_status(&snap);
         }
     }
 
@@ -351,6 +391,19 @@ impl CodexPeer {
 
 impl Drop for CodexPeer {
     fn drop(&mut self) {
+        // Stop the heartbeat thread.
+        self.hb_shutdown.store(true, Ordering::Relaxed);
+        // Drop-guard: if a review was still in flight (the child died / a call
+        // panicked before end_progress), record a terminal `error` so the status
+        // file never stays stuck on `active: true`.
+        let snap = self
+            .progress
+            .lock()
+            .ok()
+            .and_then(|mut g| g.take().map(|mut s| s.finish("error")));
+        if let Some(snap) = snap {
+            write_status(&snap);
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -374,6 +427,27 @@ fn extract_text(result: &Value) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn classifies_jsonrpc_notifications_by_id_key_presence() {
+        // Notification: method present, NO id member.
+        assert!(is_notification(
+            &json!({"jsonrpc":"2.0","method":"codex/event","params":{}})
+        ));
+        // Server REQUEST: method WITH id — not a notification, even if id is null.
+        assert!(!is_notification(
+            &json!({"jsonrpc":"2.0","id":7,"method":"elicit","params":{}})
+        ));
+        assert!(!is_notification(
+            &json!({"jsonrpc":"2.0","id":null,"method":"elicit","params":{}})
+        ));
+        // Response: id + result, no method.
+        assert!(!is_notification(
+            &json!({"jsonrpc":"2.0","id":2,"result":{}})
+        ));
+        // Non-object lines are never notifications.
+        assert!(!is_notification(&json!("hello")));
+    }
+
     /// Real codex round-trip proving the reader relays codex's turn events into the
     /// live progress sink. Ignored by default (needs `codex` logged in + quota);
     /// run manually: `cargo test -p aibridge-core --release -- --ignored progress`.
@@ -389,7 +463,7 @@ mod tests {
         let _ = peer
             .open_thread("Reply with the single word OK.", &cwds, "low")
             .expect("codex open_thread");
-        peer.end_progress();
+        peer.end_progress("completed");
 
         let st = crate::progress::read_status(&cwds).expect("status file written");
         eprintln!("CAPTURED STATUS: {st}");

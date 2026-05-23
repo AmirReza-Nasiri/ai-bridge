@@ -129,7 +129,7 @@ impl Server {
                     .ok_or_else(|| anyhow::anyhow!("codex peer unavailable"))?;
                 peer.begin_progress(cwd, &phase);
                 let r = peer.reply(&tid, prompt);
-                peer.end_progress();
+                peer.end_progress(if r.is_ok() { "completed" } else { "error" });
                 r
             };
             match reply {
@@ -151,7 +151,7 @@ impl Server {
                 .ok_or_else(|| anyhow::anyhow!("codex peer unavailable"))?;
             peer.begin_progress(cwd, &phase);
             let r = peer.open_thread(prompt, cwd, crate::codex::REVIEW_REASONING_EFFORT);
-            peer.end_progress();
+            peer.end_progress(if r.is_ok() { "completed" } else { "error" });
             r
         };
         match opened {
@@ -421,7 +421,7 @@ impl Server {
                 .ok_or_else(|| anyhow::anyhow!("codex peer unavailable"))?;
             peer.begin_progress(cwd, "implement");
             let r = peer.open_thread(prompt, cwd, crate::codex::IMPLEMENT_REASONING_EFFORT);
-            peer.end_progress();
+            peer.end_progress(if r.is_ok() { "completed" } else { "error" });
             r
         };
         match opened {
