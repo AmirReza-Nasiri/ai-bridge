@@ -1,0 +1,107 @@
+name: Release
+
+# Cut a release by pushing a tag, e.g. `git tag v0.2.1 && git push origin v0.2.1`.
+# Per-platform release binaries are built, then a single `publish` job attaches
+# them all (+ sha256) to the GitHub Release at once — so the release is never
+# left with only some platforms' assets. `aibridge update` (Phase 2c) downloads
+# by exact name `aibridge-<target>[.exe]` (version comes from the tag).
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Refuse to release a tag whose version doesn't match Cargo.toml, otherwise the
+  # downloaded binary would report the wrong version and the updater would loop.
+  preflight:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag must match the workspace version
+        shell: bash
+        run: |
+          set -euo pipefail
+          ver="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          tag="${GITHUB_REF_NAME#v}"
+          echo "Cargo version: $ver | tag: $tag"
+          if [ "$ver" != "$tag" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo version $ver — bump Cargo.toml or fix the tag"
+            exit 1
+          fi
+
+  build:
+    needs: preflight
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            ext: ".exe"
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            ext: ""
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            ext: ""
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            ext: ""
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history so build.rs can stamp the git SHA/date
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }} -p aibridge
+      - name: Stage asset (+ sha256)
+        shell: bash
+        run: |
+          set -euo pipefail
+          src="target/${{ matrix.target }}/release/aibridge${{ matrix.ext }}"
+          asset="aibridge-${{ matrix.target }}${{ matrix.ext }}"
+          cp "$src" "$asset"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$asset" > "$asset.sha256"
+          else
+            shasum -a 256 "$asset" > "$asset.sha256"
+          fi
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            aibridge-${{ matrix.target }}${{ matrix.ext }}
+            aibridge-${{ matrix.target }}${{ matrix.ext }}.sha256
+          if-no-files-found: error
+
+  # Single publish step: only after EVERY platform built, attach all assets to the
+  # release in one shot (no partial release).
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release + upload assets (built-in GITHUB_TOKEN)
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create release + upload all assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
