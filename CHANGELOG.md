@@ -6,6 +6,31 @@ versioning is semver.
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-05-23
+
+### Changed
+
+- **Warm-peer pre-warming hardened (peer-reviewed, APPROVE).** Fixes the first
+  review of a session being COLD even though a background warmer was running — the
+  dominant ~30s/~51K-token cost (the diff itself is negligible):
+  - **Adopt the in-flight warmer instead of cold-spawning a second child.**
+    `ensure_peer` now does a bounded `recv_timeout` (60s) to ADOPT the
+    background-warmed child when a review arrives mid-warm-up, instead of the old
+    non-blocking `try_recv` that discarded the in-flight warmer and cold-spawned
+    (the worst of both — cold AND a wasted warm-up). Adopting reuses the ~51K
+    system-prompt cost already paid on the Gate thread, so the first Stop/review is
+    a warm `codex-reply`.
+  - **Re-warm after a transport error.** `invalidate_peer` now kicks off a fresh
+    background warm (idempotent — never stacks warmers/children), so one Codex error
+    no longer returns the whole session to cold first-calls.
+  - **Reset per-child counters on child replacement.** `gate_reviews` (and
+    `plan_epoch`) reset whenever the child/thread map is replaced, so a stale
+    anti-anchoring count can't drop a freshly-warmed Gate thread before the next
+    review uses it.
+  - PlanGate is intentionally NOT pre-warmed: the per-epoch anti-anchoring reset in
+    `plan_gate()` would discard it. Only the Gate thread (Stop + `review_diff`) is
+    pre-warmed.
+
 ## [0.5.2] - 2026-05-23
 
 ### Changed

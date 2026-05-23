@@ -52,6 +52,14 @@ const MAX_CONSULT_TOPICS: usize = 32;
 /// stale prior-diff findings while keeping warm-cache speed in between.
 const GATE_RESET_EVERY: u32 = 10;
 
+/// How long `ensure_peer` waits to ADOPT an in-flight background-warmed child before
+/// giving up and cold-spawning. Sized to comfortably cover a cold child spawn + one
+/// `xhigh` primer turn (the warm-up), so a first review that arrives mid-warm-up
+/// adopts the warm child instead of paying the cold system-prompt cost again. The
+/// Stop hook (1800s) and interactive tools tolerate this wait, which only happens
+/// when warming is still in flight.
+const WARM_ADOPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Holds the warm Codex child + a topic→threadId registry + per-(workspace,session)
 /// gate state. ONE child hosts many ISOLATED threads (verified: distinct threadIds
 /// don't leak into each other).
@@ -90,29 +98,64 @@ impl Server {
         if self.codex.is_some() {
             return Ok(());
         }
-        // One-shot: consume the warming receiver. If ready, adopt the warmed child
-        // + register its pre-opened gate thread. If not, dropping the rx lets the
-        // warming child self-clean (its `send` fails on the closed channel) — no
-        // leak — and we cold-spawn instead.
+        // Adopt the background-warmed child if one is in flight. BLOCK briefly
+        // (bounded) rather than cold-spawning a second child: the warmer has already
+        // paid the ~51K system-prompt cost on the Gate thread, so adopting it makes
+        // the first review a warm `codex-reply` instead of paying that cost AGAIN on
+        // a fresh cold child (the previous `try_recv` threw the in-flight warmer away
+        // whenever the first review beat warm-up — the worst of both: cold + wasted).
+        // This runs on the request thread, which is exactly the call that needs the
+        // peer (it would otherwise wait on the cold spawn anyway); no lock is held.
         if let Some(rx) = self.warm_rx.take() {
-            if let Ok((peer, gate_tid)) = rx.try_recv() {
-                self.codex = Some(peer);
-                self.threads.clear();
-                self.threads.insert(TopicKey::Gate, gate_tid);
-                return Ok(());
+            use std::sync::mpsc::RecvTimeoutError;
+            match rx.recv_timeout(WARM_ADOPT_TIMEOUT) {
+                Ok((peer, gate_tid)) => {
+                    self.codex = Some(peer);
+                    self.threads.clear();
+                    self.threads.insert(TopicKey::Gate, gate_tid);
+                    // Fresh child ⇒ fresh Gate thread: reset the anti-anchoring
+                    // counter so a stale count can't drop this just-warmed thread
+                    // before the next review uses it (Codex review).
+                    self.gate_reviews = 0;
+                    return Ok(());
+                }
+                // Warmer failed (thread ended → rx disconnected) or is too slow:
+                // cold-spawn now. The abandoned warmer self-cleans — its later `send`
+                // fails on the dropped rx and its CodexPeer is killed on Drop (its
+                // open_thread is itself deadline-bounded by CALL_TIMEOUT).
+                Err(RecvTimeoutError::Disconnected) | Err(RecvTimeoutError::Timeout) => {}
             }
         }
         self.codex = Some(CodexPeer::spawn()?);
         self.threads.clear();
+        self.gate_reviews = 0; // new child ⇒ new Gate thread; reset the counter
         Ok(())
+    }
+
+    /// Start background warming unless a peer is already live OR a warmer is already
+    /// in flight — idempotent, so re-warm calls never stack warmers/children.
+    fn spawn_warming_if_absent(&mut self) {
+        if self.codex.is_some() || self.warm_rx.is_some() {
+            return;
+        }
+        self.warm_rx = Some(spawn_warming());
     }
 
     /// Drop the child + all its (now-dead) thread mappings so the next call spawns
     /// fresh. A timed-out/wedged child must never be reused — its stdin may no
     /// longer drain, and the next (synchronous, unbounded) write would then hang.
+    /// Then re-warm in the background so the NEXT call can adopt a warm child rather
+    /// than cold-spawn (otherwise one transport error returns us to cold first calls
+    /// for the rest of the session).
     fn invalidate_peer(&mut self) {
         self.codex = None;
         self.threads.clear();
+        // The current child's Gate + PlanGate threads died with it: reset the
+        // per-child counters so a stale count can't drop the next child's
+        // freshly-(re)warmed Gate thread, and so the next plan_gate re-opens cleanly.
+        self.gate_reviews = 0;
+        self.plan_epoch = None;
+        self.spawn_warming_if_absent();
     }
 
     /// Ask Codex on `key`'s thread: continue it if known (warm `codex-reply`) or
@@ -1240,7 +1283,7 @@ pub fn serve() -> anyhow::Result<()> {
     if let Ok(cwd) = std::env::current_dir() {
         crate::plan_gate::promote_pending(&cwd.display().to_string());
     }
-    server.warm_rx = Some(spawn_warming()); // warm Codex while the user works
+    server.spawn_warming_if_absent(); // warm Codex in the background while the user works
     let stdin = std::io::stdin();
     let mut reader = stdin.lock();
     let mut stdout = std::io::stdout();
