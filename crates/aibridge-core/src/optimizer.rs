@@ -41,23 +41,35 @@ pub fn pretooluse(hook_input: &Value) -> String {
         .get("tool_name")
         .and_then(Value::as_str)
         .unwrap_or("");
-    // Plan-gate enforcement (deny wins; merged here so a denied pre-approval Bash
-    // is never also rtk-rewritten, per Codex review). The hook payload carries cwd.
+    // The hook payload carries cwd + tool_input.
     let cwd = hook_input.get("cwd").and_then(Value::as_str).unwrap_or(".");
+    let tool_input_opt = hook_input.get("tool_input");
+    let command = tool_input_opt
+        .and_then(|t| t.get("command"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    // 1. Pre-approval plan gate: deny writes/Bash until the plan is Codex-approved
+    //    (deny wins; merged here so a denied pre-approval Bash is never also
+    //    rtk-rewritten, per Codex review).
     if let Some(deny) = crate::plan_gate::enforce(cwd, tool_name) {
+        return deny;
+    }
+    // 2. Post-approval risk delta: an APPROVED task attempting an unapproved
+    //    high-risk command (publish/deploy/migration/destructive shell) re-arms the
+    //    gate so the plan is re-reviewed with that command in scope. AI Bridge does
+    //    NOT hard-fence ordinary file writes (self-reported scope is a weak boundary
+    //    that would train users to disable the gate); instead the approved plan is
+    //    fed to the Stop gate, which compares it against the actual diff.
+    if let Some(deny) = crate::plan_gate::enforce_risk(cwd, tool_name, command) {
         return deny;
     }
     if tool_name != "Bash" {
         return no_change;
     }
-    let tool_input = match hook_input.get("tool_input") {
+    let tool_input = match tool_input_opt {
         Some(v) => v,
         None => return no_change,
     };
-    let command = tool_input
-        .get("command")
-        .and_then(Value::as_str)
-        .unwrap_or("");
     if command.is_empty() || raw_bypassed(command) || !is_rtk_safe(command) {
         return no_change;
     }

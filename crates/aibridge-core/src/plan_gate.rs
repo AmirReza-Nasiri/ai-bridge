@@ -179,6 +179,63 @@ fn write_state(cwd: &str, v: &Value) -> std::io::Result<()> {
     std::fs::rename(&tmp, d.join("state.json"))
 }
 
+// The in-flight review marker lives in its OWN atomic file (`pending`), NOT in
+// `state.json`. `begin_review` (warm server) and `start_epoch` (UserPromptSubmit
+// hook) run in different processes with no lock; keeping the review nonce out of
+// the authority state means a `begin_review` write can never read-modify-write its
+// way over a concurrent `start_epoch` reset (Codex review). Each entry is tagged
+// with the epoch, so a stale marker from a previous epoch is simply ignored.
+fn pending_path(cwd: &str) -> PathBuf {
+    dir(cwd).join("pending")
+}
+
+/// Record THIS review's submission (epoch + plan hash) atomically in the separate
+/// `pending` file. One write, no authority-state touch.
+fn write_pending(cwd: &str, epoch: &str, plan_hash: u64) {
+    let d = dir(cwd);
+    if std::fs::create_dir_all(&d).is_err() {
+        return;
+    }
+    let body = json!({ "epoch": epoch, "plan_hash": plan_hash }).to_string();
+    let tmp = d.join(format!("pending.tmp.{}", std::process::id()));
+    if std::fs::write(&tmp, body).is_ok() {
+        let _ = std::fs::rename(&tmp, pending_path(cwd));
+    }
+}
+
+/// The in-flight review's (epoch, plan_hash), if any.
+fn read_pending(cwd: &str) -> Option<(String, u64)> {
+    let v: Value = serde_json::from_str(&std::fs::read_to_string(pending_path(cwd)).ok()?).ok()?;
+    let epoch = v.get("epoch").and_then(Value::as_str)?.to_string();
+    let hash = v.get("plan_hash").and_then(Value::as_u64)?;
+    Some((epoch, hash))
+}
+
+/// Drop the in-flight review marker (new epoch / clean slate). Best-effort.
+fn clear_pending(cwd: &str) {
+    let _ = std::fs::remove_file(pending_path(cwd));
+}
+
+/// Insert/overwrite a top-level field in a JSON object value (no-op if `v` is not
+/// an object). Shared by `record`/`revoke` so they all mutate state the same way.
+fn set_field(v: &mut Value, k: &str, val: Value) {
+    if let Some(o) = v.as_object_mut() {
+        o.insert(k.into(), val);
+    }
+}
+
+/// Cap the stored approved-plan text so `state.json` stays small (the Stop gate
+/// only needs the gist for a scope-vs-diff comparison).
+fn cap_plan(plan: &str) -> String {
+    const MAX: usize = 4000;
+    if plan.chars().count() <= MAX {
+        plan.to_string()
+    } else {
+        let head: String = plan.chars().take(MAX).collect();
+        format!("{head}\n…(plan truncated)")
+    }
+}
+
 /// Stable non-cryptographic hash, shared shape with the Stop-gate.
 fn hash_str(s: &str) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -217,11 +274,17 @@ pub fn start_epoch(cwd: &str, session: &str, prompt: &str) {
     let state = json!({
         "epoch": epoch,
         "approved": false,
+        "status": "pending",
+        "revoked_reason": "new_epoch",
         "approved_plan_hash": Value::Null,
+        "approved_command_classes": [],
+        "approved_plan": "",
         "rounds": 0,
         "last_findings_hash": Value::Null,
         "same_findings": 0,
     });
+    // A new task starts with no in-flight review (drop any prior epoch's marker).
+    clear_pending(cwd);
     if write_state(cwd, &state).is_err() {
         // Fail closed: if we can't write the fresh PENDING epoch, delete any prior
         // (possibly APPROVED) state so the gate denies until a plan is re-approved,
@@ -266,11 +329,38 @@ fn bypassed() -> bool {
             .unwrap_or(false)
 }
 
+/// True when the current epoch is approved AND no DIFFERENT plan is currently under
+/// review. The in-flight review marker (separate `pending` file) lets a changed-plan
+/// re-submission re-block writes during its (minutes-long) review WITHOUT any
+/// authority-state write from `begin_review`: if a pending review for THIS epoch
+/// names a plan whose hash differs from the approved one, the prior approval is
+/// treated as superseded until the new plan is approved.
+fn effectively_approved(cwd: &str) -> bool {
+    if !is_approved(cwd) {
+        return false;
+    }
+    if !pending_path(cwd).exists() {
+        return true; // no in-flight review → approval stands
+    }
+    match read_pending(cwd) {
+        Some((pe, ph)) if pe == current_epoch(cwd) => {
+            // counts as approved only if the in-flight review is the SAME plan that
+            // was approved (idempotent re-check); a different plan is still in review.
+            read_state(cwd).and_then(|s| s.get("approved_plan_hash").and_then(Value::as_u64))
+                == Some(ph)
+        }
+        Some(_) => true, // marker from another epoch → ignore (start_epoch clears it)
+        // Present but unreadable → conservatively treat as a changed-plan review in
+        // flight (a corrupt marker must NOT fail open).
+        None => false,
+    }
+}
+
 /// The gate is currently HOLDING writes (enabled, not bypassed, current task not
-/// yet approved). Used by both the PreToolUse hook AND the in-process `run` tool,
-/// so `run` (which executes arbitrary shell) can't bypass the hook.
+/// effectively approved). Used by both the PreToolUse hook AND the in-process `run`
+/// tool, so `run` (which executes arbitrary shell) can't bypass the hook.
 pub fn blocks_writes(cwd: &str) -> bool {
-    is_enabled(cwd) && !bypassed() && !is_approved(cwd)
+    is_enabled(cwd) && !bypassed() && !effectively_approved(cwd)
 }
 
 /// Is this tool one the gate must hold until approval? Includes `mcp__aibridge__run`
@@ -315,6 +405,310 @@ fn deny_json() -> String {
             "hookEventName": "PreToolUse",
             "permissionDecision": "deny",
             "permissionDecisionReason": reason
+        }
+    })
+    .to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Revocable, scope-bound approval (plan-gate v2)
+//
+// A single APPROVE no longer permanently unlocks the whole epoch. Approval is
+// revoked when: (a) a later non-APPROVE verdict comes back for THIS epoch
+// (`record`), (b) a materially different plan is submitted while approved
+// (`begin_review`), or (c) an unapproved HIGH-RISK command is attempted
+// (`enforce_risk`). New user prompt = new epoch stays the outer boundary. We do
+// NOT fence ordinary file writes (self-reported `intended_files` is a weak
+// boundary and hard-fencing trains users to disable the gate) — instead the
+// approved plan is fed to the Stop gate, which compares it against the actual diff
+// (every changed file) and flags out-of-scope or unplanned high-risk changes.
+// ---------------------------------------------------------------------------
+
+fn push_unique(out: &mut Vec<&'static str>, c: &'static str) {
+    if !out.contains(&c) {
+        out.push(c);
+    }
+}
+
+/// Does `tok` name the program `name`, tolerating a `.exe` suffix and a path
+/// prefix (`/usr/bin/git`, `C:\\bin\\git.exe`)? Used for the leading program of a
+/// (sub)command so `git.exe push` / `/bin/rm -rf` are not missed.
+fn token_is_cmd(tok: &str, name: &str) -> bool {
+    let base = tok.rsplit(['/', '\\']).next().unwrap_or(tok);
+    base == name
+        || base
+            .strip_suffix(".exe")
+            .map(|b| b == name)
+            .unwrap_or(false)
+}
+
+/// A downloader piped into a shell interpreter (`curl … | sh`, `iwr … | iex`,
+/// `wget … | sudo bash`). Checked on the raw lowered string because it is about
+/// the pipe itself, before separators are flattened for tokenizing.
+fn is_pipe_to_shell(lowered: &str) -> bool {
+    let has_dl = [
+        "curl ",
+        "wget ",
+        "iwr ",
+        "irm ",
+        "invoke-webrequest",
+        "invoke-restmethod",
+    ]
+    .iter()
+    .any(|p| lowered.contains(p));
+    if !has_dl {
+        return false;
+    }
+    lowered.split('|').skip(1).any(|seg| {
+        let mut toks = seg.split_whitespace();
+        let mut first = toks.next().unwrap_or("");
+        if first == "sudo" {
+            first = toks.next().unwrap_or("");
+        }
+        matches!(
+            first,
+            "sh" | "bash" | "zsh" | "dash" | "ksh" | "iex" | "pwsh" | "powershell"
+        )
+    })
+}
+
+/// Scan free text (a command OR a plan) for ALL high-risk command CLASSES present.
+/// Token-based (not raw substring) so `warm -reset`/`git pushd`/a path containing a
+/// risk phrase don't false-trigger, and `git.exe push`/`/bin/rm -rf` aren't missed.
+/// Shell separators are flattened so each sub-command's program is matched on its
+/// own; surrounding quotes/backticks/punctuation are trimmed so prose like
+/// "run `git push`" classifies too. False positives only cost one extra plan round.
+fn scan_risk_classes(text: &str) -> Vec<&'static str> {
+    let lowered = text.to_lowercase();
+    let mut out: Vec<&'static str> = Vec::new();
+    if is_pipe_to_shell(&lowered) {
+        push_unique(&mut out, "pipe-to-shell");
+    }
+    // Flatten shell separators so tokens from adjacent sub-commands don't fuse.
+    let spaced: String = lowered
+        .chars()
+        .map(|c| if "|&;\n\r\t()".contains(c) { ' ' } else { c })
+        .collect();
+    let tokens: Vec<&str> = spaced
+        .split_whitespace()
+        .map(|t| t.trim_matches(|c: char| "`'\".,!?".contains(c)))
+        .filter(|t| !t.is_empty())
+        .collect();
+    if tokens.is_empty() {
+        return out;
+    }
+    let has = |t: &str| tokens.contains(&t);
+    let has_any = |opts: &[&str]| tokens.iter().any(|x| opts.contains(x));
+    let has_prefix = |p: &str| tokens.iter().any(|x| x.starts_with(p));
+    let has_cmd = |name: &str| tokens.iter().any(|t| token_is_cmd(t, name));
+    let seq = |a: &str, b: &str| tokens.windows(2).any(|w| w[0] == a && w[1] == b);
+    // A clustered short flag like `-rf`/`-r`/`-fr` (recursive); excludes `--long`.
+    let recursive_flag = || {
+        tokens.iter().any(|t| {
+            (t.starts_with('-') && !t.starts_with("--") && t.contains('r')) || *t == "--recursive"
+        })
+    };
+
+    // destructive filesystem
+    if (has_cmd("rm") && recursive_flag())
+        || (has_cmd("remove-item") && has_any(&["-recurse", "-r"]))
+        || (has_any(&["rmdir", "rd"]) && has("/s"))
+        || (has_cmd("del") && has_any(&["/s", "/q"]))
+    {
+        push_unique(&mut out, "destructive-fs");
+    }
+
+    // remote publish / deploy
+    if (has_cmd("git") && has("push"))
+        || (has_any(&["npm", "yarn", "pnpm", "bun"]) && has("publish"))
+        || (has_cmd("cargo") && has("publish"))
+        || (has_cmd("gh") && has("release") && has_any(&["create", "upload", "edit", "delete"]))
+        || (has_cmd("docker") && has("push"))
+        || (has_any(&["vercel", "netlify", "wrangler", "firebase", "fly", "flyctl"])
+            && has("deploy"))
+        || (has_cmd("vercel") && has("--prod"))
+    {
+        push_unique(&mut out, "remote-publish");
+    }
+
+    // destructive DB / schema / migration execution
+    if seq("drop", "table")
+        || seq("drop", "database")
+        || seq("truncate", "table")
+        || (has_cmd("prisma") && has("migrate") && has_any(&["deploy", "reset"]))
+        || (has_cmd("drizzle-kit") && has_any(&["migrate", "push"]))
+        || (has_cmd("knex") && has_prefix("migrate"))
+        || (has_cmd("alembic") && has("upgrade"))
+        || (has_cmd("rails") && has_prefix("db:migrate"))
+        || (has_any(&["sequelize", "sequelize-cli"]) && has_prefix("db:migrate"))
+        || (has_cmd("typeorm") && has("migration:run"))
+        || (has_cmd("supabase") && has("db") && has("push"))
+    {
+        push_unique(&mut out, "db-migration");
+    }
+
+    // infrastructure mutation
+    if (has_cmd("terraform") && has_any(&["apply", "destroy"]))
+        || (has_cmd("pulumi") && has_any(&["up", "destroy"]))
+        || (has_cmd("kubectl") && has_any(&["apply", "delete"]))
+    {
+        push_unique(&mut out, "infra-mutation");
+    }
+    out
+}
+
+/// The single highest-risk class of one command (the first match), or `None` for
+/// an ordinary command. Public for display; the gate uses [`unapproved_high_risk`]
+/// which checks EVERY class so a chained unapproved command can't hide.
+pub fn high_risk_class(command: &str) -> Option<&'static str> {
+    scan_risk_classes(command).into_iter().next()
+}
+
+/// The canonical high-risk class names the gate understands (and that the reviewer
+/// may authorize via a `RISK-APPROVED:` line).
+pub const RISK_CLASSES: &[&str] = &[
+    "destructive-fs",
+    "remote-publish",
+    "db-migration",
+    "infra-mutation",
+    "pipe-to-shell",
+];
+
+/// Parse the high-risk command classes the REVIEWER explicitly authorized, from a
+/// `RISK-APPROVED: class, class` line in Codex's review text. Authorization comes
+/// from the reviewer — which understands the plan's intent, including a "do NOT run
+/// X" instruction — NOT from scanning the plan prose, so a plan merely *mentioning*
+/// a dangerous command can't silently pre-authorize it. No line (or no known class)
+/// → empty, so every high-risk command re-arms the gate (fail-safe).
+pub fn parse_risk_approved(review: &str) -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = Vec::new();
+    for line in review.lines() {
+        // Require a STANDALONE reviewer-owned line: after stripping leading markdown
+        // list/quote/emphasis chars, it must START with the tag — so the tag merely
+        // QUOTED inside explanatory prose can't authorize anything.
+        let lower = line.to_lowercase();
+        let head = lower.trim_start_matches(|c: char| c.is_whitespace() || "-*>#`".contains(c));
+        let Some(rest) = head.strip_prefix("risk-approved:") else {
+            continue;
+        };
+        for tok in rest.split(',') {
+            let t = tok.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-');
+            if let Some(canon) = RISK_CLASSES.iter().find(|c| **c == t) {
+                push_unique(&mut out, canon);
+            }
+        }
+    }
+    out
+}
+
+/// Command classes already authorized by the current approved plan.
+pub fn approved_command_classes(cwd: &str) -> Vec<String> {
+    read_state(cwd)
+        .and_then(|s| {
+            s.get("approved_command_classes")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+        })
+        .unwrap_or_default()
+}
+
+/// The plan text approved for the current epoch (kept for the Stop gate's
+/// scope-vs-diff comparison; cleared when a new epoch starts). Survives a revoke
+/// so the Stop gate still knows what scope was last agreed.
+pub fn approved_plan(cwd: &str) -> Option<String> {
+    read_state(cwd)?
+        .get("approved_plan")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Revoke the current epoch's approval (re-arm the gate). `reason` is recorded for
+/// `doctor`/diagnostics. Best-effort: a missing state file means nothing to revoke.
+pub fn revoke(cwd: &str, reason: &str) {
+    if let Some(mut s) = read_state(cwd) {
+        set_field(&mut s, "approved", json!(false));
+        if let Some(o) = s.as_object_mut() {
+            o.remove("approved_epoch");
+        }
+        set_field(&mut s, "status", json!("pending"));
+        set_field(&mut s, "revoked_reason", json!(reason));
+        let _ = write_state(cwd, &s);
+    }
+}
+
+/// Called by the `plan_gate` tool BEFORE the (minutes-long) Codex review. Records
+/// THIS submission (epoch + plan hash) in the separate `pending` file. Two effects,
+/// both WITHOUT writing the authority state (so it can't race `start_epoch`):
+///   1. While a plan whose hash differs from the approved one is in review,
+///      [`effectively_approved`] returns false → writes re-block (closes the
+///      "approve narrow phase-1, execute broad phase-2 under one epoch" gap).
+///   2. [`record`] approves only if this marker is still the in-flight plan, so a
+///      superseded review's late APPROVE can't take effect.
+///
+/// Re-submitting the SAME approved plan keeps approval (marker hash == approved).
+pub fn begin_review(cwd: &str, plan: &str) {
+    if !is_enabled(cwd) {
+        return;
+    }
+    write_pending(cwd, &current_epoch(cwd), hash_str(plan));
+}
+
+/// Post-approval risk class that the approved plan did NOT cover, for a Bash/run
+/// command — `None` when the command is ordinary, its class is already approved,
+/// the gate is off/bypassed, or the plan isn't approved (pre-approval is already
+/// blocked by [`enforce`]). Does not mutate state.
+pub fn unapproved_high_risk(cwd: &str, tool_name: &str, command: &str) -> Option<&'static str> {
+    if !is_enabled(cwd) || bypassed() {
+        return None;
+    }
+    if tool_name != "Bash" && tool_name != "mcp__aibridge__run" {
+        return None;
+    }
+    if !effectively_approved(cwd) {
+        return None;
+    }
+    // Check EVERY class in the command (a chained `git push && terraform destroy`
+    // must not pass just because its FIRST class is approved). Deny on the first
+    // class the approved plan did not authorize.
+    let approved = approved_command_classes(cwd);
+    scan_risk_classes(command)
+        .into_iter()
+        .find(|class| !approved.iter().any(|a| a == class))
+}
+
+/// PreToolUse risk gate (runs AFTER [`enforce`] returns allow): if an approved
+/// task attempts an unapproved high-risk command, revoke approval and DENY so the
+/// plan is re-reviewed with the command in scope. `None` to allow.
+pub fn enforce_risk(cwd: &str, tool_name: &str, command: &str) -> Option<String> {
+    let class = unapproved_high_risk(cwd, tool_name, command)?;
+    revoke(cwd, "high_risk_command_delta");
+    Some(risk_deny_json(class))
+}
+
+/// Human-readable instruction for a high-risk re-gate (shared by the hook deny and
+/// the `run` tool's plain-text reply).
+pub fn risk_delta_message(class: &str) -> String {
+    format!(
+        "PLAN_RISK_DELTA_REQUIRED: this command is a high-risk class ('{class}') that the \
+         approved plan did not cover, so the plan gate has re-armed. Do NOT retry this command. \
+         Update your plan to name this exact command under risk_surfaces (e.g. `git push`, \
+         `prisma migrate deploy`, `rm -rf`), call `mcp__aibridge__plan_gate` again, and once it \
+         returns <AI-BRIDGE-APPROVE/> this command class is allowed for the task."
+    )
+}
+
+fn risk_deny_json(class: &str) -> String {
+    json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": risk_delta_message(class)
         }
     })
     .to_string()
@@ -375,24 +769,65 @@ pub fn record(
         );
     }
     let rounds = s.get("rounds").and_then(Value::as_u64).unwrap_or(0) + 1;
-    let set = |s: &mut Value, k: &str, v: Value| {
-        if let Some(o) = s.as_object_mut() {
-            o.insert(k.into(), v);
-        }
-    };
-    set(&mut s, "rounds", json!(rounds));
+    set_field(&mut s, "rounds", json!(rounds));
 
     match verdict {
         crate::gate::Verdict::Approve => {
-            set(&mut s, "approved", json!(true));
+            // Stale-review guard: only approve the plan that is still the in-flight
+            // submission. `begin_review` records (epoch, plan_hash) in the separate
+            // `pending` file; if a NEWER plan was submitted for THIS epoch while this
+            // review ran, refuse — its APPROVE is superseded. (No marker → skipped,
+            // e.g. gate-off manual use or a direct unit-test call.)
+            if pending_path(cwd).exists() {
+                match read_pending(cwd) {
+                    // A newer plan for THIS epoch superseded this review.
+                    Some((pe, ph)) if pe == epoch && ph != hash_str(plan) => {
+                        return Outcome::NeedsInfo(
+                            "AI Bridge: a newer plan was submitted while this one was under \
+                             review — re-submit the CURRENT plan to plan_gate before proceeding."
+                                .to_string(),
+                        );
+                    }
+                    // Present but unreadable → can't confirm this IS the current plan;
+                    // refuse rather than approve against a corrupt marker.
+                    None => {
+                        return Outcome::NeedsInfo(
+                            "AI Bridge: the in-flight review marker is unreadable — re-submit the \
+                             current plan to plan_gate before proceeding."
+                                .to_string(),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            set_field(&mut s, "approved", json!(true));
             // Bind approval to THIS epoch so is_approved() can reject a stale flag.
-            set(&mut s, "approved_epoch", json!(epoch));
-            set(&mut s, "approved_plan_hash", json!(hash_str(plan)));
-            set(&mut s, "same_findings", json!(0));
+            set_field(&mut s, "approved_epoch", json!(epoch));
+            set_field(&mut s, "approved_plan_hash", json!(hash_str(plan)));
+            // Pre-authorize ONLY the high-risk classes the REVIEWER explicitly
+            // allowed (its `RISK-APPROVED:` line) — never inferred from plan prose.
+            // Keep the plan text for the Stop gate's scope-vs-diff comparison.
+            set_field(
+                &mut s,
+                "approved_command_classes",
+                json!(parse_risk_approved(findings)),
+            );
+            set_field(&mut s, "approved_plan", json!(cap_plan(plan)));
+            set_field(&mut s, "status", json!("approved"));
+            set_field(&mut s, "revoked_reason", Value::Null);
+            set_field(&mut s, "same_findings", json!(0));
             let _ = write_state(cwd, &s);
             Outcome::Approved
         }
         crate::gate::Verdict::RequestChanges => {
+            // A non-APPROVE verdict for THIS epoch REVOKES any prior approval — the
+            // gate must never tell Claude to "revise" while writes stay unlocked.
+            set_field(&mut s, "approved", json!(false));
+            if let Some(o) = s.as_object_mut() {
+                o.remove("approved_epoch");
+            }
+            set_field(&mut s, "status", json!("rejected"));
+            set_field(&mut s, "revoked_reason", json!("request_changes"));
             let fh = hash_str(findings);
             let prev = s.get("last_findings_hash").and_then(Value::as_u64);
             let same = if prev == Some(fh) {
@@ -400,8 +835,8 @@ pub fn record(
             } else {
                 1
             };
-            set(&mut s, "last_findings_hash", json!(fh));
-            set(&mut s, "same_findings", json!(same));
+            set_field(&mut s, "last_findings_hash", json!(fh));
+            set_field(&mut s, "same_findings", json!(same));
             let _ = write_state(cwd, &s);
             if same >= NO_PROGRESS_THRESHOLD as u64 {
                 Outcome::Stuck(findings.to_string())
@@ -410,6 +845,13 @@ pub fn record(
             }
         }
         crate::gate::Verdict::Blocked | crate::gate::Verdict::Unparseable => {
+            // Same fail-closed contract: a non-decision must not leave writes open.
+            set_field(&mut s, "approved", json!(false));
+            if let Some(o) = s.as_object_mut() {
+                o.remove("approved_epoch");
+            }
+            set_field(&mut s, "status", json!("needs_info"));
+            set_field(&mut s, "revoked_reason", json!("blocked"));
             let _ = write_state(cwd, &s);
             Outcome::NeedsInfo(findings.to_string())
         }
@@ -428,7 +870,13 @@ pub fn prompt(plan: &str) -> String {
          Write:\n\
          1. FINDINGS: if the plan is sound, write \"No blocking concerns.\"; otherwise list \
          concise, actionable changes the agent should make to the plan.\n\
-         2. A final line that is EXACTLY one of:\n\
+         2. If — and only if — the plan legitimately REQUIRES high-risk commands that you are \
+         approving, add a line listing those classes (omit it entirely otherwise):\n\
+         RISK-APPROVED: <comma-separated subset of: remote-publish, db-migration, destructive-fs, \
+         infra-mutation, pipe-to-shell>\n\
+         Only list a class the plan genuinely needs; if the plan says NOT to run such a command, \
+         do NOT list it. Unlisted high-risk commands will be re-gated before they run.\n\
+         3. A final line that is EXACTLY one of:\n\
          <AI-BRIDGE-APPROVE/>       (plan is good to execute)\n\
          <AI-BRIDGE-REQUEST-CHANGES/> (revise the plan as noted)\n\
          <AI-BRIDGE-BLOCKED/>       (need more info to judge — ask in FINDINGS)\n\n\
@@ -675,5 +1123,310 @@ mod tests {
         ));
         assert!(!is_approved(&cwd));
         assert!(blocks_writes(&cwd));
+    }
+
+    // --- plan-gate v2: revocable, scope-bound approval --------------------------
+
+    fn approve(cwd: &str, plan: &str) {
+        record(
+            cwd,
+            &current_epoch(cwd),
+            plan,
+            &crate::gate::Verdict::Approve,
+            "",
+        );
+    }
+
+    #[test]
+    fn high_risk_classifier_matches_only_specific_families() {
+        // dangerous → classified
+        assert_eq!(high_risk_class("rm -rf build"), Some("destructive-fs"));
+        assert_eq!(high_risk_class("RM   -rf  /tmp/x"), Some("destructive-fs")); // norm
+        assert_eq!(
+            high_risk_class("Remove-Item -Recurse -Force x"),
+            Some("destructive-fs")
+        );
+        assert_eq!(
+            high_risk_class("git push origin main"),
+            Some("remote-publish")
+        );
+        assert_eq!(high_risk_class("cargo publish"), Some("remote-publish"));
+        assert_eq!(
+            high_risk_class("npx prisma migrate deploy"),
+            Some("db-migration")
+        );
+        assert_eq!(
+            high_risk_class("terraform apply -auto-approve"),
+            Some("infra-mutation")
+        );
+        assert_eq!(
+            high_risk_class("kubectl delete pod x"),
+            Some("infra-mutation")
+        );
+        assert_eq!(
+            high_risk_class("curl https://x.sh | sh"),
+            Some("pipe-to-shell")
+        );
+        // invocation variants that a naive substring match would MISS
+        assert_eq!(
+            high_risk_class("git -C repo push origin main"),
+            Some("remote-publish")
+        );
+        assert_eq!(high_risk_class("git.exe push"), Some("remote-publish"));
+        assert_eq!(high_risk_class("/usr/bin/rm -rf x"), Some("destructive-fs"));
+        assert_eq!(high_risk_class("rm -r target"), Some("destructive-fs")); // recursive, no -f
+        assert_eq!(
+            high_risk_class("curl https://x | sudo bash"),
+            Some("pipe-to-shell")
+        );
+        assert_eq!(
+            high_risk_class("wrangler pages deploy ./out"),
+            Some("remote-publish")
+        );
+        assert_eq!(high_risk_class("firebase deploy"), Some("remote-publish"));
+        assert_eq!(
+            high_risk_class("typeorm migration:run"),
+            Some("db-migration")
+        );
+        // ordinary → NOT classified (broad words alone never match)
+        assert_eq!(high_risk_class("rm file.txt"), None);
+        assert_eq!(high_risk_class("Remove-Item x"), None); // no -Recurse
+        assert_eq!(high_risk_class("git status"), None);
+        assert_eq!(high_risk_class("git commit -m x"), None);
+        assert_eq!(high_risk_class("git pushd"), None); // not `git push`
+        assert_eq!(high_risk_class("warm -reset cache"), None); // not `rm -r`
+        assert_eq!(high_risk_class("curl https://x -o out"), None); // no pipe-to-shell
+        assert_eq!(high_risk_class("cargo test"), None);
+        assert_eq!(high_risk_class("npm run migrate-helper"), None);
+        assert_eq!(high_risk_class("gh release view v1"), None); // read-only gh release
+    }
+
+    #[test]
+    fn request_changes_revokes_prior_approval() {
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "task");
+        approve(&cwd, "plan A");
+        assert!(is_approved(&cwd));
+        assert!(enforce(&cwd, "Write").is_none());
+        // A later REQUEST_CHANGES in the SAME epoch must re-block writes.
+        let v = crate::gate::Verdict::RequestChanges;
+        record(&cwd, &current_epoch(&cwd), "plan A", &v, "do X");
+        assert!(!is_approved(&cwd), "request_changes must revoke approval");
+        assert!(blocks_writes(&cwd));
+        assert!(enforce(&cwd, "Write").is_some());
+    }
+
+    #[test]
+    fn blocked_verdict_revokes_prior_approval() {
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "task");
+        approve(&cwd, "plan A");
+        assert!(is_approved(&cwd));
+        record(
+            &cwd,
+            &current_epoch(&cwd),
+            "plan A",
+            &crate::gate::Verdict::Blocked,
+            "need info",
+        );
+        assert!(!is_approved(&cwd), "blocked must revoke approval");
+    }
+
+    #[test]
+    fn changed_plan_under_review_reblocks_writes_without_authority_write() {
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "task");
+        approve(&cwd, "plan A");
+        // Re-submitting the SAME plan keeps approval (idempotent re-check).
+        begin_review(&cwd, "plan A");
+        assert!(!blocks_writes(&cwd), "same plan keeps approval");
+        // A materially different plan under review re-blocks writes — via the
+        // separate `pending` marker, WITHOUT touching the authority state (so it
+        // can't race start_epoch). The raw approval flag is untouched.
+        begin_review(&cwd, "plan B — much broader");
+        assert!(
+            blocks_writes(&cwd),
+            "changed plan under review blocks writes"
+        );
+        assert!(
+            is_approved(&cwd),
+            "authority state untouched by begin_review"
+        );
+    }
+
+    #[test]
+    fn reviewer_risk_approved_authorizes_command_classes() {
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "deploy task");
+        // The REVIEWER explicitly authorizes remote-publish in its review output.
+        record(
+            &cwd,
+            &current_epoch(&cwd),
+            "deploy plan",
+            &crate::gate::Verdict::Approve,
+            "Looks good.\nRISK-APPROVED: remote-publish",
+        );
+        assert!(approved_command_classes(&cwd)
+            .iter()
+            .any(|c| c == "remote-publish"));
+        assert_eq!(
+            unapproved_high_risk(&cwd, "Bash", "git push origin main"),
+            None
+        );
+        // …but a class the reviewer did NOT authorize is still gated.
+        assert_eq!(
+            unapproved_high_risk(&cwd, "Bash", "prisma migrate deploy"),
+            Some("db-migration")
+        );
+    }
+
+    #[test]
+    fn plan_prose_naming_a_command_does_not_authorize_it() {
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "task");
+        // Plan MENTIONS git push but the reviewer added NO RISK-APPROVED line —
+        // authorization must come from the reviewer, not from plan prose.
+        record(
+            &cwd,
+            &current_epoch(&cwd),
+            "Plan: we will run `git push` at the end.",
+            &crate::gate::Verdict::Approve,
+            "No blocking concerns.",
+        );
+        assert!(approved_command_classes(&cwd).is_empty());
+        assert_eq!(
+            unapproved_high_risk(&cwd, "Bash", "git push"),
+            Some("remote-publish")
+        );
+    }
+
+    #[test]
+    fn enforce_risk_revokes_and_denies_unapproved_command() {
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "refactor");
+        approve(&cwd, "Plan: refactor the component."); // no high-risk command named
+        assert!(is_approved(&cwd));
+        // An ordinary command after approval is allowed and does not revoke.
+        assert!(enforce_risk(&cwd, "Bash", "cargo test").is_none());
+        assert!(is_approved(&cwd));
+        // A high-risk command the plan didn't cover → deny + re-arm the gate.
+        let deny = enforce_risk(&cwd, "Bash", "git push origin main");
+        assert!(deny.is_some());
+        assert!(deny.unwrap().contains("PLAN_RISK_DELTA_REQUIRED"));
+        assert!(!is_approved(&cwd), "high-risk delta must revoke approval");
+        assert!(blocks_writes(&cwd));
+    }
+
+    #[test]
+    fn unapproved_high_risk_is_noop_before_approval() {
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "task");
+        // Pre-approval is enforce()'s job; the risk gate must not fire yet.
+        assert_eq!(unapproved_high_risk(&cwd, "Bash", "git push"), None);
+        assert!(enforce_risk(&cwd, "Bash", "git push").is_none());
+    }
+
+    #[test]
+    fn chained_command_cannot_hide_an_unapproved_class() {
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "deploy");
+        // Reviewer authorizes remote-publish only.
+        record(
+            &cwd,
+            &current_epoch(&cwd),
+            "deploy plan",
+            &crate::gate::Verdict::Approve,
+            "ok\nRISK-APPROVED: remote-publish",
+        );
+        // First class (remote-publish) is approved, but the SECOND (infra-mutation)
+        // is not — the gate must still catch it (no first-class masking).
+        assert_eq!(
+            unapproved_high_risk(&cwd, "Bash", "git push && terraform destroy"),
+            Some("infra-mutation")
+        );
+    }
+
+    #[test]
+    fn stale_review_approve_is_refused() {
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "task");
+        let epoch = current_epoch(&cwd);
+        // Plan A starts review (stamps pending=hash(A))…
+        begin_review(&cwd, "plan A");
+        // …but a newer plan B is submitted before A's verdict returns.
+        begin_review(&cwd, "plan B");
+        // A's late APPROVE is superseded → refused, gate stays closed.
+        assert!(matches!(
+            record(&cwd, &epoch, "plan A", &crate::gate::Verdict::Approve, ""),
+            Outcome::NeedsInfo(_)
+        ));
+        assert!(!is_approved(&cwd));
+        // The CURRENT plan (B) can still be approved normally.
+        assert!(matches!(
+            record(&cwd, &epoch, "plan B", &crate::gate::Verdict::Approve, ""),
+            Outcome::Approved
+        ));
+        assert!(is_approved(&cwd));
+    }
+
+    #[test]
+    fn approved_plan_survives_revoke_for_stop_gate() {
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "task");
+        approve(&cwd, "Plan: edit src/a.rs");
+        assert_eq!(approved_plan(&cwd).as_deref(), Some("Plan: edit src/a.rs"));
+        // approved_plan survives a later revoke (the Stop gate still needs the scope).
+        revoke(&cwd, "high_risk_command_delta");
+        assert!(!is_approved(&cwd));
+        assert_eq!(approved_plan(&cwd).as_deref(), Some("Plan: edit src/a.rs"));
+        // …but a NEW epoch clears it (start_epoch resets state).
+        start_epoch(&cwd, "sess", "next task");
+        assert_eq!(approved_plan(&cwd), None);
+    }
+
+    #[test]
+    fn corrupt_pending_marker_fails_closed() {
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "task");
+        approve(&cwd, "plan A");
+        assert!(!blocks_writes(&cwd)); // approved, no in-flight review
+                                       // A present-but-unreadable pending marker must NOT fail open.
+        std::fs::write(pending_path(&cwd), b"{ not json").unwrap();
+        assert!(blocks_writes(&cwd), "corrupt pending marker must block");
+        // …and record must refuse to approve against a corrupt marker.
+        assert!(matches!(
+            record(
+                &cwd,
+                &current_epoch(&cwd),
+                "plan A",
+                &crate::gate::Verdict::Approve,
+                ""
+            ),
+            Outcome::NeedsInfo(_)
+        ));
+    }
+
+    #[test]
+    fn risk_approved_must_be_a_standalone_line() {
+        // A standalone line authorizes (markdown bullet tolerated)…
+        assert_eq!(
+            parse_risk_approved("findings\n- RISK-APPROVED: remote-publish, db-migration"),
+            vec!["remote-publish", "db-migration"]
+        );
+        // …but the tag merely QUOTED inside prose does not.
+        assert!(parse_risk_approved("Do not add a RISK-APPROVED: remote-publish line.").is_empty());
+        // Unknown class names are ignored.
+        assert!(parse_risk_approved("RISK-APPROVED: launch-missiles").is_empty());
     }
 }

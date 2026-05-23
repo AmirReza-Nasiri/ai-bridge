@@ -261,6 +261,16 @@ impl Server {
                     "AI Bridge: `run` is blocked by the plan gate — this task has no approved \
                      plan yet. Call `plan_gate` with your plan and retry after <AI-BRIDGE-APPROVE/>."
                         .to_string()
+                } else if let Some(class) =
+                    crate::plan_gate::unapproved_high_risk(&cwd, "mcp__aibridge__run", command)
+                {
+                    // Approved task, but a high-risk command class the plan didn't
+                    // cover → re-arm the gate (same contract as the PreToolUse hook).
+                    crate::plan_gate::revoke(&cwd, "high_risk_command_delta");
+                    format!(
+                        "AI Bridge: `run` blocked — {}",
+                        crate::plan_gate::risk_delta_message(class)
+                    )
                 } else {
                     run_command(command)
                 }
@@ -468,6 +478,10 @@ impl Server {
         // Capture the epoch BEFORE the (minutes-long) Codex call so `record` can
         // refuse to approve if a new task started meanwhile (TOCTOU guard).
         let epoch = crate::plan_gate::current_epoch(&cwd);
+        // If this epoch is already approved but the plan materially changed, revoke
+        // up front so writes re-block while the new plan is under review (the
+        // minutes-long Codex call must not run with stale approval still open).
+        crate::plan_gate::begin_review(&cwd, plan);
         // New task epoch → drop the prior plan dialogue so it can't anchor.
         if self.plan_epoch.as_deref() != Some(epoch.as_str()) {
             self.threads.remove(&TopicKey::PlanGate);
@@ -590,7 +604,11 @@ impl Server {
             }
         }
 
-        let prompt = gate::prompt(&bundle.text);
+        // Feed the pre-approved plan (if any) so the reviewer can flag changes that
+        // fall outside the approved scope or high-risk actions the plan never named
+        // — the soft-telemetry half of plan-gate v2 (we don't hard-fence files).
+        let approved_plan = crate::plan_gate::approved_plan(cwd);
+        let prompt = gate::prompt_with_scope(&bundle.text, approved_plan.as_deref());
         // Periodic anti-anchoring reset of the reserved review thread (shared bound
         // with manual review_diff; warm-cache speed is kept for the runs between).
         self.tick_gate_reset();

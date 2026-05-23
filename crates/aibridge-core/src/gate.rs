@@ -32,6 +32,24 @@ pub const NO_PROGRESS_THRESHOLD: u32 = 2;
 
 /// The review prompt: review the CURRENT diff only, end with exactly one tag.
 pub fn prompt(diff_bundle: &str) -> String {
+    prompt_with_scope(diff_bundle, None)
+}
+
+/// Like [`prompt`], but when a pre-approved plan exists for the task, also asks the
+/// reviewer to flag changes outside the approved scope or unplanned high-risk
+/// actions. This is the soft-telemetry half of plan-gate v2 — AI Bridge never
+/// hard-fences files; the Stop gate compares the approved plan against the real
+/// diff instead.
+pub fn prompt_with_scope(diff_bundle: &str, approved_plan: Option<&str>) -> String {
+    let scope = match approved_plan {
+        Some(p) if !p.trim().is_empty() => format!(
+            "\nThis task had a PRE-APPROVED plan/scope. In addition, flag any change clearly \
+             OUTSIDE this scope, or any high-risk action (publish/deploy/migrations/destructive \
+             shell/data loss) the plan did not mention:\n\
+             === APPROVED PLAN ===\n{p}\n=== END APPROVED PLAN ===\n"
+        ),
+        _ => String::new(),
+    };
     format!(
         "You are AI Bridge's Stop-gate peer reviewer.\n\
          Review ONLY the current uncommitted changes below. Any earlier turns in this \
@@ -47,7 +65,8 @@ pub fn prompt(diff_bundle: &str) -> String {
          Be strict. Use REQUEST-CHANGES for ANY correctness/safety bug — crashes, undefined \
          names, broken tests, missed requirements, regressions, or unhandled edge cases (empty \
          input, division by zero, null/None, out-of-bounds). Use APPROVE only when the diff is \
-         genuinely safe to ship as-is. Use BLOCKED only when required context is missing.\n\n\
+         genuinely safe to ship as-is. Use BLOCKED only when required context is missing.\n\
+         {scope}\n\
          === CURRENT CHANGES ===\n{diff_bundle}"
     )
 }

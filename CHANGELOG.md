@@ -6,6 +6,41 @@ versioning is semver.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-05-23
+
+### Changed
+
+- **Plan gate is now revocable + scope-bound (plan-gate v2).** A single APPROVE no
+  longer permanently unlocks the whole user-prompt epoch. This closes the gap where
+  Claude could get a narrow phase-1 plan approved and then execute broad later work
+  (or run a destructive command) under the same approval, with only the Stop gate as
+  a backstop. New behavior:
+  - **A non-APPROVE verdict revokes.** A later `REQUEST_CHANGES`/`BLOCKED` for the
+    same epoch sets `approved=false` — the gate can no longer say "revise" while
+    writes stay unlocked (it was previously a silent no-op contradiction).
+  - **A materially-changed plan re-arms during review.** Re-submitting a different
+    plan re-blocks writes while it is under review, via a separate atomic `pending`
+    marker file — so `begin_review` never read-modify-writes the authority state and
+    cannot race the `UserPromptSubmit` epoch reset. A late APPROVE from a superseded
+    review is refused (epoch + plan-hash nonce); a corrupt marker fails closed.
+  - **High-risk command delta.** Even under an approved plan, an unapproved
+    high-risk command (remote publish/deploy, DB migration, destructive filesystem,
+    infra mutation, `curl … | sh`) is denied with `PLAN_RISK_DELTA_REQUIRED` and
+    re-arms the gate. Detection is a narrow, token-based static classifier (no Codex
+    call on the hot path); it tolerates `.exe`/path-prefixed programs and chained
+    commands, and checks EVERY class so a chained unapproved command can't hide
+    behind an approved one. Authorization comes from the REVIEWER: Codex lists the
+    classes it approves on a `RISK-APPROVED:` line — never inferred from plan prose
+    (so a plan merely mentioning, or saying "do NOT run", a command can't authorize
+    it). No line → every high-risk command re-gates (fail-safe).
+  - **No file fencing.** Ordinary file writes are never hard-blocked by self-reported
+    scope (a weak boundary that would train users to disable the gate). Instead the
+    approved plan is fed to the Stop gate, which compares it against the actual diff
+    (every changed file, incl. untracked) and flags out-of-scope or unplanned
+    high-risk changes.
+  - New-user-prompt = new-epoch remains the outer boundary. Design + 3 implementation
+    rounds Codex-reviewed → APPROVE.
+
 ## [0.4.1] - 2026-05-23
 
 ### Fixed

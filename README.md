@@ -16,7 +16,7 @@
 | **`review_diff`** — review the current git diff | ✅ working |
 | **`implement`** — Codex drafts a unified-diff patch (validated with `git apply --check`) for you to review + apply | ✅ working |
 | **`run`** — structured command/test execution (exit code, duration, capped output, process-tree timeout) | ✅ working |
-| **`plan_gate`** — the **automatic** PRE-execution plan gate (Codex must approve the task's plan before any write/Bash; default-on, mirror of the Stop gate) | ✅ working |
+| **`plan_gate`** — the **automatic** PRE-execution plan gate (Codex must approve the task's plan before any write/Bash; default-on, mirror of the Stop gate). Approval is **revocable + scope-bound**: a non-APPROVE verdict or a materially-changed plan re-arms it, and an unapproved high-risk command (publish/deploy/migration/destructive shell) is re-gated | ✅ working |
 | **`review_stop`** — the **automatic** Stop-hook gate (allow/block + no-progress + fail-ask; node-direct spawn, background warming, project-subtree scoped, deadline-bounded) | ✅ working |
 | **`aibridge init`** — one-command local wiring, both gates by default (subdirectory-of-a-repo aware) | ✅ working |
 | **`aibridge doctor` / `selftest`** — one-command health + connection check (version, install-shape, `--check-updates`) | ✅ working |
@@ -112,9 +112,13 @@ it works:
 - **Before coding — the plan gate.** On a new task, Claude does read-only
   discovery (Read/Grep/Glob) and forms a plan; the first write/Bash is blocked
   until Codex approves that plan via a short multi-round dialogue (`plan_gate`).
-  So the *approach* is vetted before a line is written. On by default; skip a
-  trivial task with `AIBRIDGE_PLAN_GATE=0`, or turn the gate off at install with
-  `aibridge init --no-plan-gate`.
+  So the *approach* is vetted before a line is written. The approval is
+  **scope-bound**: if Claude later submits a materially different plan, or a
+  reviewer round comes back non-APPROVE, the gate re-arms; and an unapproved
+  high-risk command (publish/deploy/migration/destructive shell) is re-gated
+  before it runs, so a narrow approval can't be stretched into broad or dangerous
+  work. On by default; skip a trivial task with `AIBRIDGE_PLAN_GATE=0`, or turn the
+  gate off at install with `aibridge init --no-plan-gate`.
 - **Before finishing — the review gate.** When Claude finishes, the `Stop` hook
   sends the resulting diff to the warm Codex peer. If Codex finds a real problem,
   Claude is sent back to fix it before finishing.
