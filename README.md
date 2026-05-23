@@ -79,17 +79,21 @@ handshake, MCP registration, the Stop hook, and install state:
 
 ```
 AI Bridge doctor (windows)
-  [ ok ] aibridge — v0.1.0 (...)
-  [ ok ] claude CLI — 2.1.145
+  [ ok ] aibridge version — 0.4.0 (git 1a2b3c4, 2026-05-23) (C:\Users\you\.local\bin\aibridge.exe)
+  [ ok ] claude CLI — 2.1.146 (Claude Code)
   [ ok ] codex CLI — codex-cli 0.130.0
   [ ok ] codex mcp-server handshake — connects (quota-free)
   [ ok ] codex launch mode — node-direct — ...\node.exe ...\codex.js
   [ ok ] review reasoning effort — xhigh (thorough — reviews take minutes, no cutoff)
   [ ok ] aibridge MCP registration — registered + connected
+  [ ok ] aibridge binary path — registered to a stable path (not a build artifact)
+  [ ok ] install metadata — recorded (...\aibridge.exe)
   [ ok ] Stop review hook — installed (.claude/settings.local.json)
   ...
 RESULT: all good — AI Bridge is wired and connected.
 ```
+
+(`aibridge doctor --check-updates` adds an `updates` line that asks GitHub for a newer release.)
 
 For a deeper proof that actually exercises a Codex review (uses quota):
 `aibridge selftest --full`.

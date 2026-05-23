@@ -10,8 +10,11 @@
    `xcode-select --install` before anything else. (`git` is also required at
    runtime: `review_diff` and the gate diff the working tree.)
 
-1. **Install the Rust toolchain.** There is no prebuilt release asset yet, so
-   `aibridge` is built from source — Rust is a real prerequisite on macOS today:
+1. **Install the Rust toolchain.** A prebuilt release asset now exists
+   (`aibridge-aarch64-apple-darwin` / `aibridge-x86_64-apple-darwin`, CI-built —
+   the **build-from-source** path below is the human-verified one on Apple Silicon,
+   so it stays the recommended install; the prebuilt binary is the same source
+   built by CI). To build from source, Rust is the prerequisite:
 
    ```bash
    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
@@ -45,15 +48,27 @@
 5. **Restart Claude Code** — `init` prints `RESTART_REQUIRED` — so it connects the
    `aibridge` MCP server and loads the Stop hook.
 
-6. **Verify in one command:** `aibridge doctor` (no quota). For a real Codex
-   round-trip proof before relying on the gate: `aibridge selftest --full` (uses
-   quota). `aibridge selftest` alone is the same checks as `doctor`.
+6. **Verify in one command:** `aibridge doctor` (no quota; add `--check-updates`
+   to also ask GitHub for a newer release). For a real Codex round-trip proof
+   before relying on the gate: `aibridge selftest --full` (uses quota).
+   `aibridge selftest` alone is the same checks as `doctor`.
+
+## Updating
+
+- `aibridge update` downloads the matching release binary (`aibridge-aarch64-apple-darwin`
+  / `aibridge-x86_64-apple-darwin`) via the GitHub CLI (`gh`), verifies its SHA-256,
+  `chmod +x`es it, and atomically replaces the installed binary; then restart Claude
+  Code so the MCP server picks it up. `aibridge update --check` reports without
+  changing anything. `aibridge --version` shows version + build provenance.
+- Updating needs `gh` + `gh auth login` (private repo). On a download (vs a
+  `cargo install` build) clear Gatekeeper quarantine if macOS complains:
+  `xattr -dr com.apple.quarantine <path>/aibridge`.
 
 ## macOS gotchas
 
-- **No prebuilt release yet** → build from source, so the Rust toolchain is a real
-  prerequisite (not just "if you build it yourself"). `cargo install` produces a
-  release binary.
+- **Prebuilt assets are CI-built** (arm64 native; x86_64 cross-compiled). The
+  human-verified install is the `cargo install` source build on Apple Silicon, so
+  it stays the recommendation; `aibridge update` / a downloaded asset is fine too.
 - **Gatekeeper quarantine does NOT apply to a `cargo install`-built binary** — it
   only hits a *downloaded* binary. If/when prebuilt assets exist, clear it with
   `xattr -dr com.apple.quarantine ./aibridge`.

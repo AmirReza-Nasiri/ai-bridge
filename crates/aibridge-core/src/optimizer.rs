@@ -32,7 +32,7 @@ pub fn pretooluse_str(stdin: &str) -> String {
     pretooluse(&v)
 }
 
-/// Decide a PreToolUse outcome. First enforces the (opt-in) plan gate — denying a
+/// Decide a PreToolUse outcome. First enforces the plan gate (default-on) — denying a
 /// write/Bash tool until the task's plan is Codex-approved — then, for an allowed
 /// Bash command, returns `{}` (no change) or an `updatedInput` rtk rewrite.
 pub fn pretooluse(hook_input: &Value) -> String {

@@ -2,8 +2,9 @@
 //!
 //! v4 successor to `codex-peer`. Design + usage: see `README.md`.
 //!
-//! This is the Phase-0 foundation: the CLI surface is wired as stubs so the
-//! shape is real and `--version` works. Functionality lands in later phases.
+//! CLI entry point: `mcp-server` (the warm engine Claude connects to), `init`
+//! (wire a project — both gates by default), `doctor`/`selftest`, `update`, the
+//! internal `hook` entry points, and a reserved `profile` command.
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -23,7 +24,7 @@ struct Cli {
 enum Commands {
     /// Run the AI Bridge MCP server (the warm peer engine).
     McpServer,
-    /// Wire the MCP server + Stop review hook into the project (local).
+    /// Wire the MCP server + both review gates (plan + Stop) into the project (local).
     Init {
         /// Also wire the rtk output-optimizer PreToolUse hook (safe mode).
         #[arg(long)]
@@ -180,7 +181,7 @@ fn doctor_cmd(full: bool, check_updates: bool) -> Result<()> {
 
 fn not_yet(what: &str) -> Result<()> {
     println!(
-        "AI Bridge v{} (foundation) on {} — `{}` is not implemented yet.",
+        "AI Bridge v{} on {} — `{}` is not implemented yet.",
         aibridge_core::version(),
         aibridge_platform::platform_name(),
         what

@@ -208,7 +208,7 @@ impl Server {
             "health" => health::report(),
             "capability_status" => health::capability_report(),
             "budget_status" => {
-                "AI Bridge: no active review budget state yet (foundation).".to_string()
+                "AI Bridge: no active review budget state yet (not implemented).".to_string()
             }
             "consult" => {
                 let args = msg.pointer("/params/arguments");
@@ -1293,7 +1293,7 @@ fn tools() -> Value {
             "plan_gate",
             "PRE-execution plan review: before you start CODING a task, submit your todolist/plan \
              here for a Codex second opinion. Returns a verdict — APPROVE, REQUEST_CHANGES \
-             (revise and call again), or needs-info. When the (opt-in) plan gate is active, \
+             (revise and call again), or needs-info. When the plan gate is active (default-on), \
              writes (Write/Edit/MultiEdit/NotebookEdit) and Bash are BLOCKED until this returns \
              <AI-BRIDGE-APPROVE/> for the current task. Do read-only discovery (Read/Grep/Glob) \
              first, then submit a concrete plan.",

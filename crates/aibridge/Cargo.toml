@@ -1,5 +1,7 @@
 [package]
 name = "aibridge"
+description = "Keeps Codex warm as a fast peer reviewer for Claude Code — an automatic plan gate + Stop review gate, on-demand consult, and self-update."
+keywords = ["claude", "codex", "mcp", "code-review", "ai"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -1,4 +1,4 @@
-//! Pre-execution plan gate (OPT-IN): before any file change in a task, Codex
+//! Pre-execution plan gate (DEFAULT-ON; `init --no-plan-gate` to skip): before any file change in a task, Codex
 //! reviews the task's todolist/approach in a continuous dialogue until APPROVE —
 //! the planning-phase mirror of the Stop-gate (which reviews the result after).
 //!

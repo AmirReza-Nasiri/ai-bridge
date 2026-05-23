@@ -1,7 +1,8 @@
-//! AI Bridge core: warm peer engine, review strategies, profile translation.
-//!
-//! Increment: exposes [`version`], a [`health`] check, a [`codex`] warm-peer
-//! client, and the [`mcp`] stdio server (with a live `consult` tool).
+//! AI Bridge core: the warm Codex peer engine ([`codex`]), the [`mcp`] stdio
+//! server (consult / plan_gate / review_diff / implement / run / review_stop /
+//! health / capability_status / budget_status), the two review gates ([`gate`],
+//! [`plan_gate`]), [`git`] diffing, persisted consult [`topics`], the rtk
+//! [`optimizer`] hook, [`install`] wiring, [`doctor`] checks, and [`update`].
 
 pub mod codex;
 pub mod doctor;
@@ -27,7 +28,7 @@ pub const GIT_SHA: &str = env!("AIBRIDGE_GIT_SHA");
 /// Commit date (YYYY-MM-DD) of the build, or "unknown". Embedded by `build.rs`.
 pub const BUILD_DATE: &str = env!("AIBRIDGE_BUILD_DATE");
 
-/// Full version string for `--version` / `doctor`: `0.2.0 (git 8f2c9da, 2026-05-23)`.
+/// Full version string for `--version` / `doctor`, e.g. `0.4.0 (git 8f2c9da, 2026-05-23)`.
 pub const VERSION_FULL: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     " (git ",
