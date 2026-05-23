@@ -30,6 +30,13 @@ fn main() {
 
     println!("cargo:rustc-env=AIBRIDGE_GIT_SHA={sha}");
     println!("cargo:rustc-env=AIBRIDGE_BUILD_DATE={date}");
+    // The target triple this binary is built for — used by `update` to pick the
+    // matching release asset (`aibridge-<target>[.exe]`). `TARGET` is set by Cargo
+    // for build scripts; it is NOT available via `env!` in normal code.
+    println!(
+        "cargo:rustc-env=AIBRIDGE_TARGET={}",
+        std::env::var("TARGET").unwrap_or_else(|_| "unknown".into())
+    );
 
     // Refresh the stamp when HEAD / refs / staged state move (best-effort; path is
     // relative to this crate dir = <repo>/crates/aibridge-core). `index` catches

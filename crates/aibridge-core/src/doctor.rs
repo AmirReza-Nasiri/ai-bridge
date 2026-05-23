@@ -240,7 +240,7 @@ fn update_check() -> Check {
                 (Some(c), Some(l)) if l > c => check(
                     Status::Warn,
                     "updates",
-                    format!("newer release available: {c} → {l} (see `aibridge update`)"),
+                    format!("newer release available: {c} → {l} (run `aibridge update`)"),
                 ),
                 (Some(c), Some(l)) if l == c => check(
                     Status::Pass,

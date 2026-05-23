@@ -6,6 +6,23 @@ versioning is semver.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-05-23
+
+### Added
+
+- **`aibridge update` now installs (Phase 2c).** Downloads the latest release's
+  binary for this platform (`aibridge-<target>[.exe]`) via `gh release download`,
+  verifies its sha256 against the published `.sha256` (one new dep, `sha2` — the
+  right place to not skimp), and replaces the installed binary: an atomic rename on
+  Unix; on Windows the in-use exe is renamed aside to a UNIQUE `<name>.old.<pid>.<ts>`
+  backup and the new one moved into place (with rollback on failure and best-effort
+  sweep of old backups). It is fail-safe — on any error the verified binary is left
+  staged and the install is never half-written. Flags: `--check` (report only),
+  `--yes` (no prompt), `--target <path>` (replace a specific binary), `--from-source`
+  (reserved; not implemented). After updating, restart Claude Code so the MCP server
+  picks up the new binary. Codex-reviewed (design + 2 implementation rounds → APPROVE:
+  sha2 verification, unique Windows backup name, honest messaging).
+
 ## [0.3.0] - 2026-05-23
 
 ### Added

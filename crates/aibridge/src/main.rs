@@ -51,11 +51,20 @@ enum Commands {
         #[arg(long = "check-updates")]
         check_updates: bool,
     },
-    /// Check for (and later, install) a newer AI Bridge release.
+    /// Check for and install a newer AI Bridge release.
     Update {
-        /// Only check + report; don't change anything. (Apply lands in a later release.)
+        /// Only check + report; don't change anything.
         #[arg(long)]
         check: bool,
+        /// Apply without the interactive confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+        /// Build from source instead of downloading a release (not implemented yet).
+        #[arg(long = "from-source")]
+        from_source: bool,
+        /// Replace this binary path instead of the auto-resolved one (advanced).
+        #[arg(long)]
+        target: Option<String>,
     },
     /// Internal hook entry points (invoked by Claude Code hooks, not by you).
     Hook {
@@ -97,7 +106,12 @@ fn main() -> Result<()> {
         },
         Commands::Selftest { full } => doctor_cmd(full, false),
         Commands::Doctor { check_updates } => doctor_cmd(false, check_updates),
-        Commands::Update { check } => update_cmd(check),
+        Commands::Update {
+            check,
+            yes,
+            from_source,
+            target,
+        } => update_cmd(check, yes, from_source, target),
         Commands::Hook { action } => match action {
             HookAction::Pretooluse => hook_pretooluse(),
             HookAction::UserPromptSubmit => hook_user_prompt_submit(),
@@ -105,21 +119,35 @@ fn main() -> Result<()> {
     }
 }
 
-fn update_cmd(check_only: bool) -> Result<()> {
+fn update_cmd(
+    check_only: bool,
+    yes: bool,
+    from_source: bool,
+    target: Option<String>,
+) -> Result<()> {
     use std::time::Duration;
     println!("AI Bridge {}\n", aibridge_core::VERSION_FULL);
-    println!(
-        "{}",
-        aibridge_core::update::check_report(Duration::from_secs(15))
-    );
-    if !check_only {
+    if check_only {
         println!(
-            "\nNote: automatic download/replace isn't available in this build yet — until the \
-             next release ships it, update by rebuilding from source (git pull + cargo build \
-             --release) or re-running the installer. `aibridge update --check` does the same check."
+            "{}",
+            aibridge_core::update::check_report(Duration::from_secs(15))
         );
+        return Ok(());
     }
-    Ok(())
+    match aibridge_core::update::apply_update(aibridge_core::update::ApplyOptions {
+        assume_yes: yes,
+        from_source,
+        target_path: target,
+    }) {
+        Ok(msg) => {
+            println!("{msg}");
+            Ok(())
+        }
+        Err(msg) => {
+            eprintln!("AI Bridge update: {msg}");
+            std::process::exit(1);
+        }
+    }
 }
 
 fn hook_pretooluse() -> Result<()> {
