@@ -62,6 +62,9 @@ pub fn init(project: &Path, rtk: bool, plan_gate: bool) -> Result<InitReport> {
     write_install_state(project, &exe_str, &mut actions)?;
     git_exclude(project, ".ai-bridge/", &mut actions);
 
+    // Record global install provenance (which binary to replace on `update`).
+    crate::update::record_install(&exe_str);
+
     Ok(InitReport {
         actions,
         restart_required: true,
@@ -261,7 +264,7 @@ fn install_plan_gate(project: &Path, exe: &str, actions: &mut Vec<String>) -> Re
         backup_if_exists(&path, actions)?;
         write_json(&path, &root)?;
         actions.push(format!(
-            "wired the OPT-IN plan gate (UserPromptSubmit + broad PreToolUse) in {}",
+            "wired the plan gate (UserPromptSubmit + broad PreToolUse) in {}",
             display(&path)
         ));
     } else {

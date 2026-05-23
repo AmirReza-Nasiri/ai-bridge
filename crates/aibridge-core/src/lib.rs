@@ -13,6 +13,7 @@ pub mod mcp;
 pub mod optimizer;
 pub mod plan_gate;
 pub mod topics;
+pub mod update;
 
 /// The crate (and product) semver version (from `Cargo.toml`).
 pub fn version() -> &'static str {

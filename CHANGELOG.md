@@ -6,6 +6,27 @@ versioning is semver.
 
 ## [Unreleased]
 
+### Added
+
+- **`aibridge update --check` + `doctor --check-updates` (update foundation, Phase 2a).**
+  A read-only update check: queries the latest GitHub *release* via the `gh` CLI
+  (`gh api repos/<owner>/<repo>/releases/latest`) so no HTTP/TLS/zip crates are
+  added and `gh` handles private-repo auth. Compares the release tag (stable
+  semver only — prereleases rejected) to the running version and reports
+  current / latest / update-available. `gh` runs non-interactively
+  (`GH_PROMPT_DISABLED`) under a hard timeout (reader threads + poll + kill,
+  `CREATE_NO_WINDOW` on Windows); every failure mode (gh-missing, timeout, no
+  releases, repo-inaccessible) is a clear non-fatal message. A 404 on
+  releases/latest is disambiguated with a second repo-accessibility probe so a
+  private-repo auth failure isn't reported as "no releases yet". `doctor` stays
+  offline by default; `--check-updates` adds the network check (warning-only).
+  `init` now records install provenance to `~/.ai-bridge/install.json`
+  (install path + version + sha) so a future `update` replaces the right binary;
+  `doctor` warns if the recorded path differs from the running binary. The actual
+  download/replace is Phase 2c; CI-built release artifacts are Phase 2b.
+  Codex-reviewed (2 rounds → APPROVE: gh approach, then 404 disambiguation +
+  honest "apply not yet" messaging).
+
 ## [0.2.0] - 2026-05-23
 
 ### Added

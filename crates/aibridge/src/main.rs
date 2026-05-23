@@ -46,7 +46,17 @@ enum Commands {
         full: bool,
     },
     /// Diagnose (and optionally repair) the installation.
-    Doctor,
+    Doctor {
+        /// Also check GitHub for a newer release (network; off by default).
+        #[arg(long = "check-updates")]
+        check_updates: bool,
+    },
+    /// Check for (and later, install) a newer AI Bridge release.
+    Update {
+        /// Only check + report; don't change anything. (Apply lands in a later release.)
+        #[arg(long)]
+        check: bool,
+    },
     /// Internal hook entry points (invoked by Claude Code hooks, not by you).
     Hook {
         #[command(subcommand)]
@@ -85,13 +95,31 @@ fn main() -> Result<()> {
                 not_yet(&format!("profile apply (dry_run={dry_run}, fix={fix})"))
             }
         },
-        Commands::Selftest { full } => doctor_cmd(full),
-        Commands::Doctor => doctor_cmd(false),
+        Commands::Selftest { full } => doctor_cmd(full, false),
+        Commands::Doctor { check_updates } => doctor_cmd(false, check_updates),
+        Commands::Update { check } => update_cmd(check),
         Commands::Hook { action } => match action {
             HookAction::Pretooluse => hook_pretooluse(),
             HookAction::UserPromptSubmit => hook_user_prompt_submit(),
         },
     }
+}
+
+fn update_cmd(check_only: bool) -> Result<()> {
+    use std::time::Duration;
+    println!("AI Bridge {}\n", aibridge_core::VERSION_FULL);
+    println!(
+        "{}",
+        aibridge_core::update::check_report(Duration::from_secs(15))
+    );
+    if !check_only {
+        println!(
+            "\nNote: automatic download/replace isn't available in this build yet — until the \
+             next release ships it, update by rebuilding from source (git pull + cargo build \
+             --release) or re-running the installer. `aibridge update --check` does the same check."
+        );
+    }
+    Ok(())
 }
 
 fn hook_pretooluse() -> Result<()> {
@@ -112,9 +140,9 @@ fn hook_user_prompt_submit() -> Result<()> {
     Ok(())
 }
 
-fn doctor_cmd(full: bool) -> Result<()> {
+fn doctor_cmd(full: bool, check_updates: bool) -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let report = aibridge_core::doctor::run(&cwd, full);
+    let report = aibridge_core::doctor::run(&cwd, full, check_updates);
     report.print();
     if !report.ok() {
         std::process::exit(1);

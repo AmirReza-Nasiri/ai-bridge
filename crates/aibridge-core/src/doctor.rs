@@ -97,7 +97,9 @@ fn version_of(name: &str) -> Option<(std::path::PathBuf, String)> {
 }
 
 /// Run all checks for `project`. `full` adds a real (quota-using) Codex round-trip.
-pub fn run(project: &Path, full: bool) -> Report {
+/// `check_updates` adds a network check against GitHub Releases (off by default so
+/// `doctor` stays fast + offline).
+pub fn run(project: &Path, full: bool, check_updates: bool) -> Report {
     let mut checks = Vec::new();
 
     let exe = std::env::current_exe()
@@ -171,15 +173,107 @@ pub fn run(project: &Path, full: bool) -> Report {
 
     checks.push(mcp_registration(project));
     checks.push(mcp_binary_path(project));
+    checks.push(install_metadata());
     checks.push(stop_hook(project));
     checks.push(install_state(project));
     checks.push(spawned_context(project));
 
+    if check_updates {
+        checks.push(update_check());
+    }
     if full {
         checks.push(e2e_roundtrip(project));
     }
 
     Report { checks }
+}
+
+/// Offline: compare the recorded install path (`~/.ai-bridge/install.json`) to the
+/// running exe. A mismatch means a later `update` could replace the WRONG binary.
+fn install_metadata() -> Check {
+    let running = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    match crate::update::recorded_install_path() {
+        None => check(
+            Status::Pass,
+            "install metadata",
+            "not recorded yet (run `aibridge init` so `update` knows which binary to replace)",
+        ),
+        Some(recorded) => {
+            // Compare case-insensitively on Windows (drive-letter / case noise).
+            let same = recorded.eq_ignore_ascii_case(&running)
+                || recorded
+                    .replace('\\', "/")
+                    .eq_ignore_ascii_case(&running.replace('\\', "/"));
+            if same {
+                check(
+                    Status::Pass,
+                    "install metadata",
+                    format!("recorded ({recorded})"),
+                )
+            } else {
+                check(
+                    Status::Warn,
+                    "install metadata",
+                    format!(
+                        "recorded install path ({recorded}) differs from the running binary \
+                         ({running}) — `update` would target the recorded one; re-run `aibridge init` \
+                         from the intended install if that's wrong"
+                    ),
+                )
+            }
+        }
+    }
+}
+
+/// Network (only with `--check-updates`): is a newer GitHub release available?
+/// Warning-only — never fails doctor (offline/auth/missing-gh are expected).
+fn update_check() -> Check {
+    use std::time::Duration;
+    match crate::update::latest_release(Duration::from_secs(3)) {
+        crate::update::ReleaseLookup::Found { tag, .. } => {
+            match (
+                crate::update::current_version(),
+                crate::update::parse_version(&tag),
+            ) {
+                (Some(c), Some(l)) if l > c => check(
+                    Status::Warn,
+                    "updates",
+                    format!("newer release available: {c} → {l} (see `aibridge update`)"),
+                ),
+                (Some(c), Some(l)) if l == c => check(
+                    Status::Pass,
+                    "updates",
+                    format!("on the latest release ({c})"),
+                ),
+                (Some(_), Some(l)) => check(
+                    Status::Pass,
+                    "updates",
+                    format!("ahead of latest release {l} (dev build)"),
+                ),
+                _ => check(
+                    Status::Warn,
+                    "updates",
+                    format!("latest tag '{tag}' isn't clean semver"),
+                ),
+            }
+        }
+        crate::update::ReleaseLookup::None => {
+            check(Status::Pass, "updates", "no published releases yet")
+        }
+        crate::update::ReleaseLookup::GhMissing => check(
+            Status::Warn,
+            "updates",
+            "can't check — GitHub CLI (`gh`) not installed",
+        ),
+        crate::update::ReleaseLookup::Timeout => {
+            check(Status::Warn, "updates", "check timed out reaching GitHub")
+        }
+        crate::update::ReleaseLookup::Failed(why) => {
+            check(Status::Warn, "updates", format!("check failed: {why}"))
+        }
+    }
 }
 
 /// Report the reasoning effort AI Bridge uses for reviews and the user's global
