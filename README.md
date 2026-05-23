@@ -19,9 +19,10 @@
 | **`plan_gate`** — the **automatic** PRE-execution plan gate (Codex must approve the task's plan before any write/Bash; default-on, mirror of the Stop gate) | ✅ working |
 | **`review_stop`** — the **automatic** Stop-hook gate (allow/block + no-progress + fail-ask; node-direct spawn, background warming, project-subtree scoped, deadline-bounded) | ✅ working |
 | **`aibridge init`** — one-command local wiring, both gates by default (subdirectory-of-a-repo aware) | ✅ working |
-| **`aibridge doctor` / `selftest`** — one-command health + connection check | ✅ working |
+| **`aibridge doctor` / `selftest`** — one-command health + connection check (version, install-shape, `--check-updates`) | ✅ working |
+| **`aibridge update`** — self-update from GitHub Releases (`gh` download + sha256 verify + replace; `--check` to just report) | ✅ working |
 | **rtk output-compression** — opt-in via `aibridge init --rtk` (safe-mode allowlist) | ✅ working |
-| `--shared` team install · `uninit` · TUI | 🔭 planned |
+| `--shared` team install · `uninit` · TUI · `--from-source` update | 🔭 planned |
 
 ---
 
@@ -146,10 +147,14 @@ tiny fixed cost, far below the startup overhead the warm engine removes.
 ## Commands
 
 ```
+aibridge --version           # version + build provenance, e.g. 0.4.0 (git 1a2b3c4, 2026-05-23)
 aibridge init                # wire this project (local scope) — both gates on by default
 aibridge init --no-plan-gate # wire it WITHOUT the pre-execution plan gate (Stop gate only)
 aibridge init --rtk          # also wire the rtk output-optimizer hook (safe mode)
-aibridge doctor              # one-command health + connection check (no quota)
+aibridge doctor              # one-command health + connection check (no quota, offline)
+aibridge doctor --check-updates  # also ask GitHub whether a newer release exists
+aibridge update --check      # report current vs latest release (no changes)
+aibridge update [--yes]      # download + verify + install the latest release (--yes skips the prompt)
 aibridge selftest [--full]   # same checks; --full adds a real Codex round-trip (uses quota)
 aibridge mcp-server          # the warm peer engine Claude connects to (run by Claude, not you)
 aibridge profile apply       # planned — translate ai-bridge.profile.toml -> native config
@@ -157,6 +162,14 @@ aibridge profile apply       # planned — translate ai-bridge.profile.toml -> n
 
 Per-session escape hatch (skip the plan gate for a trivial task — set it before
 launching Claude Code): `AIBRIDGE_PLAN_GATE=0`.
+
+**Updating.** `aibridge update` pulls the matching binary (`aibridge-<target>[.exe]`)
+from the latest [GitHub Release](https://github.com/omega-do-it-solutions/ai-bridge/releases)
+via the `gh` CLI, verifies its SHA-256, and replaces the installed binary in place
+(on Windows even while the MCP server is running it) — then **reload Claude Code**
+so the MCP server picks up the new version. Cutting a release: bump the
+`[workspace.package]` version, then `git tag vX.Y.Z && git push origin vX.Y.Z`
+(CI builds every platform + publishes the assets).
 
 MCP tools exposed by `mcp-server`: `consult` (named persisted topics),
 `plan_gate` (pre-execution plan review), `implement` (validated patch),
@@ -171,6 +184,8 @@ MCP tools exposed by `mcp-server`: `consult` (named persisted topics),
 - **Codex CLI** installed and logged in (`codex` must work; on Windows the
   `%APPDATA%\npm\codex.cmd` shim is auto-discovered).
 - **Git** on PATH (the gate and `review_diff` diff the working tree).
+- **GitHub CLI (`gh`)**, authenticated (`gh auth login`) — only for `aibridge update`
+  (it reaches the private repo's releases); everything else works without it.
 - **Rust toolchain** — only to build/install from source.
 - **rtk** — optional output compressor; wired in safe-mode, opt-in via
   `aibridge init --rtk` (not required). AI Bridge never auto-downloads it;
