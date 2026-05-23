@@ -175,6 +175,7 @@ pub fn run(project: &Path, full: bool, check_updates: bool) -> Report {
     checks.push(mcp_binary_path(project));
     checks.push(install_metadata());
     checks.push(stop_hook(project));
+    checks.push(plan_gate_status(project));
     checks.push(install_state(project));
     checks.push(spawned_context(project));
 
@@ -443,6 +444,30 @@ fn mcp_binary_path(project: &Path) -> Check {
             "aibridge binary path",
             "registered to a stable path (not a build artifact)",
         )
+    }
+}
+
+/// Report the plan gate's marker state. `Pending` means `init` staged it but it
+/// won't enforce until the MCP server starts (i.e. Claude Code is restarted) — the
+/// fix for the post-install deadlock.
+fn plan_gate_status(project: &Path) -> Check {
+    match crate::plan_gate::marker_state(&project.display().to_string()) {
+        crate::plan_gate::MarkerState::Disabled => check(
+            Status::Pass,
+            "plan gate",
+            "off (init wires it by default; --no-plan-gate to skip)",
+        ),
+        crate::plan_gate::MarkerState::Pending => check(
+            Status::Warn,
+            "plan gate",
+            "staged — restart Claude Code to activate it (the plan_gate tool connects on restart)",
+        ),
+        crate::plan_gate::MarkerState::Active => check(
+            Status::Pass,
+            "plan gate",
+            "active — Codex must approve the plan before writes/Bash. If the plan_gate tool ever \
+             isn't reachable, restart Claude Code or set AIBRIDGE_PLAN_GATE=0 to bypass",
+        ),
     }
 }
 

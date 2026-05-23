@@ -14,8 +14,11 @@
 //! - the warm MCP server's `plan_gate` tool runs the Codex dialogue and, on
 //!   APPROVE, marks the epoch approved.
 //!
-//! Activation is gated by an `enabled` marker written by `aibridge init
-//! --plan-gate`, so merely shipping the binary never starts gating anyone's work.
+//! Activation is two-step so installing/updating never deadlocks the current
+//! session: `aibridge init` STAGES an `enabled.pending` marker, and the MCP server
+//! PROMOTES it to `enabled` on its next startup — i.e. the gate only enforces once
+//! a server that actually provides the `plan_gate` tool is running (after the
+//! Claude Code restart `init` asks for). Merely shipping the binary gates no one.
 
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -36,9 +39,8 @@ pub const NO_PROGRESS_THRESHOLD: u32 = 2;
 /// `plan_gate` MCP tool uses the warm server's `current_dir`.
 fn root(cwd: &str) -> PathBuf {
     let start = Path::new(cwd);
-    // Marker-first: the enabled marker is the AUTHORITATIVE anchor, so a nested
-    // `.git`/`.ai-bridge` below the enabled project can't shadow it (which would
-    // silently disable enforcement — fail-open).
+    // Pass 1 — an ACTIVE `enabled` marker wins globally: a child's stale `.pending`
+    // must never shadow an active ancestor (which would fail the gate open).
     let mut p = start;
     loop {
         if p.join(".ai-bridge")
@@ -53,8 +55,24 @@ fn root(cwd: &str) -> PathBuf {
             None => break,
         }
     }
-    // Fallback (no marker yet / gate off): first ancestor with `.ai-bridge` or
-    // `.git`, so state co-locates with the rest of the install.
+    // Pass 2 — else a STAGED `.pending` marker, so promotion/state lookups from a
+    // child (or past a nested `.git`) still find a parent's staged gate.
+    let mut p = start;
+    loop {
+        if p.join(".ai-bridge")
+            .join("plan-gate")
+            .join("enabled.pending")
+            .exists()
+        {
+            return p.to_path_buf();
+        }
+        match p.parent() {
+            Some(parent) => p = parent,
+            None => break,
+        }
+    }
+    // Pass 3 — fallback (gate off): first ancestor with `.ai-bridge` or `.git`, so
+    // state co-locates with the rest of the install.
     let mut p = start;
     loop {
         if p.join(".ai-bridge").exists() || p.join(".git").exists() {
@@ -82,13 +100,67 @@ pub fn is_enabled(cwd: &str) -> bool {
     marker_path(cwd).exists()
 }
 
-/// Turn enforcement on for this project (idempotent). Called by `init`. Uses the
-/// raw cwd (init runs at the project root) so the marker anchors the root that
-/// `root()` resolves to thereafter.
+/// Turn enforcement on immediately (idempotent). Direct activation — used by tests
+/// and any "activate now" path. (`init` uses [`enable_pending`] instead.)
 pub fn enable(cwd: &str) -> std::io::Result<()> {
     let d = Path::new(cwd).join(".ai-bridge").join("plan-gate");
     std::fs::create_dir_all(&d)?;
     std::fs::write(d.join("enabled"), b"1\n")
+}
+
+/// STAGE the gate without activating it yet (called by `init`). Writes
+/// `enabled.pending`; the gate stays INACTIVE (`is_enabled` checks `enabled`) until
+/// the MCP server promotes it on startup. This is the fix for the install deadlock:
+/// the session that ran `init` is never hard-blocked before the `plan_gate` tool is
+/// reachable (the tool connects only on the next Claude Code start, which is exactly
+/// when promotion happens). Never downgrades an already-active gate.
+pub fn enable_pending(cwd: &str) -> std::io::Result<()> {
+    // Root-resolved check: if the gate is already active here OR at an ancestor,
+    // don't stage an orphan child `.pending` over it.
+    if is_enabled(cwd) {
+        return Ok(());
+    }
+    let d = Path::new(cwd).join(".ai-bridge").join("plan-gate");
+    std::fs::create_dir_all(&d)?;
+    std::fs::write(d.join("enabled.pending"), b"1\n")
+}
+
+/// Promote a staged gate (`enabled.pending` → `enabled`). Called by the MCP server
+/// on startup: once THIS session's server (which provides `plan_gate`) is up, the
+/// gate goes active. Best-effort + idempotent: no pending → no-op; already active →
+/// just clear any leftover pending marker.
+pub fn promote_pending(cwd: &str) {
+    let d = dir(cwd);
+    let pending = d.join("enabled.pending");
+    let enabled = d.join("enabled");
+    if enabled.exists() {
+        let _ = std::fs::remove_file(&pending);
+        return;
+    }
+    if pending.exists() {
+        // Atomic; if it loses a race with another server, the other outcome
+        // (enabled now exists) is equally correct.
+        let _ = std::fs::rename(&pending, &enabled);
+    }
+}
+
+/// Install state of the gate for `doctor`: off, staged (awaiting restart), or active.
+pub enum MarkerState {
+    Disabled,
+    Pending,
+    Active,
+}
+
+/// Report the gate's marker state (active `enabled` wins over `enabled.pending`).
+pub fn marker_state(cwd: &str) -> MarkerState {
+    let d = dir(cwd);
+    if d.join("enabled").exists() {
+        MarkerState::Active
+    } else if d.join("enabled.pending").exists() {
+        MarkerState::Pending
+    } else {
+        MarkerState::Disabled
+    }
 }
 
 fn read_state(cwd: &str) -> Option<Value> {
@@ -234,7 +306,10 @@ fn deny_json() -> String {
         Do NOT retry this tool. First gather context with Read/Grep/Glob, form a todolist, \
         then call the MCP tool `mcp__aibridge__plan_gate` with a structured plan \
         (todos, approach, intended_files, risk_surfaces, test_plan). Revise and call it \
-        again until it returns <AI-BRIDGE-APPROVE/>; only then will writes/Bash be allowed.";
+        again until it returns <AI-BRIDGE-APPROVE/>; only then will writes/Bash be allowed. \
+        If `mcp__aibridge__plan_gate` is NOT available, AI Bridge was just installed/updated — \
+        the tool connects only after a Claude Code restart: restart Claude Code, or relaunch it \
+        with AIBRIDGE_PLAN_GATE=0 set to bypass the gate for this session.";
     json!({
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
@@ -445,6 +520,80 @@ mod tests {
             record(&cwd, &current_epoch(&cwd), "p2", &v, "same finding"),
             Outcome::Stuck(_)
         ));
+    }
+
+    #[test]
+    fn pending_gate_is_inactive_until_promoted() {
+        let cwd = tmp();
+        // init stages it → NOT active yet (no deadlock: writes flow until promote).
+        enable_pending(&cwd).unwrap();
+        assert!(!is_enabled(&cwd), "staged gate must not enforce yet");
+        assert!(matches!(marker_state(&cwd), MarkerState::Pending));
+        assert!(enforce(&cwd, "Write").is_none());
+        // server startup promotes it → now active.
+        promote_pending(&cwd);
+        assert!(is_enabled(&cwd), "promoted gate must enforce");
+        assert!(matches!(marker_state(&cwd), MarkerState::Active));
+        start_epoch(&cwd, "s", "t");
+        assert!(enforce(&cwd, "Write").is_some());
+    }
+
+    #[test]
+    fn enable_pending_never_downgrades_active_gate() {
+        let cwd = tmp();
+        enable(&cwd).unwrap(); // already active
+        enable_pending(&cwd).unwrap(); // init re-run must not stage-over an active gate
+        assert!(is_enabled(&cwd));
+        assert!(matches!(marker_state(&cwd), MarkerState::Active));
+    }
+
+    #[test]
+    fn pending_promotes_from_subdir_even_past_nested_git() {
+        let root = tmp();
+        enable_pending(&root).unwrap(); // staged at the project root
+        let sub = format!("{root}/pkg");
+        std::fs::create_dir_all(format!("{sub}/.git")).unwrap(); // nested git, must NOT shadow
+                                                                 // From the nested subdir, state + promote resolve to the ROOT's staged marker.
+        assert!(matches!(marker_state(&sub), MarkerState::Pending));
+        promote_pending(&sub);
+        assert!(
+            is_enabled(&root),
+            "root gate active after promote-from-subdir"
+        );
+        assert!(matches!(marker_state(&sub), MarkerState::Active));
+    }
+
+    #[test]
+    fn active_parent_not_shadowed_by_stale_child_pending() {
+        let root = tmp();
+        enable(&root).unwrap(); // active at root
+        let sub = format!("{root}/pkg");
+        // a stale orphan child `.pending` (could exist from a pre-fix v0.4.0 install)
+        let pg = Path::new(&sub).join(".ai-bridge").join("plan-gate");
+        std::fs::create_dir_all(&pg).unwrap();
+        std::fs::write(pg.join("enabled.pending"), b"1\n").unwrap();
+        // The ACTIVE parent must win from the child (not fail open).
+        assert!(
+            is_enabled(&sub),
+            "active parent must not be shadowed by child pending"
+        );
+        assert!(matches!(marker_state(&sub), MarkerState::Active));
+        start_epoch(&sub, "s", "t");
+        assert!(enforce(&sub, "Write").is_some());
+    }
+
+    #[test]
+    fn enable_pending_skips_when_ancestor_active() {
+        let root = tmp();
+        enable(&root).unwrap(); // active at root
+        let sub = format!("{root}/pkg");
+        std::fs::create_dir_all(&sub).unwrap();
+        enable_pending(&sub).unwrap(); // must NOT create an orphan child .pending
+        assert!(!Path::new(&sub)
+            .join(".ai-bridge")
+            .join("plan-gate")
+            .join("enabled.pending")
+            .exists());
     }
 
     #[test]

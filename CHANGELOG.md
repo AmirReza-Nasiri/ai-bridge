@@ -6,6 +6,27 @@ versioning is semver.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-05-23
+
+### Fixed
+
+- **Plan-gate install deadlock.** After `aibridge init` (default-on plan gate),
+  the SAME Claude session got hard-blocked: every Write/Edit/Bash was denied with
+  "call `mcp__aibridge__plan_gate`", but that MCP tool only connects after a Claude
+  Code restart — so there was no in-session way to approve a plan and unblock
+  (`AIBRIDGE_PLAN_GATE=0` can't help mid-session either, since hooks read the env
+  fixed at launch). Now `init` STAGES the gate (`enabled.pending`) instead of
+  activating it; the MCP server PROMOTES it to active on its next startup — so the
+  gate only enforces once a server that actually provides `plan_gate` is running
+  (i.e. after the restart `init` asks for). `root()` resolution is now 3-pass
+  (active `enabled` wins globally over a child's stale `.pending`, then `.pending`,
+  then `.ai-bridge`/`.git`), so promotion/state work from a subdir or past a
+  nested `.git`, and an active parent gate is never shadowed by a stale child
+  marker. The PreToolUse deny message now also points to the restart / bypass when
+  `plan_gate` is unreachable, and `doctor` reports the gate as off / staged
+  (restart to activate) / active. Found on macOS, reproduced + fixed cross-platform.
+  Codex-reviewed (design + 3 implementation rounds → APPROVE).
+
 ## [0.4.0] - 2026-05-23
 
 ### Added

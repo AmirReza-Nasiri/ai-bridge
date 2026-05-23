@@ -1197,6 +1197,12 @@ fn spawn_warming() -> std::sync::mpsc::Receiver<(CodexPeer, String)> {
 pub fn serve() -> anyhow::Result<()> {
     let mut server = Server::new();
     write_runtime_snapshot(); // record the spawned-context PATH for `doctor`
+                              // Activate a staged plan gate now that THIS server (which provides `plan_gate`)
+                              // is up — closes the post-`init` deadlock where the gate would block before the
+                              // approval tool was reachable.
+    if let Ok(cwd) = std::env::current_dir() {
+        crate::plan_gate::promote_pending(&cwd.display().to_string());
+    }
     server.warm_rx = Some(spawn_warming()); // warm Codex while the user works
     let stdin = std::io::stdin();
     let mut reader = stdin.lock();

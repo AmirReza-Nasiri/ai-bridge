@@ -152,7 +152,7 @@ tiny fixed cost, far below the startup overhead the warm engine removes.
 
 ```
 aibridge --version           # version + build provenance, e.g. 0.4.0 (git 1a2b3c4, 2026-05-23)
-aibridge init                # wire this project (local scope) — both gates on by default
+aibridge init                # wire this project (run from the project ROOT) — both gates on by default
 aibridge init --no-plan-gate # wire it WITHOUT the pre-execution plan gate (Stop gate only)
 aibridge init --rtk          # also wire the rtk output-optimizer hook (safe mode)
 aibridge doctor              # one-command health + connection check (no quota, offline)

@@ -181,8 +181,12 @@ fn hook_is_aibridge_pretooluse(h: &Value) -> bool {
 /// shared `pretooluse` handler also does rtk), and a coding-habit note in
 /// `CLAUDE.local.md`. A per-session bypass is `AIBRIDGE_PLAN_GATE=0`.
 fn install_plan_gate(project: &Path, exe: &str, actions: &mut Vec<String>) -> Result<()> {
-    crate::plan_gate::enable(&project.to_string_lossy())
-        .context("writing the plan-gate enabled marker")?;
+    // STAGE the gate (enabled.pending), don't activate it yet — the MCP server
+    // promotes it on its next startup. This prevents the install deadlock where the
+    // gate would block this very session before the `plan_gate` tool (which needs a
+    // Claude Code restart) is reachable.
+    crate::plan_gate::enable_pending(&project.to_string_lossy())
+        .context("staging the plan-gate marker")?;
 
     let path = project.join(".claude").join("settings.local.json");
     if let Some(parent) = path.parent() {
