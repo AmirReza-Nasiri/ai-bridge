@@ -8,24 +8,27 @@ versioning is semver.
 
 ### Added
 
-- **Pre-execution plan gate (`plan_gate` tool + opt-in hooks) — the planning-phase
-  mirror of the Stop-gate.** Before any file change in a task, Codex reviews the
-  agent's todolist/approach in a continuous multi-round dialogue until APPROVE, so
-  the *approach* is vetted before code is written (the Stop-gate still reviews the
-  *result* after). Enforcement is opt-in via `aibridge init --plan-gate`, which
-  wires: a `UserPromptSubmit` hook that starts a fresh task epoch each prompt; a
-  broad `PreToolUse` hook (`Write|Edit|MultiEdit|NotebookEdit|Bash|mcp__aibridge__run`)
-  that DENIES those tools until the current task's plan is approved (Bash and the
-  `run` tool are default-denied — no fragile write-detection; `run` is also gated
-  in-process as defense-in-depth; read-only discovery via Read/Grep/Glob stays free);
-  and a coding-habit note in `CLAUDE.local.md`. The `plan_gate` MCP tool runs the
-  Codex round on an isolated thread (separate from the review Gate and consults),
-  reuses the Stop-gate's verdict sentinels + no-progress machinery, and on APPROVE
-  unlocks writes for the epoch. State is shared on disk under `.ai-bridge/plan-gate/`
-  so the separate hook processes and the warm server agree. Merely installing the
-  binary never gates anyone — activation requires the explicit `--plan-gate` flag.
-  Design Codex-vetted (2-round dialogue → APPROVE; per-task granularity, Bash
-  default-deny, hook-as-enforcement-not-transport, shared verdict machinery).
+- **Pre-execution plan gate (`plan_gate` tool + hooks) — the planning-phase
+  mirror of the Stop-gate, now DEFAULT-ON.** Before any file change in a task, Codex
+  reviews the agent's todolist/approach in a continuous multi-round dialogue until
+  APPROVE, so the *approach* is vetted before code is written (the Stop-gate still
+  reviews the *result* after). `aibridge init` wires it BY DEFAULT (symmetric with
+  the Stop gate; disable with `init --no-plan-gate`): a `UserPromptSubmit` hook that
+  starts a fresh task epoch each prompt; a broad `PreToolUse` hook
+  (`Write|Edit|MultiEdit|NotebookEdit|Bash|mcp__aibridge__run`) that DENIES those
+  tools until the current task's plan is approved (Bash and the `run` tool are
+  default-denied — no fragile write-detection; `run` is also gated in-process as
+  defense-in-depth; read-only discovery via Read/Grep/Glob stays free); and a
+  coding-habit note in `CLAUDE.local.md`. A quick per-session bypass for a trivial
+  task is `AIBRIDGE_PLAN_GATE=0` (or `PLAN_GATE_DISABLE=1`). The `plan_gate` MCP
+  tool runs the Codex round on an isolated thread (separate from the review Gate and
+  consults), reuses the Stop-gate's verdict sentinels + no-progress machinery, and
+  on APPROVE unlocks writes for the epoch. State is shared on disk under
+  `.ai-bridge/plan-gate/` (atomic writes, marker-first root resolution, epoch-bound
+  approval + TOCTOU guard, fail-closed on corrupt/missing state); install de-dupes
+  prior hooks by ownership so a foreign PreToolUse hook is never dropped. Design
+  Codex-vetted (2 rounds → APPROVE); implementation Codex-vetted (3 rounds →
+  APPROVE: run-bypass, atomic state, TOCTOU, root anchoring, hook de-dupe).
 
 ### Changed
 

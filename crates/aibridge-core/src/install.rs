@@ -29,10 +29,11 @@ pub struct InitReport {
     pub restart_required: bool,
 }
 
-/// Wire AI Bridge into the project rooted at `project`. With `rtk`, also wire the
-/// rtk output-optimizer PreToolUse hook (safe mode). With `plan_gate`, wire the
-/// opt-in pre-execution plan gate (UserPromptSubmit + a broad PreToolUse hook that
-/// denies writes/Bash until the plan is approved — that hook also does rtk).
+/// Wire AI Bridge into the project rooted at `project`. `plan_gate` is normally
+/// true (DEFAULT-ON, the planning-phase gate — `init --no-plan-gate` opts out):
+/// it wires UserPromptSubmit + a broad PreToolUse hook that denies writes/Bash
+/// until the plan is approved (that hook also does rtk, subsuming the rtk-only
+/// Bash hook). `rtk` only matters when `plan_gate` is off (wires the narrow hook).
 pub fn init(project: &Path, rtk: bool, plan_gate: bool) -> Result<InitReport> {
     let exe = std::env::current_exe().context("resolving the aibridge executable path")?;
     let exe_str = exe.to_string_lossy().to_string();
@@ -137,10 +138,45 @@ fn install_rtk_hook(project: &Path, exe: &str, actions: &mut Vec<String>) -> Res
 
 const PLAN_GATE_NOTE: &str = "AI Bridge PLAN GATE is active here. Coding habit: for any task that will change files, FIRST do read-only discovery (Read/Grep/Glob), form a short todolist, then call `mcp__aibridge__plan_gate` with your plan (todos, approach, intended_files, risk_surfaces, test_plan) and iterate until it returns <AI-BRIDGE-APPROVE/>. Writes (Write/Edit/MultiEdit/NotebookEdit) and Bash are BLOCKED until the plan is approved for the current task.";
 
-/// Install the OPT-IN plan gate: an `enabled` marker, a `UserPromptSubmit` hook
-/// that starts a fresh task epoch, a broad `PreToolUse` hook that denies
-/// writes/Bash until the plan is approved (the shared `pretooluse` handler also
-/// does rtk), and a coding-habit note in `CLAUDE.local.md`.
+/// True iff a `PreToolUse` group is an AI Bridge `pretooluse` hook group, matched
+/// by OWNERSHIP (command basename `aibridge[.exe]` AND args `["hook","pretooluse"]`)
+/// rather than merely "an arg contains `pretooluse`", so a foreign hook is never
+/// removed by the plan-gate de-dupe.
+fn group_is_aibridge_pretooluse(g: &Value) -> bool {
+    g.pointer("/hooks")
+        .and_then(Value::as_array)
+        .map(|hs| hs.iter().any(hook_is_aibridge_pretooluse))
+        .unwrap_or(false)
+}
+
+fn hook_is_aibridge_pretooluse(h: &Value) -> bool {
+    let args_match = h
+        .get("args")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.len() == 2 && a[0].as_str() == Some("hook") && a[1].as_str() == Some("pretooluse")
+        })
+        .unwrap_or(false);
+    let cmd_is_ours = h
+        .get("command")
+        .and_then(Value::as_str)
+        .map(|c| {
+            let base = Path::new(c)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(c)
+                .to_ascii_lowercase();
+            base == "aibridge" || base == "aibridge.exe"
+        })
+        .unwrap_or(false);
+    args_match && cmd_is_ours
+}
+
+/// Install the plan gate (DEFAULT-ON; disable with `init --no-plan-gate`): an
+/// `enabled` marker, a `UserPromptSubmit` hook that starts a fresh task epoch, a
+/// broad `PreToolUse` hook that denies writes/Bash until the plan is approved (the
+/// shared `pretooluse` handler also does rtk), and a coding-habit note in
+/// `CLAUDE.local.md`. A per-session bypass is `AIBRIDGE_PLAN_GATE=0`.
 fn install_plan_gate(project: &Path, exe: &str, actions: &mut Vec<String>) -> Result<()> {
     crate::plan_gate::enable(&project.to_string_lossy())
         .context("writing the plan-gate enabled marker")?;
@@ -169,25 +205,14 @@ fn install_plan_gate(project: &Path, exe: &str, actions: &mut Vec<String>) -> Re
             *pre = json!([]);
         }
         let arr = pre.as_array_mut().expect("array");
-        // De-dupe by ownership: drop EVERY AI Bridge `pretooluse` group (the
+        // De-dupe by OWNERSHIP: drop EVERY AI Bridge `pretooluse` group (the
         // rtk-only Bash one, or any prior plan-gate matcher) and re-add the single
         // canonical broad group. Leaving two would double-run the hook with
-        // unspecified ordering; matching by "calls our pretooluse" survives matcher
-        // string changes across versions.
+        // unspecified ordering. Ownership = command basename `aibridge[.exe]` AND
+        // args `["hook","pretooluse"]`, so a FOREIGN hook that merely uses a
+        // "pretooluse" arg is never dropped (matters now that this runs by default).
         let snapshot = arr.clone();
-        arr.retain(|g| {
-            !g.pointer("/hooks")
-                .and_then(Value::as_array)
-                .map(|hs| {
-                    hs.iter().any(|h| {
-                        h.get("args")
-                            .and_then(Value::as_array)
-                            .map(|a| a.iter().any(|x| x.as_str() == Some("pretooluse")))
-                            .unwrap_or(false)
-                    })
-                })
-                .unwrap_or(false)
-        });
+        arr.retain(|g| !group_is_aibridge_pretooluse(g));
         arr.push(json!({
             "matcher": "Write|Edit|MultiEdit|NotebookEdit|Bash|mcp__aibridge__run",
             "hooks": [{
@@ -533,4 +558,102 @@ fn now_ms() -> u128 {
 
 fn display(path: &Path) -> String {
     path.display().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    fn tmp() -> std::path::PathBuf {
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!("aibridge-install-{}-{}", std::process::id(), n));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+    fn read_settings(project: &Path) -> Value {
+        let s =
+            std::fs::read_to_string(project.join(".claude").join("settings.local.json")).unwrap();
+        serde_json::from_str(&s).unwrap()
+    }
+    fn pre_groups(v: &Value) -> Vec<Value> {
+        v.pointer("/hooks/PreToolUse")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    }
+    const CANON: &str = "Write|Edit|MultiEdit|NotebookEdit|Bash|mcp__aibridge__run";
+
+    #[test]
+    fn plan_gate_install_is_idempotent() {
+        let p = tmp();
+        install_plan_gate(&p, "aibridge", &mut Vec::new()).unwrap();
+        let first = read_settings(&p);
+        install_plan_gate(&p, "aibridge", &mut Vec::new()).unwrap();
+        let second = read_settings(&p);
+        assert_eq!(first, second, "re-running install must not change settings");
+        let ours = pre_groups(&second)
+            .iter()
+            .filter(|g| group_is_aibridge_pretooluse(g))
+            .count();
+        assert_eq!(ours, 1, "exactly one AI Bridge PreToolUse group");
+    }
+
+    #[test]
+    fn plan_gate_install_preserves_foreign_hooks() {
+        let p = tmp();
+        std::fs::create_dir_all(p.join(".claude")).unwrap();
+        // A FOREIGN hook that happens to use a "pretooluse" arg must NOT be dropped.
+        let seed = json!({ "hooks": { "PreToolUse": [{
+            "matcher": "Bash",
+            "hooks": [{ "type": "command", "command": "/usr/bin/other-tool", "args": ["pretooluse"] }]
+        }]}});
+        std::fs::write(
+            p.join(".claude").join("settings.local.json"),
+            serde_json::to_string(&seed).unwrap(),
+        )
+        .unwrap();
+        install_plan_gate(&p, "aibridge", &mut Vec::new()).unwrap();
+        let groups = pre_groups(&read_settings(&p));
+        assert!(
+            groups
+                .iter()
+                .any(|g| g.pointer("/hooks/0/command").and_then(Value::as_str)
+                    == Some("/usr/bin/other-tool")),
+            "foreign hook must be preserved"
+        );
+        assert!(
+            groups.iter().any(group_is_aibridge_pretooluse),
+            "our canonical group must be added"
+        );
+    }
+
+    #[test]
+    fn plan_gate_install_replaces_old_aibridge_bash_hook() {
+        let p = tmp();
+        std::fs::create_dir_all(p.join(".claude")).unwrap();
+        // An OLD AI Bridge rtk-only Bash pretooluse hook must be replaced, not doubled.
+        let seed = json!({ "hooks": { "PreToolUse": [{
+            "matcher": "Bash",
+            "hooks": [{ "type": "command", "command": "aibridge", "args": ["hook", "pretooluse"] }]
+        }]}});
+        std::fs::write(
+            p.join(".claude").join("settings.local.json"),
+            serde_json::to_string(&seed).unwrap(),
+        )
+        .unwrap();
+        install_plan_gate(&p, "aibridge", &mut Vec::new()).unwrap();
+        let groups = pre_groups(&read_settings(&p));
+        let ours: Vec<_> = groups
+            .iter()
+            .filter(|g| group_is_aibridge_pretooluse(g))
+            .collect();
+        assert_eq!(ours.len(), 1, "old Bash hook replaced, not duplicated");
+        assert_eq!(
+            ours[0].get("matcher").and_then(Value::as_str),
+            Some(CANON),
+            "the surviving group is the canonical broad one"
+        );
+    }
 }

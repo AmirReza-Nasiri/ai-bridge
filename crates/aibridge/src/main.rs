@@ -28,10 +28,11 @@ enum Commands {
         /// Also wire the rtk output-optimizer PreToolUse hook (safe mode).
         #[arg(long)]
         rtk: bool,
-        /// Also wire the OPT-IN pre-execution plan gate: before any write/Bash in a
-        /// task, Codex must approve the plan (UserPromptSubmit + PreToolUse hooks).
-        #[arg(long = "plan-gate")]
-        plan_gate: bool,
+        /// Do NOT wire the pre-execution plan gate. By default the plan gate is ON
+        /// (symmetric with the Stop gate): before any write/Bash in a task, Codex
+        /// must approve the plan. A quick per-session bypass is `AIBRIDGE_PLAN_GATE=0`.
+        #[arg(long = "no-plan-gate")]
+        no_plan_gate: bool,
     },
     /// Translate `ai-bridge.profile.toml` into native per-CLI config.
     Profile {
@@ -78,7 +79,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::McpServer => aibridge_core::mcp::serve(),
-        Commands::Init { rtk, plan_gate } => init(rtk, plan_gate),
+        Commands::Init { rtk, no_plan_gate } => init(rtk, !no_plan_gate),
         Commands::Profile { action } => match action {
             ProfileAction::Apply { dry_run, fix } => {
                 not_yet(&format!("profile apply (dry_run={dry_run}, fix={fix})"))
@@ -141,9 +142,19 @@ fn init(rtk: bool, plan_gate: bool) -> Result<()> {
     if report.restart_required {
         println!(
             "\nRESTART_REQUIRED: restart Claude Code so it connects the aibridge MCP server \
-             and loads the Stop hook."
+             and loads the hooks."
         );
     }
-    println!("Then work normally — the automatic peer-review gate is active.");
+    if plan_gate {
+        println!(
+            "Then work normally — BOTH gates are automatic: the plan gate (Codex approves the \
+             plan before any write/Bash) and the Stop gate (Codex reviews the result). Quick \
+             bypass for a trivial task: set AIBRIDGE_PLAN_GATE=0."
+        );
+    } else {
+        println!(
+            "Then work normally — the automatic Stop peer-review gate is active (plan gate off)."
+        );
+    }
     Ok(())
 }

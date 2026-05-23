@@ -181,11 +181,24 @@ pub fn is_approved(cwd: &str) -> bool {
     }
 }
 
-/// The gate is currently HOLDING writes (enabled, current task not yet approved).
-/// Used by both the PreToolUse hook AND the in-process `run` tool, so `run` (which
-/// executes arbitrary shell) can't bypass the hook.
+/// Quick per-session escape hatch (mirrors rtk's): `AIBRIDGE_PLAN_GATE=0` or
+/// `PLAN_GATE_DISABLE=1` turns OFF enforcement without un-installing — for a
+/// trivial task where a full plan round isn't worth the wait. Set it before
+/// launching Claude Code (hooks inherit that environment).
+fn bypassed() -> bool {
+    std::env::var("AIBRIDGE_PLAN_GATE")
+        .map(|v| v == "0")
+        .unwrap_or(false)
+        || std::env::var("PLAN_GATE_DISABLE")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+}
+
+/// The gate is currently HOLDING writes (enabled, not bypassed, current task not
+/// yet approved). Used by both the PreToolUse hook AND the in-process `run` tool,
+/// so `run` (which executes arbitrary shell) can't bypass the hook.
 pub fn blocks_writes(cwd: &str) -> bool {
-    is_enabled(cwd) && !is_approved(cwd)
+    is_enabled(cwd) && !bypassed() && !is_approved(cwd)
 }
 
 /// Is this tool one the gate must hold until approval? Includes `mcp__aibridge__run`
