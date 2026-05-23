@@ -356,6 +356,20 @@ impl Drop for CodexPeer {
     }
 }
 
+fn extract_text(result: &Value) -> String {
+    result
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -385,18 +399,4 @@ mod tests {
             "expected codex to stream >=1 progress event during the turn, got {events}"
         );
     }
-}
-
-fn extract_text(result: &Value) -> String {
-    result
-        .get("content")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| item.get("text").and_then(Value::as_str))
-                .collect::<Vec<_>>()
-                .join("")
-        })
-        .unwrap_or_default()
 }
