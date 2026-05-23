@@ -6,6 +6,8 @@ versioning is semver.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-05-23
+
 ### Added
 
 - **`aibridge update --check` + `doctor --check-updates` (update foundation, Phase 2a).**
