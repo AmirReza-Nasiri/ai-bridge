@@ -35,6 +35,15 @@ enum TopicKey {
     Consult(String),
 }
 
+/// Human label for the live review-progress sink, from the thread being used.
+fn progress_phase(key: &TopicKey) -> String {
+    match key {
+        TopicKey::Gate => "review".to_string(),
+        TopicKey::PlanGate => "plan-gate".to_string(),
+        TopicKey::Consult(name) => format!("consult:{name}"),
+    }
+}
+
 /// Cap on simultaneously-tracked consult topics so a long session can't grow the
 /// registry without bound. (The gate slot is separate and never evicted here.)
 const MAX_CONSULT_TOPICS: usize = 32;
@@ -111,13 +120,17 @@ impl Server {
     /// stale thread ("Session not found") transparently reopens.
     fn ask_topic(&mut self, key: TopicKey, prompt: &str, cwd: &str) -> anyhow::Result<String> {
         self.ensure_peer()?;
+        let phase = progress_phase(&key);
         if let Some(tid) = self.threads.get(&key).cloned() {
             let reply = {
                 let peer = self
                     .codex
                     .as_mut()
                     .ok_or_else(|| anyhow::anyhow!("codex peer unavailable"))?;
-                peer.reply(&tid, prompt)
+                peer.begin_progress(cwd, &phase);
+                let r = peer.reply(&tid, prompt);
+                peer.end_progress();
+                r
             };
             match reply {
                 Ok(text) if !is_session_lost(&text) => return Ok(text),
@@ -136,7 +149,10 @@ impl Server {
                 .codex
                 .as_mut()
                 .ok_or_else(|| anyhow::anyhow!("codex peer unavailable"))?;
-            peer.open_thread(prompt, cwd, crate::codex::REVIEW_REASONING_EFFORT)
+            peer.begin_progress(cwd, &phase);
+            let r = peer.open_thread(prompt, cwd, crate::codex::REVIEW_REASONING_EFFORT);
+            peer.end_progress();
+            r
         };
         match opened {
             Ok((tid, text)) => {
@@ -403,7 +419,10 @@ impl Server {
                 .codex
                 .as_mut()
                 .ok_or_else(|| anyhow::anyhow!("codex peer unavailable"))?;
-            peer.open_thread(prompt, cwd, crate::codex::IMPLEMENT_REASONING_EFFORT)
+            peer.begin_progress(cwd, "implement");
+            let r = peer.open_thread(prompt, cwd, crate::codex::IMPLEMENT_REASONING_EFFORT);
+            peer.end_progress();
+            r
         };
         match opened {
             Ok((_tid, text)) => Ok(text), // discard threadId: ephemeral, never reused

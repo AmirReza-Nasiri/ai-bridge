@@ -52,6 +52,12 @@ enum Commands {
         #[arg(long = "check-updates")]
         check_updates: bool,
     },
+    /// Show the live status of an in-progress Codex review (--watch to follow it).
+    Status {
+        /// Follow the review live, refreshing each second until it finishes.
+        #[arg(long)]
+        watch: bool,
+    },
     /// Check for and install a newer AI Bridge release.
     Update {
         /// Only check + report; don't change anything.
@@ -107,6 +113,7 @@ fn main() -> Result<()> {
         },
         Commands::Selftest { full } => doctor_cmd(full, false),
         Commands::Doctor { check_updates } => doctor_cmd(false, check_updates),
+        Commands::Status { watch } => status_cmd(watch),
         Commands::Update {
             check,
             yes,
@@ -118,6 +125,28 @@ fn main() -> Result<()> {
             HookAction::UserPromptSubmit => hook_user_prompt_submit(),
         },
     }
+}
+
+fn status_cmd(watch: bool) -> Result<()> {
+    let cwd = std::env::current_dir()?.to_string_lossy().to_string();
+    loop {
+        match aibridge_core::progress::status_report(&cwd) {
+            Some(line) => println!("AI Bridge: {line}"),
+            None => println!("AI Bridge: no review status yet for this project."),
+        }
+        if !watch {
+            break;
+        }
+        // Stop following once the review is no longer active (one final line above).
+        let active = aibridge_core::progress::read_status(&cwd)
+            .and_then(|s| s.get("active").and_then(|v| v.as_bool()))
+            .unwrap_or(false);
+        if !active {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    Ok(())
 }
 
 fn update_cmd(

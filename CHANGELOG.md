@@ -6,6 +6,25 @@ versioning is semver.
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-05-23
+
+### Added
+
+- **Live review progress (`aibridge status`).** A Codex review at `xhigh` takes
+  MINUTES even for a small diff — the cost is the model's reasoning, not the input
+  size — and the warm peer blocks in one JSON-RPC request the whole time, so it was
+  a silent black box indistinguishable from a hang. AI Bridge now relays the
+  `codex/event` notifications the `codex mcp-server` streams during a turn (the
+  request loop previously discarded them) into an atomically-written
+  `.ai-bridge/review-status.json`: phase, elapsed seconds, event count, last event
+  type, and live token count. `aibridge status` prints it; `aibridge status --watch`
+  follows it each second until the review finishes. This makes a still-thinking
+  review (events/tokens climbing) clearly distinguishable from a genuinely stalled
+  codex (events stopped, no result) — the status line flags a ⚠ stall when an active
+  review goes >30s with no new event. Verified end-to-end against real codex (a
+  single turn streamed 30 events with a live token count, event type parsed
+  correctly).
+
 ## [0.5.0] - 2026-05-23
 
 ### Changed

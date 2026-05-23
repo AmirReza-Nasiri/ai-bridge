@@ -9,13 +9,26 @@
 //! `.cmd` shim to `node <entry>.js`) so a no-console MCP host never deadlocks on
 //! `cmd /C` (see `aibridge_platform::Platform::spawn_plan`).
 
+use crate::progress::ProgressSink;
 use aibridge_platform::{DefaultPlatform, Platform};
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+/// Shared in-flight review progress: the reader thread folds codex's streamed
+/// `codex/event` notifications into it while a call is active (set by
+/// [`CodexPeer::begin_progress`] / cleared by [`CodexPeer::end_progress`]).
+type Progress = Arc<Mutex<Option<ProgressSink>>>;
+
+/// Is this parsed line a JSON-RPC NOTIFICATION (has `method`, no/`null` `id`)?
+/// Codex streams its turn events as notifications; responses carry an `id`.
+fn is_notification(v: &Value) -> bool {
+    v.get("method").is_some() && v.get("id").map(Value::is_null).unwrap_or(true)
+}
 
 /// Deadline for the MCP handshake (`initialize`). Generous enough for a cold
 /// `codex mcp-server` start, short enough that a wedged child fails fast.
@@ -69,6 +82,8 @@ pub struct CodexPeer {
     next_id: i64,
     spawn_kind: &'static str,
     spawn_program: String,
+    /// Live review-progress sink the reader thread updates from codex events.
+    progress: Progress,
 }
 
 impl CodexPeer {
@@ -108,8 +123,13 @@ impl CodexPeer {
         }
 
         // Reader thread: forward each parsed JSON line over a channel so the
-        // request side can apply a deadline instead of blocking forever.
+        // request side can apply a deadline instead of blocking forever. It ALSO
+        // folds codex's streamed turn-event notifications into the shared progress
+        // sink (when a review is active) — these would otherwise be dropped by the
+        // request loop, leaving a multi-minute review looking hung.
         let (tx, rx) = mpsc::channel();
+        let progress: Progress = Arc::new(Mutex::new(None));
+        let reader_progress = Arc::clone(&progress);
         std::thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
             let mut line = String::new();
@@ -126,8 +146,17 @@ impl CodexPeer {
                             continue;
                         }
                         match serde_json::from_str::<Value>(trimmed) {
-                            // Forward JSON; stop if the request side has gone away.
+                            // Relay turn-event notifications to the live progress
+                            // sink, then forward JSON; stop if the request side has
+                            // gone away.
                             Ok(v) => {
+                                if is_notification(&v) {
+                                    if let Ok(mut g) = reader_progress.lock() {
+                                        if let Some(sink) = g.as_mut() {
+                                            sink.note(&v);
+                                        }
+                                    }
+                                }
                                 if tx.send(FromCodex::Message(v)).is_err() {
                                     break;
                                 }
@@ -151,6 +180,7 @@ impl CodexPeer {
             next_id: 1,
             spawn_kind,
             spawn_program,
+            progress,
         };
         peer.initialize()?;
         Ok(peer)
@@ -164,6 +194,25 @@ impl CodexPeer {
     /// The resolved launch line, for diagnostics/logging.
     pub fn spawn_program(&self) -> &str {
         &self.spawn_program
+    }
+
+    /// Start live progress tracking for a review in `cwd` (`phase` labels it, e.g.
+    /// `plan-gate` / `review` / `consult:<topic>`). The reader thread then streams
+    /// codex's turn events into `.ai-bridge/review-status.json`. Pair with
+    /// [`end_progress`](Self::end_progress).
+    pub fn begin_progress(&self, cwd: &str, phase: &str) {
+        if let Ok(mut g) = self.progress.lock() {
+            *g = Some(ProgressSink::new(cwd, phase));
+        }
+    }
+
+    /// Stop tracking the current review (writes a final inactive snapshot).
+    pub fn end_progress(&self) {
+        if let Ok(mut g) = self.progress.lock() {
+            if let Some(mut sink) = g.take() {
+                sink.finish();
+            }
+        }
     }
 
     fn initialize(&mut self) -> Result<()> {
@@ -304,6 +353,37 @@ impl Drop for CodexPeer {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Real codex round-trip proving the reader relays codex's turn events into the
+    /// live progress sink. Ignored by default (needs `codex` logged in + quota);
+    /// run manually: `cargo test -p aibridge-core --release -- --ignored progress`.
+    #[test]
+    #[ignore = "hits real codex; run with --ignored"]
+    fn progress_captures_live_codex_events() {
+        let cwd = std::env::temp_dir().join(format!("aibridge-codexprog-{}", std::process::id()));
+        std::fs::create_dir_all(&cwd).unwrap();
+        let cwds = cwd.to_string_lossy().to_string();
+
+        let mut peer = CodexPeer::spawn().expect("spawn codex mcp-server");
+        peer.begin_progress(&cwds, "test");
+        let _ = peer
+            .open_thread("Reply with the single word OK.", &cwds, "low")
+            .expect("codex open_thread");
+        peer.end_progress();
+
+        let st = crate::progress::read_status(&cwds).expect("status file written");
+        eprintln!("CAPTURED STATUS: {st}");
+        let events = st.get("events").and_then(Value::as_u64).unwrap_or(0);
+        assert!(
+            events > 0,
+            "expected codex to stream >=1 progress event during the turn, got {events}"
+        );
     }
 }
 

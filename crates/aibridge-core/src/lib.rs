@@ -13,6 +13,7 @@ pub mod install;
 pub mod mcp;
 pub mod optimizer;
 pub mod plan_gate;
+pub mod progress;
 pub mod topics;
 pub mod update;
 

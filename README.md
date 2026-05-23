@@ -20,6 +20,7 @@
 | **`review_stop`** — the **automatic** Stop-hook gate (allow/block + no-progress + fail-ask; node-direct spawn, background warming, project-subtree scoped, deadline-bounded) | ✅ working |
 | **`aibridge init`** — one-command local wiring, both gates by default (subdirectory-of-a-repo aware) | ✅ working |
 | **`aibridge doctor` / `selftest`** — one-command health + connection check (version, install-shape, `--check-updates`) | ✅ working |
+| **`aibridge status` / `--watch`** — live progress of an in-progress review (elapsed, codex events, token count) so a long review isn't a black box | ✅ working |
 | **`aibridge update`** — self-update from GitHub Releases (`gh` download + sha256 verify + replace; `--check` to just report) | ✅ working |
 | **rtk output-compression** — opt-in via `aibridge init --rtk` (safe-mode allowlist) | ✅ working |
 | `--shared` team install · `uninit` · TUI · `--from-source` update | 🔭 planned |
@@ -161,6 +162,8 @@ aibridge init --no-plan-gate # wire it WITHOUT the pre-execution plan gate (Stop
 aibridge init --rtk          # also wire the rtk output-optimizer hook (safe mode)
 aibridge doctor              # one-command health + connection check (no quota, offline)
 aibridge doctor --check-updates  # also ask GitHub whether a newer release exists
+aibridge status              # live status of an in-progress Codex review (elapsed, events, tokens)
+aibridge status --watch      # follow that review live until it finishes
 aibridge update --check      # report current vs latest release (no changes)
 aibridge update [--yes]      # download + verify + install the latest release (--yes skips the prompt)
 aibridge selftest [--full]   # same checks; --full adds a real Codex round-trip (uses quota)
