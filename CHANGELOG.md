@@ -6,6 +6,21 @@ versioning is semver.
 
 ## [Unreleased]
 
+## [0.5.4] - 2026-05-23
+
+### Changed
+
+- **Make long reviews self-explaining (discoverability).** Even with live progress
+  shipped in 0.5.1/0.5.2, a multi-minute review still read as a "hang" because nothing
+  pointed an agent to it. The `init`-written guidance (`CLAUDE.local.md`) now states
+  that peer reviews run at high reasoning effort and can take MINUTES — especially the
+  first, cold one of a session — and are NOT hung, and to watch live with
+  `aibridge status` / `aibridge status --watch`; and to commit reviewed work often so
+  each Stop (which reviews ALL uncommitted changes) stays small and fast instead of
+  re-flagging the same untracked code. The Stop hook's `statusMessage` gained the same
+  hint. Doc/guidance only — no behavior change. Existing projects pick it up on a
+  re-`init`.
+
 ## [0.5.3] - 2026-05-23
 
 ### Changed

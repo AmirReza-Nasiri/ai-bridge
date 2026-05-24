@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const GATE_LINE: &str = "AI Bridge is installed locally in this project. If the Stop hook blocks with peer-review findings, address them before finishing. If AI Bridge asks for a user decision, stop and ask the user.";
+const GATE_LINE: &str = "AI Bridge is installed locally in this project. If the Stop hook blocks with peer-review findings, address them before finishing. If AI Bridge asks for a user decision, stop and ask the user. Peer reviews run at high reasoning effort (xhigh), so a review can take MINUTES — especially the first (cold) one of a session — and it is NOT hung: run `aibridge status` (or `aibridge status --watch`) to watch live progress (elapsed, events, tokens). Commit reviewed work often: every Stop reviews ALL uncommitted changes, so a clean tree is allowed instantly while a large untracked pile makes each review slow and keeps re-flagging the same code.";
 
 /// What `init` did, for a human-readable report.
 pub struct InitReport {
@@ -370,7 +370,7 @@ fn install_stop_hook(project: &Path, actions: &mut Vec<String>) -> Result<()> {
                     "type": "mcp_tool",
                     "server": "aibridge",
                     "tool": "review_stop",
-                    "statusMessage": "AI Bridge peer review",
+                    "statusMessage": "AI Bridge peer review (can take minutes — `aibridge status --watch` to follow)",
                     // Generous: a thorough xhigh review can take several minutes,
                     // and the user prioritizes quality over speed. AI Bridge's own
                     // backstop (CALL_TIMEOUT) fires first; a crashed Codex is caught
