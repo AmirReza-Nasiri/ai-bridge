@@ -130,13 +130,15 @@ shipping unreviewed work, never looping forever.
 
 > **Review depth & latency.** Reviews run at Codex `xhigh` reasoning by default —
 > thorough, but a real review takes **minutes** (a generous internal deadline
-> ensures it always completes; it is *not* a cutoff). This is independent of your
-> global `~/.codex/config.toml`. Two practical notes: (1) `aibridge doctor` prints
-> the effort so a slow review is never mistaken for a hang; (2) the gate reviews
-> only **uncommitted** change in the project subtree, so **commit often** — small
-> incremental diffs review in seconds, and a clean tree is allowed instantly.
-> Tune the speed/depth tradeoff with `REVIEW_REASONING_EFFORT` (`xhigh` → `high`
-> → `medium` → `low`).
+> ensures it always completes; it is *not* a cutoff). Two practical notes:
+> (1) `aibridge doctor` prints the effort, and `aibridge status --watch` streams live
+> progress, so a slow review is never mistaken for a hang; (2) the Stop gate reviews
+> the **whole task delta** — work *committed* since the task started (a base recorded
+> by the `UserPromptSubmit` hook) **plus** the uncommitted tree — so a `git commit`
+> before the turn ends does **not** skip review. Commits are checkpoints, not a way
+> past the gate; commit at *task boundaries* (after a clean review) to keep the
+> **next** task's review small. Tune the speed/depth tradeoff with
+> `REVIEW_REASONING_EFFORT` (`xhigh` → `high` → `medium` → `low`).
 
 **On demand (plain language).** Just ask Claude; it routes to the MCP tools:
 

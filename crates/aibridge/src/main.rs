@@ -192,8 +192,11 @@ fn hook_user_prompt_submit() -> Result<()> {
     use std::io::Read;
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input)?;
-    // Start a fresh plan-gate epoch for this prompt; never block the prompt.
+    // Start a fresh plan-gate epoch AND record the Stop-gate review base for this
+    // prompt; never block the prompt. (The review base is recorded even when the
+    // plan gate is off, so the Stop gate can review committed-since-task work.)
     aibridge_core::plan_gate::on_user_prompt(&input);
+    aibridge_core::review_frontier::on_user_prompt(&input);
     print!("{{}}");
     Ok(())
 }

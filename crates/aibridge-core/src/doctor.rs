@@ -175,6 +175,7 @@ pub fn run(project: &Path, full: bool, check_updates: bool) -> Report {
     checks.push(mcp_binary_path(project));
     checks.push(install_metadata());
     checks.push(stop_hook(project));
+    checks.push(task_start_hook(project));
     checks.push(plan_gate_status(project));
     checks.push(install_state(project));
     checks.push(spawned_context(project));
@@ -492,6 +493,32 @@ fn stop_hook(project: &Path) -> Check {
     }
 }
 
+/// The `UserPromptSubmit` task-start hook records the per-task review BASE the Stop
+/// gate measures committed work from. Without it the Stop gate falls back to
+/// reviewing the uncommitted tree only — so a `git commit` before the turn ends can
+/// slip past review. Flag a missing one so the user re-runs `init`.
+fn task_start_hook(project: &Path) -> Check {
+    let present = std::fs::read_to_string(project.join(".claude").join("settings.local.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .map(|v| has_aibridge_user_prompt_hook(&v))
+        .unwrap_or(false);
+    if present {
+        check(
+            Status::Pass,
+            "task-start hook",
+            "installed — Stop reviews committed-since-task work too (no commit-bypass)",
+        )
+    } else {
+        check(
+            Status::Warn,
+            "task-start hook",
+            "missing (UserPromptSubmit) — Stop reviews only the uncommitted tree; \
+             a pre-Stop `git commit` can bypass review. Run `aibridge init`",
+        )
+    }
+}
+
 fn install_state(project: &Path) -> Check {
     if project
         .join(".ai-bridge")
@@ -590,6 +617,27 @@ fn e2e_roundtrip(project: &Path) -> Check {
         ),
         Err(e) => check(Status::Fail, "e2e Codex round-trip", e.to_string()),
     }
+}
+
+fn has_aibridge_user_prompt_hook(v: &Value) -> bool {
+    v.pointer("/hooks/UserPromptSubmit")
+        .and_then(Value::as_array)
+        .map(|groups| {
+            groups.iter().any(|g| {
+                g.pointer("/hooks")
+                    .and_then(Value::as_array)
+                    .map(|hs| {
+                        hs.iter().any(|h| {
+                            h.get("args")
+                                .and_then(Value::as_array)
+                                .map(|a| a.iter().any(|x| x.as_str() == Some("user-prompt-submit")))
+                                .unwrap_or(false)
+                        })
+                    })
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
 }
 
 fn has_aibridge_stop_hook(v: &Value) -> bool {

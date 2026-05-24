@@ -14,6 +14,7 @@ pub mod mcp;
 pub mod optimizer;
 pub mod plan_gate;
 pub mod progress;
+pub mod review_frontier;
 pub mod topics;
 pub mod update;
 

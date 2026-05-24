@@ -6,6 +6,31 @@ versioning is semver.
 
 ## [Unreleased]
 
+## [0.5.5] - 2026-05-23
+
+### Security / Changed
+
+- **Closed the commit-before-Stop review bypass (peer-reviewed, 2 rounds → APPROVE).**
+  The Stop gate previously reviewed only the UNCOMMITTED working tree, so a `git commit`
+  made before the turn ended left a clean tree and shipped the code UNREVIEWED — defeating
+  "nothing ships without review." The Stop gate now reviews the WHOLE task delta:
+  - A `UserPromptSubmit` task-start hook (now installed even with the plan gate OFF)
+    records a per-task review BASE (HEAD at task start) in tamper-resistant state OUTSIDE
+    the repo (`~/.ai-bridge/review-state/<repo>/<session>.json` — a repo-local file would
+    be agent-writable AND excluded from review, merely relocating the bypass).
+  - Stop reviews `base..HEAD` (work committed during the task) PLUS the uncommitted tree.
+    The base advances at the next task start ONLY when the prior review resolved
+    (`approved`) — never over unresolved debt; a fail-ask "delivery" allow is recorded as
+    `needs_user`, not `approved`, so debt can't be laundered into approval.
+  - Safe degradation, never a silent skip: unborn repo ⇒ empty; a diverged base
+    (rebase/reset/branch) ⇒ the net `base↔HEAD` diff, warned; a missing base (gc/amend)
+    ⇒ the full tree, warned (a conservative superset).
+  - `aibridge doctor` gained a **task-start hook** check (warns when the `UserPromptSubmit`
+    hook is missing — committing could then bypass review).
+  - Guidance reworded (`CLAUDE.local.md` + README): the Stop gate reviews the whole task
+    delta; commits are checkpoints, not a way past the gate; the supported loop-escape is
+    no-progress / explicit user decision — never `commit` to silence the gate.
+
 ## [0.5.4] - 2026-05-23
 
 ### Changed

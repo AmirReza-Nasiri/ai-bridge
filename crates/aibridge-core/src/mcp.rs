@@ -615,11 +615,40 @@ impl Server {
         if stop_active {
             return allow(); // already in a stop-hook continuation; don't re-gate
         }
-        let bundle = match crate::git::diff_bundle(cwd) {
+        let mut bundle = match crate::git::diff_bundle(cwd) {
             Ok(b) => b,
             Err(_) => return allow(), // not a git repo / git missing: nothing to gate
         };
+
+        // Fold in work COMMITTED since the task's base so a `git commit` made BEFORE
+        // this Stop can't hide it from review (closing the commit-bypass).
+        // `committed_delta` degrades SAFELY on a diverged/missing base — it returns a
+        // warned net/full-tree diff (embedded in the text), never a silent skip — so
+        // here we just fold it in. No recorded base ⇒ uncommitted-only (pre-0.5.5
+        // behavior, no regression; `doctor` flags the missing task-start hook).
+        match crate::review_frontier::read(cwd, session).and_then(|f| {
+            f.base_spec()
+                .map(|base| crate::git::committed_delta(cwd, base))
+        }) {
+            Some(cd) => {
+                if !cd.is_empty {
+                    bundle = bundle.with_committed(&cd.text);
+                }
+            }
+            None => log_gate(
+                cwd,
+                "no review base recorded — reviewing uncommitted tree only \
+                 (re-run `aibridge init` to record a task-start base)",
+            ),
+        }
+
         if bundle.is_empty {
+            // Nothing committed-since-base AND a clean tree ⇒ nothing to review.
+            crate::review_frontier::set_status(
+                cwd,
+                session,
+                crate::review_frontier::STATUS_APPROVED,
+            );
             return allow();
         }
         log_gate(
@@ -627,9 +656,23 @@ impl Server {
             &format!("reviewing diff bundle: {} bytes", bundle.text.len()),
         );
         let key = format!("{cwd}::{session}");
+        let dh = bundle.hash;
         let mut state = self.gates.remove(&key).unwrap_or_default();
         let decision = self.gate_decide(&mut state, &bundle, cwd);
+        // Map the outcome to the frontier status so the NEXT task start won't advance
+        // the base over unresolved debt. CRUCIAL: an allow is only a genuine APPROVE
+        // when the gate recorded THIS diff as allowed; a fail-ask "delivery" allow
+        // (so Claude can ask the user) does NOT set that, and must stay needs_user —
+        // otherwise unresolved debt would be laundered into `approved` (Codex find).
+        let status = if decision != "{}" {
+            crate::review_frontier::STATUS_BLOCKED
+        } else if state.last_allowed_diff_hash == Some(dh) {
+            crate::review_frontier::STATUS_APPROVED
+        } else {
+            crate::review_frontier::STATUS_NEEDS_USER
+        };
         self.gates.insert(key, state);
+        crate::review_frontier::set_status(cwd, session, status);
         decision
     }
 

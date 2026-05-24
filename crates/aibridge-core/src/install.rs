@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const GATE_LINE: &str = "AI Bridge is installed locally in this project. If the Stop hook blocks with peer-review findings, address them before finishing. If AI Bridge asks for a user decision, stop and ask the user. Peer reviews run at high reasoning effort (xhigh), so a review can take MINUTES — especially the first (cold) one of a session — and it is NOT hung: run `aibridge status` (or `aibridge status --watch`) to watch live progress (elapsed, events, tokens). Commit reviewed work often: every Stop reviews ALL uncommitted changes, so a clean tree is allowed instantly while a large untracked pile makes each review slow and keeps re-flagging the same code.";
+const GATE_LINE: &str = "AI Bridge is installed locally in this project. If the Stop hook blocks with peer-review findings, address them before finishing. If AI Bridge asks for a user decision, stop and ask the user. Peer reviews run at high reasoning effort (xhigh), so a review can take MINUTES — especially the first (cold) one of a session — and it is NOT hung: run `aibridge status` (or `aibridge status --watch`) to watch live progress. The Stop gate reviews the WHOLE task delta — work COMMITTED since the task started PLUS the uncommitted tree — so committing does NOT skip review; commits are checkpoints, not a way past the gate. Commit at task boundaries (after a clean review) to keep the NEXT task's review small. If a review loop gets stuck, the supported escape is the no-progress prompt or an explicit user decision — never `commit` to silence the gate.";
 
 /// What `init` did, for a human-readable report.
 pub struct InitReport {
@@ -41,6 +41,9 @@ pub fn init(project: &Path, rtk: bool, plan_gate: bool) -> Result<InitReport> {
 
     register_mcp_server(project, &exe_str, &mut actions)?;
     install_stop_hook(project, &mut actions)?;
+    // Always wire the task-start hook (even with the plan gate off): the Stop gate
+    // needs a per-task review base to catch work COMMITTED during the task.
+    install_user_prompt_hook(project, &exe_str, &mut actions)?;
     if plan_gate {
         // The plan-gate's PreToolUse hook uses a BROAD matcher (write tools + Bash)
         // and the shared `pretooluse` handler does rtk too, so it subsumes the
@@ -180,6 +183,75 @@ fn hook_is_aibridge_pretooluse(h: &Value) -> bool {
 /// broad `PreToolUse` hook that denies writes/Bash until the plan is approved (the
 /// shared `pretooluse` handler also does rtk), and a coding-habit note in
 /// `CLAUDE.local.md`. A per-session bypass is `AIBRIDGE_PLAN_GATE=0`.
+/// True iff `arr` already contains an AI Bridge `user-prompt-submit` hook group.
+fn has_user_prompt_hook(arr: &[Value]) -> bool {
+    arr.iter().any(|g| {
+        g.pointer("/hooks")
+            .and_then(Value::as_array)
+            .map(|hs| {
+                hs.iter().any(|h| {
+                    h.get("args")
+                        .and_then(Value::as_array)
+                        .map(|a| a.iter().any(|x| x.as_str() == Some("user-prompt-submit")))
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// Install the `UserPromptSubmit` task-start hook (fresh plan-gate epoch + Stop
+/// review base). Wired whenever AI Bridge is installed — even with the plan gate
+/// off — so the Stop gate can baseline work committed during the task. Idempotent.
+fn install_user_prompt_hook(project: &Path, exe: &str, actions: &mut Vec<String>) -> Result<()> {
+    let path = project.join(".claude").join("settings.local.json");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("creating {}", display(parent)))?;
+    }
+    let mut root = read_json(&path)?;
+    if !root.is_object() {
+        root = json!({});
+    }
+    let changed = {
+        let obj = root.as_object_mut().expect("object");
+        let hooks = obj.entry("hooks").or_insert_with(|| json!({}));
+        if !hooks.is_object() {
+            *hooks = json!({});
+        }
+        let ups = hooks
+            .as_object_mut()
+            .expect("object")
+            .entry("UserPromptSubmit")
+            .or_insert_with(|| json!([]));
+        if !ups.is_array() {
+            *ups = json!([]);
+        }
+        let arr = ups.as_array_mut().expect("array");
+        if has_user_prompt_hook(arr) {
+            false
+        } else {
+            arr.push(json!({
+                "hooks": [{
+                    "type": "command",
+                    "command": exe,
+                    "args": ["hook", "user-prompt-submit"],
+                    "timeout": 10
+                }]
+            }));
+            true
+        }
+    };
+    if changed {
+        backup_if_exists(&path, actions)?;
+        write_json(&path, &root)?;
+        actions.push(format!(
+            "wired the task-start hook (UserPromptSubmit) in {}",
+            display(&path)
+        ));
+    }
+    Ok(())
+}
+
 fn install_plan_gate(project: &Path, exe: &str, actions: &mut Vec<String>) -> Result<()> {
     // STAGE the gate (enabled.pending), don't activate it yet — the MCP server
     // promotes it on its next startup. This prevents the install deadlock where the
@@ -239,19 +311,7 @@ fn install_plan_gate(project: &Path, exe: &str, actions: &mut Vec<String>) -> Re
             *ups = json!([]);
         }
         let arr = ups.as_array_mut().expect("array");
-        let present = arr.iter().any(|g| {
-            g.pointer("/hooks")
-                .and_then(Value::as_array)
-                .map(|hs| {
-                    hs.iter().any(|h| {
-                        h.get("args")
-                            .and_then(Value::as_array)
-                            .map(|a| a.iter().any(|x| x.as_str() == Some("user-prompt-submit")))
-                            .unwrap_or(false)
-                    })
-                })
-                .unwrap_or(false)
-        });
+        let present = has_user_prompt_hook(arr);
         if !present {
             arr.push(json!({
                 "hooks": [{
