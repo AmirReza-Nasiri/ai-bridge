@@ -262,6 +262,44 @@ impl CodexPeer {
         }
     }
 
+    /// Record a DECLINED elicitation (a codex tool wanted interactive input we can't
+    /// answer headlessly) into the live progress, so `aibridge status`, the review
+    /// result, and `doctor` can show which server to configure. Best-effort; the disk
+    /// write of the status snapshot happens after the sink lock is released.
+    fn record_elicitation(&self, params: &Value) {
+        let message = params
+            .get("message")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                params
+                    .pointer("/requestedSchema/title")
+                    .and_then(Value::as_str)
+            })
+            .unwrap_or("(no message provided)");
+        let keys: Vec<String> = params
+            .pointer("/requestedSchema/properties")
+            .and_then(Value::as_object)
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default();
+        let snap = self
+            .progress
+            .lock()
+            .ok()
+            .and_then(|mut g| g.as_mut().map(|s| s.note_elicitation(message, &keys)));
+        if let Some(snap) = snap {
+            write_status(&snap);
+        }
+    }
+
+    /// A one-line note iff THIS review turn had to decline an elicitation (for the
+    /// caller to append to the review result). `begin_progress` resets it per turn.
+    pub fn last_elicitation_note(&self) -> Option<String> {
+        self.progress
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().and_then(|s| s.last_elicitation_summary()))
+    }
+
     /// Stop tracking the current review and write a final snapshot with the terminal
     /// `outcome` (`completed` / `error` / `timeout`). The disk write happens after
     /// the lock is released.
@@ -342,6 +380,11 @@ impl CodexPeer {
                     // - no `method`       → a response: return it iff the id is ours.
                     if let Some(method) = msg.get("method").and_then(Value::as_str) {
                         if let Some(rid) = msg.get("id").filter(|v| !v.is_null()).cloned() {
+                            // Capture the elicitation params BEFORE answering (so the
+                            // user can see which tool wanted input + configure it).
+                            let elicit = (method == "elicitation/create")
+                                .then(|| msg.get("params").cloned())
+                                .flatten();
                             // If we can't answer, surface a transport error NOW rather
                             // than degrade back into waiting for `CALL_TIMEOUT` (Codex
                             // review) — the caller invalidates + re-warms the peer.
@@ -349,6 +392,9 @@ impl CodexPeer {
                                 .map_err(|e| {
                                     anyhow!("failed to answer codex `{method}` request: {e}")
                                 })?;
+                            if let Some(params) = elicit {
+                                self.record_elicitation(&params); // best-effort visibility
+                            }
                         }
                         continue;
                     }

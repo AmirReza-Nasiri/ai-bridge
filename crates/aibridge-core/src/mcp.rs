@@ -35,6 +35,15 @@ enum TopicKey {
     Consult(String),
 }
 
+/// Append a one-line note to a review result when a codex tool's elicitation had to
+/// be declined this turn, so the human sees WHY a tool didn't run + can configure it.
+fn append_elicit(text: String, note: Option<String>) -> String {
+    match note {
+        Some(n) => format!("{text}\n\n[AI Bridge: {n}]"),
+        None => text,
+    }
+}
+
 /// Human label for the live review-progress sink, from the thread being used.
 fn progress_phase(key: &TopicKey) -> String {
     match key {
@@ -165,18 +174,19 @@ impl Server {
         self.ensure_peer()?;
         let phase = progress_phase(&key);
         if let Some(tid) = self.threads.get(&key).cloned() {
-            let reply = {
+            let (reply, elicit) = {
                 let peer = self
                     .codex
                     .as_mut()
                     .ok_or_else(|| anyhow::anyhow!("codex peer unavailable"))?;
                 peer.begin_progress(cwd, &phase);
                 let r = peer.reply(&tid, prompt);
+                let elicit = peer.last_elicitation_note(); // BEFORE end_progress drops the sink
                 peer.end_progress(if r.is_ok() { "completed" } else { "error" });
-                r
+                (r, elicit)
             };
             match reply {
-                Ok(text) if !is_session_lost(&text) => return Ok(text),
+                Ok(text) if !is_session_lost(&text) => return Ok(append_elicit(text, elicit)),
                 Ok(_) => {
                     self.threads.remove(&key); // stale thread → reopen below
                 }
@@ -187,15 +197,16 @@ impl Server {
             }
         }
         self.ensure_peer()?;
-        let opened = {
+        let (opened, elicit) = {
             let peer = self
                 .codex
                 .as_mut()
                 .ok_or_else(|| anyhow::anyhow!("codex peer unavailable"))?;
             peer.begin_progress(cwd, &phase);
             let r = peer.open_thread(prompt, cwd, crate::codex::REVIEW_REASONING_EFFORT);
+            let elicit = peer.last_elicitation_note(); // BEFORE end_progress drops the sink
             peer.end_progress(if r.is_ok() { "completed" } else { "error" });
-            r
+            (r, elicit)
         };
         match opened {
             Ok((tid, text)) => {
@@ -203,7 +214,7 @@ impl Server {
                     self.evict_consult_if_full();
                 }
                 self.threads.insert(key, tid);
-                Ok(text)
+                Ok(append_elicit(text, elicit))
             }
             Err(e) => {
                 self.invalidate_peer();

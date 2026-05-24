@@ -138,6 +138,14 @@ pub struct ProgressSink {
     tokens: Option<u64>,
     tokens_source: Option<String>,
     recent: VecDeque<RecentEvent>,
+    /// Best-effort name of the most recent codex tool call (from a
+    /// `mcp_tool_call_begin` event), to attribute a following elicitation.
+    last_tool: Option<String>,
+    /// A one-line, REDACTED summary of the last elicitation AI Bridge had to decline
+    /// (a codex tool wanted interactive input we can't safely answer headlessly), so
+    /// `aibridge status` / the review result / `doctor` can tell the user which server
+    /// to configure for headless use.
+    last_elicitation: Option<String>,
 }
 
 impl ProgressSink {
@@ -160,6 +168,8 @@ impl ProgressSink {
             tokens: None,
             tokens_source: None,
             recent: VecDeque::new(),
+            last_tool: None,
+            last_elicitation: None,
         };
         write_status(&s.snapshot(true, "running"));
         s
@@ -175,6 +185,14 @@ impl ProgressSink {
         let params = msg.get("params").unwrap_or(msg);
         let kind = event_type(msg, params).unwrap_or_else(|| "unknown".to_string());
         self.last_event = kind.clone();
+        // Best-effort, low-confidence (temporal) attribution: remember the most recent
+        // tool call so a following elicitation can name the likely culprit server.
+        if kind == "mcp_tool_call_begin" {
+            self.last_tool = find_str(params, "tool")
+                .or_else(|| find_str(params, "server"))
+                .or_else(|| find_str(params, "name"))
+                .map(|s| redact(s, 80));
+        }
         if let Some((tk, src)) = extract_tokens(params) {
             self.tokens = Some(tk);
             self.tokens_source = Some(src);
@@ -222,6 +240,33 @@ impl ProgressSink {
         self.snapshot(false, outcome)
     }
 
+    /// Record an elicitation AI Bridge had to DECLINE (a codex tool wanted
+    /// interactive input we can't safely answer headlessly). REDACTS + truncates the
+    /// message, stores a one-line summary for status/result/doctor, appends one
+    /// capped redacted line to `.ai-bridge/elicitations.jsonl`, and returns a snapshot
+    /// to write off-lock. Best-effort: never blocks/fails the review.
+    pub fn note_elicitation(&mut self, message: &str, schema_keys: &[String]) -> StatusSnapshot {
+        let msg = redact(message, 400);
+        let keys: Vec<String> = schema_keys.iter().take(50).map(|k| redact(k, 60)).collect();
+        let tool = self.last_tool.clone();
+        self.last_elicitation = Some(match &tool {
+            Some(t) => format!(
+                "codex tool '{t}' wanted input: \"{msg}\" — declined (configure it for headless use)"
+            ),
+            None => format!(
+                "a codex tool wanted input: \"{msg}\" — declined (configure it for headless use)"
+            ),
+        });
+        append_elicitation_log(&self.cwd, &msg, &keys, tool.as_deref());
+        self.snapshot(true, "running")
+    }
+
+    /// The last declined-elicitation summary (for the review result note). Cleared
+    /// on `new()` (per-call), so it reflects only THIS review turn.
+    pub fn last_elicitation_summary(&self) -> Option<String> {
+        self.last_elicitation.clone()
+    }
+
     fn snapshot(&self, active: bool, status: &str) -> StatusSnapshot {
         let recent: Vec<Value> = self
             .recent
@@ -249,9 +294,103 @@ impl ProgressSink {
                 "tokens": self.tokens,
                 "tokens_source": self.tokens_source,
                 "recent_events": recent,
+                "last_elicitation": self.last_elicitation,
             }),
         }
     }
+}
+
+/// Truncate to `max` chars and strip obvious secrets/PII per word (emails, URLs,
+/// bearer/api tokens, long high-entropy strings) — conservative + cheap, applied
+/// before anything elicitation-derived is persisted (Codex review).
+fn redact(s: &str, max: usize) -> String {
+    let mut out = String::new();
+    for word in s.split_whitespace() {
+        let w = if looks_secret(word) {
+            "[redacted]"
+        } else {
+            word
+        };
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(w);
+        if out.chars().count() >= max {
+            break;
+        }
+    }
+    out.chars().take(max).collect()
+}
+
+fn looks_secret(w: &str) -> bool {
+    let lw = w.to_lowercase();
+    lw.contains('@') // email-ish
+        || lw.starts_with("http://")
+        || lw.starts_with("https://") // URLs may carry tokens in the query
+        || lw.starts_with("sk-")
+        || lw.starts_with("bearer")
+        || lw.contains("token")
+        || lw.contains("apikey")
+        || lw.contains("api_key")
+        || lw.contains("password")
+        || lw.contains("secret")
+        // long high-entropy-looking token
+        || (w.len() >= 32
+            && w.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '+' | '/' | '=')))
+}
+
+/// Cap for the persistent elicitation log (keep the last N lines).
+const ELICIT_LOG_MAX_LINES: usize = 200;
+
+/// Append one redacted JSONL line to `.ai-bridge/elicitations.jsonl`, keeping only
+/// the last [`ELICIT_LOG_MAX_LINES`]. Best-effort. `message`/`schema_keys` must be
+/// pre-redacted by the caller.
+fn append_elicitation_log(cwd: &str, message: &str, schema_keys: &[String], tool: Option<&str>) {
+    let dir = Path::new(cwd).join(".ai-bridge");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let path = dir.join("elicitations.jsonl");
+    let line = json!({
+        "declined_at_ms": now_ms() as u64,
+        "method": "elicitation/create",
+        "message": message,
+        "schema_keys": schema_keys,
+        "recent_tool": tool,
+        "recent_tool_confidence": "temporal",
+    })
+    .to_string();
+    let mut lines: Vec<String> = std::fs::read_to_string(&path)
+        .ok()
+        .map(|s| s.lines().map(str::to_string).collect())
+        .unwrap_or_default();
+    lines.push(line);
+    let n = lines.len();
+    if n > ELICIT_LOG_MAX_LINES {
+        lines.drain(0..n - ELICIT_LOG_MAX_LINES);
+    }
+    let body = format!("{}\n", lines.join("\n"));
+    let tmp = dir.join(format!("elicitations.jsonl.tmp.{}", std::process::id()));
+    if std::fs::write(&tmp, body).is_ok() && std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// The most recent declined elicitation for `doctor`: `(declined_at_ms, summary)`.
+pub fn last_declined_elicitation(cwd: &str) -> Option<(u64, String)> {
+    let content =
+        std::fs::read_to_string(Path::new(cwd).join(".ai-bridge").join("elicitations.jsonl"))
+            .ok()?;
+    let last = content.lines().filter(|l| !l.trim().is_empty()).next_back()?;
+    let v: Value = serde_json::from_str(last).ok()?;
+    let ms = v.get("declined_at_ms").and_then(Value::as_u64).unwrap_or(0);
+    let msg = v.get("message").and_then(Value::as_str).unwrap_or("");
+    let summary = match v.get("recent_tool").and_then(Value::as_str) {
+        Some(t) => format!("tool '{t}': \"{msg}\""),
+        None => format!("\"{msg}\""),
+    };
+    Some((ms, summary))
 }
 
 /// Event type via PRIORITIZED paths (codex carries it at `params.msg.type`), then
@@ -290,6 +429,22 @@ fn extract_tokens(params: &Value) -> Option<(u64, String)> {
     find_u64_key(params, "total_tokens").map(|n| (n, "recursive:total_tokens".to_string()))
 }
 
+/// First string value for `key` anywhere in `v` (best-effort). Used ONLY for the
+/// low-confidence "which tool just ran" attribution of an elicitation — never for a
+/// protocol-critical field, so a loose recursive match is acceptable here.
+fn find_str<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
+    match v {
+        Value::Object(m) => {
+            if let Some(s) = m.get(key).and_then(Value::as_str) {
+                return Some(s);
+            }
+            m.values().find_map(|val| find_str(val, key))
+        }
+        Value::Array(a) => a.iter().find_map(|val| find_str(val, key)),
+        _ => None,
+    }
+}
+
 /// Recursive search for a u64 under EXACTLY `key` (kept narrow on purpose).
 fn find_u64_key(v: &Value, key: &str) -> Option<u64> {
     match v {
@@ -321,10 +476,17 @@ pub fn status_report(cwd: &str) -> Option<String> {
     let last = s.get("last_event").and_then(Value::as_str).unwrap_or("");
     let tokens = s.get("tokens").and_then(Value::as_u64);
     let tok = tokens.map(|t| format!(", ~{t} tokens")).unwrap_or_default();
+    // A declined elicitation means a codex tool wanted input we couldn't answer
+    // headlessly — surface it so the user can configure that server.
+    let elic = s
+        .get("last_elicitation")
+        .and_then(Value::as_str)
+        .map(|e| format!("\n  ⚠ {e}"))
+        .unwrap_or_default();
 
     if !active {
         return Some(format!(
-            "no review in progress (last [{phase}]: {status}, {elapsed}s, {events} events{tok})"
+            "no review in progress (last [{phase}]: {status}, {elapsed}s, {events} events{tok}){elic}"
         ));
     }
 
@@ -352,7 +514,7 @@ pub fn status_report(cwd: &str) -> Option<String> {
         String::new()
     };
     Some(format!(
-        "review IN PROGRESS [{phase}]: {elapsed}s elapsed, {events} events{tok}, last: {last}{note}"
+        "review IN PROGRESS [{phase}]: {elapsed}s elapsed, {events} events{tok}, last: {last}{note}{elic}"
     ))
 }
 
@@ -485,6 +647,59 @@ mod tests {
                 .and_then(Value::as_array)
                 .map(|a| a.len()),
             Some(RECENT_CAP)
+        );
+    }
+
+    #[test]
+    fn redact_strips_secrets_and_truncates() {
+        assert_eq!(redact("hello world", 100), "hello world");
+        assert!(redact("api_token=sk-abcdefghijklmnop", 100).contains("[redacted]"));
+        assert!(!redact("ping me at a@b.com please", 100).contains("a@b.com"));
+        assert!(!redact("see https://x.com/?token=zzz", 100).contains("token=zzz"));
+        assert!(redact(&"word ".repeat(500), 20).chars().count() <= 20);
+    }
+
+    #[test]
+    fn note_elicitation_records_surfaces_and_persists() {
+        let cwd = tmp();
+        let mut s = ProgressSink::new(&cwd, "review");
+        let snap = s.note_elicitation("Select a browser tab to inspect", &["tabId".to_string()]);
+        write_status(&snap);
+        // status file carries it + status_report surfaces a warning line
+        let st = read_status(&cwd).unwrap();
+        assert!(st
+            .get("last_elicitation")
+            .and_then(Value::as_str)
+            .unwrap()
+            .contains("declined"));
+        assert!(status_report(&cwd).unwrap().contains("wanted input"));
+        // persisted to the capped JSONL + readable by doctor
+        let (_, summary) = last_declined_elicitation(&cwd).expect("logged");
+        assert!(summary.contains("Select a browser tab"));
+        // per-turn accessor (for the review-result note)
+        assert!(s
+            .last_elicitation_summary()
+            .unwrap()
+            .contains("Select a browser tab"));
+    }
+
+    #[test]
+    fn elicitation_log_is_capped() {
+        let cwd = tmp();
+        let mut s = ProgressSink::new(&cwd, "review");
+        for i in 0..(ELICIT_LOG_MAX_LINES + 25) {
+            let _ = s.note_elicitation(&format!("ask {i}"), &[]);
+        }
+        let content = std::fs::read_to_string(
+            std::path::Path::new(&cwd)
+                .join(".ai-bridge")
+                .join("elicitations.jsonl"),
+        )
+        .unwrap();
+        let lines = content.lines().filter(|l| !l.trim().is_empty()).count();
+        assert!(
+            lines <= ELICIT_LOG_MAX_LINES,
+            "log must be capped, got {lines}"
         );
     }
 }

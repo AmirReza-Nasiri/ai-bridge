@@ -6,6 +6,25 @@ versioning is semver.
 
 ## [Unreleased]
 
+## [0.5.7] - 2026-05-24
+
+### Added
+
+- **Surface declined elicitations so you can configure the offending tool (peer-reviewed → APPROVE).**
+  Follow-up to v0.5.6: when a codex tool wants interactive input AI Bridge can't safely answer
+  headlessly, it still declines (no hang), but now records it (REDACTED + truncated) so you can see
+  WHICH server to configure for headless use:
+  - `aibridge status` shows `⚠ codex tool '<name>' wanted input: "<message>" — declined`.
+  - The review result appends a one-line `[AI Bridge: …]` note when an elicitation was declined that turn.
+  - A capped (≤200-line), redacted `.ai-bridge/elicitations.jsonl` keeps recent history.
+  - `aibridge doctor` lists codex's configured MCP servers (read-only — never launches them, since a probe
+    could itself elicit/hang) and WARNS only when a tool RECENTLY (≤24h) needed input during a review.
+  - Redaction strips obvious secrets/PII (emails, URLs, api/bearer tokens, long high-entropy strings) and
+    stores schema KEY names only — never values/defaults/content.
+  - DECISION (Codex review): AI Bridge does NOT auto-accept elicitations with synthesized schema defaults —
+    that's unsafe (it could consent to credentials/destructive actions). The correct fix is configuring the
+    server for headless use, which this surfacing makes discoverable; auto-decline stays the safety net.
+
 ## [0.5.6] - 2026-05-23
 
 ### Fixed (liveness)
