@@ -36,6 +36,27 @@ fn is_notification(v: &Value) -> bool {
     }
 }
 
+/// Build the JSON-RPC response to an INBOUND server→client request from codex, so
+/// codex never blocks waiting on this (headless) client. Reviews run with no human
+/// at the codex layer, so we DECLINE elicitations rather than hang; other
+/// server-initiated requests get a graceful empty result or a `method not found`
+/// error so codex always gets an answer and proceeds. `id` is echoed verbatim.
+fn server_request_response(method: &str, id: &Value) -> Value {
+    match method {
+        // The model called a tool that wants user input — decline (no human here).
+        "elicitation/create" => json!({"jsonrpc":"2.0","id":id,"result":{"action":"decline"}}),
+        "ping" => json!({"jsonrpc":"2.0","id":id,"result":{}}),
+        // We expose no filesystem roots to the peer.
+        "roots/list" => json!({"jsonrpc":"2.0","id":id,"result":{"roots":[]}}),
+        // Anything else server-initiated: a clean error so codex moves on rather than
+        // waiting forever (covers sampling/createMessage and any future request).
+        _ => json!({
+            "jsonrpc":"2.0","id":id,
+            "error":{"code":-32601,"message":format!("method '{method}' is not supported by the aibridge MCP client")}
+        }),
+    }
+}
+
 /// Deadline for the MCP handshake (`initialize`). Generous enough for a cold
 /// `codex mcp-server` start, short enough that a wedged child fails fast.
 const INIT_TIMEOUT: Duration = Duration::from_secs(20);
@@ -309,8 +330,30 @@ impl CodexPeer {
             };
             match self.rx.recv_timeout(remaining) {
                 Ok(FromCodex::Message(msg)) => {
+                    // Classify by SHAPE, not by id — codex's request-id space is
+                    // separate from ours, so an id collision is possible (Codex review):
+                    // - `method` + `id`  → an INBOUND server→client request: ANSWER it
+                    //   so codex never blocks on us (e.g. `elicitation/create` when the
+                    //   model calls one of codex's own MCP tools mid-review — that
+                    //   deadlocked a real plan_gate until CALL_TIMEOUT), then keep
+                    //   waiting for OUR response.
+                    // - `method`, no `id` → a notification (already relayed to the
+                    //   progress sink by the reader): ignore.
+                    // - no `method`       → a response: return it iff the id is ours.
+                    if let Some(method) = msg.get("method").and_then(Value::as_str) {
+                        if let Some(rid) = msg.get("id").filter(|v| !v.is_null()).cloned() {
+                            // If we can't answer, surface a transport error NOW rather
+                            // than degrade back into waiting for `CALL_TIMEOUT` (Codex
+                            // review) — the caller invalidates + re-warms the peer.
+                            self.write_msg(&server_request_response(method, &rid))
+                                .map_err(|e| {
+                                    anyhow!("failed to answer codex `{method}` request: {e}")
+                                })?;
+                        }
+                        continue;
+                    }
                     if msg.get("id").and_then(Value::as_i64) != Some(id) {
-                        continue; // notification or a different id
+                        continue; // a stray/late response to some other request
                     }
                     if let Some(err) = msg.get("error") {
                         return Err(anyhow!("codex error: {err}"));
@@ -446,6 +489,39 @@ mod tests {
         ));
         // Non-object lines are never notifications.
         assert!(!is_notification(&json!("hello")));
+    }
+
+    #[test]
+    fn answers_inbound_server_requests_so_codex_never_blocks() {
+        let id = json!(7);
+        // Elicitation → decline (headless: no human to answer).
+        let elicit = server_request_response("elicitation/create", &id);
+        assert_eq!(
+            elicit.pointer("/result/action").and_then(Value::as_str),
+            Some("decline")
+        );
+        assert_eq!(elicit.get("id"), Some(&id), "id echoed verbatim");
+        // ping → empty result.
+        assert_eq!(
+            server_request_response("ping", &id).pointer("/result"),
+            Some(&json!({}))
+        );
+        // roots/list → empty roots.
+        assert!(server_request_response("roots/list", &id)
+            .pointer("/result/roots")
+            .and_then(Value::as_array)
+            .unwrap()
+            .is_empty());
+        // anything else → method-not-found error (a clean answer, never a hang).
+        assert_eq!(
+            server_request_response("sampling/createMessage", &id)
+                .pointer("/error/code")
+                .and_then(Value::as_i64),
+            Some(-32601)
+        );
+        // string ids are echoed too.
+        let sid = json!("abc-1");
+        assert_eq!(server_request_response("ping", &sid).get("id"), Some(&sid));
     }
 
     /// Real codex round-trip proving the reader relays codex's turn events into the

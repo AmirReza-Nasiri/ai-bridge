@@ -6,6 +6,27 @@ versioning is semver.
 
 ## [Unreleased]
 
+## [0.5.6] - 2026-05-23
+
+### Fixed (liveness)
+
+- **Fixed a deadlock where a codex elicitation hung a review until the 1500s timeout
+  (peer-reviewed → APPROVE).** Diagnosed LIVE via the v0.5.2 progress telemetry: during a
+  plan_gate review the codex MODEL invoked one of the user's own codex-configured MCP
+  servers, which issued an MCP `elicitation/create` request to its client. AI Bridge's
+  warm-peer request loop ignored any message that wasn't the response to its own
+  `tools/call`, so codex blocked waiting for the elicitation result while AI Bridge
+  blocked waiting for codex — a silent ~18-minute hang (the live status showed
+  `last_event: elicitation_request` with a fresh bridge heartbeat). Now the request loop
+  classifies messages by SHAPE (not id — avoids an id-collision deadlock) and ANSWERS
+  inbound server→client requests so codex never blocks on this headless client:
+  `elicitation/create` → decline, `ping` → `{}`, `roots/list` → empty roots, anything
+  else → a JSON-RPC `method not found` error. A failed answer-write surfaces a transport
+  error (peer re-warmed) rather than degrading back into a timeout wait.
+  - Deferred (tracked): run reviews WITHOUT the user's codex-configured MCP servers at
+    all — a pure-reasoning review shouldn't call browser/firecrawl (needs `CODEX_HOME`
+    isolation or per-server disable; `codex-reply` can't take per-call `config`).
+
 ## [0.5.5] - 2026-05-23
 
 ### Security / Changed
