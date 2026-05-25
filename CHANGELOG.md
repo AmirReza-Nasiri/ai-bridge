@@ -6,6 +6,36 @@ versioning is semver.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-05-25
+
+### Added (review reliability)
+
+- **`aibridge review-mcp` — user-controlled policy for which of codex's own MCP servers stay
+  enabled during AI Bridge reviews (peer-reviewed, 2 rounds → APPROVE).** Root cause of a
+  reproduced ~10-min review stall: mid-review the warm codex child (the model) invoked one of the
+  user's browser/scrape MCP servers (chrome-devtools / firecrawl / playwright / scrapling); it
+  elicited / ran a long op and the review hung. That elicitation is between codex and ITS sub-server,
+  one level below AI Bridge, so the v0.5.6 elicitation fix can't reach it. A code/plan review is pure
+  reasoning over the diff/plan we hand codex — those servers have no place there.
+  - When AI Bridge spawns its warm review child it now passes per-server
+    `-c mcp_servers.<name>.enabled=<bool>` overrides (mechanism probed: reliable; a blanket
+    `mcp_servers={}` does NOT work — codex merges the table). The user's `~/.codex/config.toml` is
+    untouched; codex keeps every server everywhere else — only AI Bridge's review child is constrained.
+  - **Default: none** — reviews run tool-free out of the box (kills the stall). Opt servers back in:
+    `aibridge review-mcp list | enable <name> | disable <name> | all | none` (persists to
+    `~/.ai-bridge/review-mcp.json`; reload the window to apply to a running review).
+  - **Fail-closed**, never fail-open: server names are enumerated with a real TOML parser UNIONed
+    with a lenient `[mcp_servers.<name>]` header scan (so a config the strict parser trips on but
+    codex still loads can't leave a server un-disabled); if the config is present but unenumerable, or
+    a discovered name can't be safely emitted as a `-c` key, AI Bridge REFUSES to start the review
+    peer rather than run a review with unfiltered MCP servers.
+  - `aibridge doctor` shows the effective review allowlist and warns (red) when a review-enabled
+    server looks browser/scrape (name + command heuristic) or when the codex config can't be parsed.
+  - One warm child = one policy → applies to `review_diff` / `review_stop` / `plan_gate` / `consult` /
+    `implement` alike. LIMITATION (documented): enumerates `~/.codex/config.toml` only; a server
+    defined solely in a project-local `.codex/config.toml` isn't covered. Reliability isolation, not a
+    security sandbox.
+
 ## [0.5.9] - 2026-05-24
 
 ### Added (review friction)

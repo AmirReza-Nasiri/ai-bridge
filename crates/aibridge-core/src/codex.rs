@@ -122,9 +122,23 @@ impl CodexPeer {
         let plan = DefaultPlatform::spawn_plan(&exe);
         let spawn_kind = plan.kind.as_str();
         let spawn_program = plan.program.clone();
+        // Constrain which of codex's own MCP servers this REVIEW child may use
+        // (`-c mcp_servers.<name>.enabled=<bool>`), default none — so the model can't
+        // derail a review by invoking a browser/scrape server that elicits or hangs.
+        // User-controlled via `aibridge review-mcp`. FAIL CLOSED: if the codex config is
+        // present but unenumerable we refuse to start (never inherit unfiltered servers).
+        let review_mcp_overrides = crate::review_mcp::spawn_overrides().ok_or_else(|| {
+            anyhow::anyhow!(
+                "can't read/parse ~/.codex/config.toml to enforce the review-mcp policy — \
+                 refusing to start the review peer with unfiltered MCP servers; fix the codex \
+                 config (see `aibridge review-mcp list`)"
+            )
+        })?;
         let mut child = plan
             .into_command()
             .arg("mcp-server")
+            // Overrides go AFTER the subcommand (proven placement).
+            .args(&review_mcp_overrides)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

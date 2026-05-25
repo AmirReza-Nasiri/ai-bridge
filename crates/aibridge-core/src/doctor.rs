@@ -177,6 +177,7 @@ pub fn run(project: &Path, full: bool, check_updates: bool) -> Report {
     checks.push(stop_hook(project));
     checks.push(task_start_hook(project));
     checks.push(codex_mcp_servers(project));
+    checks.push(review_mcp_policy());
     checks.push(plan_gate_status(project));
     checks.push(install_state(project));
     checks.push(spawned_context(project));
@@ -490,6 +491,65 @@ fn stop_hook(project: &Path) -> Check {
             Status::Warn,
             "Stop review hook",
             "not installed — run `aibridge init`",
+        )
+    }
+}
+
+/// Which of codex's MCP servers stay enabled during AI Bridge REVIEWS (user policy
+/// via `aibridge review-mcp`; default none → tool-free reviews). WARNS when a
+/// review-enabled server looks browser/scrape — those elicit/run long and can STALL a
+/// review (the bug this policy exists to prevent). Scans `~/.codex/config.toml` only —
+/// a project-local codex config's servers aren't covered (documented limitation).
+fn review_mcp_policy() -> Check {
+    let names = match crate::review_mcp::codex_server_names() {
+        Some(n) => n,
+        None => {
+            return check(
+                Status::Warn,
+                "review-mcp policy",
+                "~/.codex/config.toml is present but unreadable/unparseable — AI Bridge will \
+                 REFUSE to start a review peer (fail-closed) until it's fixed",
+            )
+        }
+    };
+    if names.is_empty() {
+        return check(
+            Status::Pass,
+            "review-mcp policy",
+            "no codex MCP servers → reviews run tool-free",
+        );
+    }
+    let allow = crate::review_mcp::allowlist();
+    let enabled: Vec<String> = names
+        .iter()
+        .filter(|n| allow.iter().any(|a| a == *n))
+        .cloned()
+        .collect();
+    let risky: Vec<String> = enabled
+        .iter()
+        .filter(|n| crate::review_mcp::server_looks_interactive(n.as_str()))
+        .cloned()
+        .collect();
+    let desc = if enabled.is_empty() {
+        "none (pure reasoning)".to_string()
+    } else {
+        enabled.join(", ")
+    };
+    if risky.is_empty() {
+        check(
+            Status::Pass,
+            "review-mcp policy",
+            format!("codex servers enabled in reviews: {desc} (home config only; change via `aibridge review-mcp`)"),
+        )
+    } else {
+        check(
+            Status::Warn,
+            "review-mcp policy",
+            format!(
+                "enabled in reviews: {desc} — ⚠ {} looks browser/scrape and can STALL a review; \
+                 disable with `aibridge review-mcp disable <name>`",
+                risky.join(", ")
+            ),
         )
     }
 }

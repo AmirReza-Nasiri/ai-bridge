@@ -78,6 +78,13 @@ enum Commands {
         #[command(subcommand)]
         action: HookAction,
     },
+    /// Control which of codex's own MCP servers stay enabled during AI Bridge
+    /// reviews (default: NONE — reviews run tool-free so a browser/scrape server
+    /// can't stall them). Reload the window to apply a change to a running review.
+    ReviewMcp {
+        #[command(subcommand)]
+        action: ReviewMcpAction,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -86,6 +93,26 @@ enum HookAction {
     Pretooluse,
     /// UserPromptSubmit: start a fresh plan-gate task epoch for the new prompt.
     UserPromptSubmit,
+}
+
+#[derive(Subcommand, Debug)]
+enum ReviewMcpAction {
+    /// List codex MCP servers and whether each is enabled during AI Bridge reviews.
+    List,
+    /// Enable a codex MCP server during AI Bridge reviews (name from `list`).
+    Enable {
+        /// The codex MCP server name.
+        name: String,
+    },
+    /// Disable a codex MCP server during AI Bridge reviews (name from `list`).
+    Disable {
+        /// The codex MCP server name.
+        name: String,
+    },
+    /// Enable ALL codex MCP servers during reviews (⚠ browser/scrape ones can stall).
+    All,
+    /// Disable ALL codex MCP servers during reviews (pure reasoning — the default).
+    None,
 }
 
 #[derive(Subcommand, Debug)]
@@ -124,7 +151,26 @@ fn main() -> Result<()> {
             HookAction::Pretooluse => hook_pretooluse(),
             HookAction::UserPromptSubmit => hook_user_prompt_submit(),
         },
+        Commands::ReviewMcp { action } => review_mcp_cmd(action),
     }
+}
+
+fn review_mcp_cmd(action: ReviewMcpAction) -> Result<()> {
+    use aibridge_core::review_mcp;
+    match action {
+        ReviewMcpAction::List => println!("{}", review_mcp::list_report()),
+        ReviewMcpAction::Enable { name } => match review_mcp::enable(&name) {
+            Ok(msg) => println!("{msg}"),
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        },
+        ReviewMcpAction::Disable { name } => println!("{}", review_mcp::disable(&name)),
+        ReviewMcpAction::All => println!("{}", review_mcp::set_all(true)),
+        ReviewMcpAction::None => println!("{}", review_mcp::set_all(false)),
+    }
+    Ok(())
 }
 
 fn status_cmd(watch: bool) -> Result<()> {

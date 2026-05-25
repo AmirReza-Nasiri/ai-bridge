@@ -16,6 +16,7 @@ pub mod plan_gate;
 pub mod plan_receipt;
 pub mod progress;
 pub mod review_frontier;
+pub mod review_mcp;
 pub mod topics;
 pub mod update;
 

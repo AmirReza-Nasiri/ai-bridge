@@ -12,3 +12,4 @@ aibridge-platform = { path = "../aibridge-platform" }
 anyhow = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.10" # verify downloaded release binaries before replacing the installed one
+toml = { workspace = true } # parse codex config.toml to enumerate its MCP servers (review-mcp policy)
