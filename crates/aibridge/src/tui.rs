@@ -26,23 +26,25 @@ use std::io::IsTerminal;
 use std::time::{Duration, Instant};
 
 use aibridge_core::doctor::{self, Check, Status};
-use aibridge_core::{progress, review_mcp};
+use aibridge_core::{progress, review_mcp, skills};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Health,
     Review,
     Mcp,
+    Skills,
     Update,
 }
 
 impl Tab {
-    const ALL: [Tab; 4] = [Tab::Health, Tab::Review, Tab::Mcp, Tab::Update];
+    const ALL: [Tab; 5] = [Tab::Health, Tab::Review, Tab::Mcp, Tab::Skills, Tab::Update];
     fn title(self) -> &'static str {
         match self {
             Tab::Health => "Health",
             Tab::Review => "Review",
             Tab::Mcp => "Codex MCP",
+            Tab::Skills => "Skills",
             Tab::Update => "Update",
         }
     }
@@ -99,6 +101,13 @@ struct App {
     update_line: String,
     update_rx: Option<std::sync::mpsc::Receiver<String>>,
     update_on_exit: bool,
+    /// Skills tab: the (lazily-computed) `skills::doctor()` report + its scroll. `None`
+    /// until first viewed so startup stays snappy (the digest reads many skill files).
+    skills_report: Option<String>,
+    skills_scroll: u16,
+    /// Pending 2-key confirm for a MUTATING Skills action (`Some('s')`/`Some('m')`):
+    /// the action only runs on the SECOND matching press; any other key cancels it.
+    skills_confirm: Option<char>,
     message: Option<String>,
     quit: bool,
 }
@@ -125,11 +134,53 @@ impl App {
             update_line: "Press 'c' to check for a newer release.".to_string(),
             update_rx: None,
             update_on_exit: false,
+            skills_report: None,
+            skills_scroll: 0,
+            skills_confirm: None,
             message: None,
             quit: false,
         };
         app.refresh_all();
         app
+    }
+
+    /// (Re)compute the Skills doctor report (folder digests → not on the fast tick).
+    fn refresh_skills(&mut self) {
+        self.skills_report = Some(skills::doctor());
+    }
+
+    /// 2-key confirm gate for a mutating Skills action: returns true (and clears) on the
+    /// SECOND matching press; otherwise arms `c` and returns false. Pure (unit-tested).
+    fn skills_confirm_press(&mut self, c: char) -> bool {
+        if self.skills_confirm == Some(c) {
+            self.skills_confirm = None;
+            true
+        } else {
+            self.skills_confirm = Some(c);
+            false
+        }
+    }
+
+    /// Apply sync / migrate (add-missing only; safe), refresh the report, surface the
+    /// result's key line (incl. any failure) in the footer.
+    fn apply_skills(&mut self, migrate: bool) {
+        let r = if migrate {
+            skills::migrate(true)
+        } else {
+            skills::sync(true)
+        };
+        self.refresh_skills();
+        let key = r
+            .lines()
+            .find(|l| l.contains("ADD") || l.contains("nothing") || l.contains("failed"))
+            .map(|l| l.trim().to_string())
+            .unwrap_or_else(|| "done".into());
+        let what = if migrate {
+            "migrate (codex-legacy->hub)"
+        } else {
+            "sync (hub->agents)"
+        };
+        self.message = Some(format!("{what}: {key}"));
     }
 
     /// Start a background update CHECK (read-only, networked) so the event loop never
@@ -226,6 +277,7 @@ impl App {
                 }
             },
             Tab::Health => self.health_scroll = self.health_scroll.saturating_add(1),
+            Tab::Skills => self.skills_scroll = self.skills_scroll.saturating_add(1),
             Tab::Review | Tab::Update => {}
         }
     }
@@ -236,6 +288,7 @@ impl App {
                 McpView::Tools => self.tool_sel = self.tool_sel.saturating_sub(1),
             },
             Tab::Health => self.health_scroll = self.health_scroll.saturating_sub(1),
+            Tab::Skills => self.skills_scroll = self.skills_scroll.saturating_sub(1),
             Tab::Review | Tab::Update => {}
         }
     }
@@ -454,7 +507,10 @@ fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
         }
         app.poll_update(); // fold in a finished background update-check
         app.poll_discover(); // fold in a finished background tool-discovery
-                             // Live-refresh the (cheap) review status ~1s; heavy refresh only on `r`.
+        if app.tab == Tab::Skills && app.skills_report.is_none() {
+            app.refresh_skills(); // lazy first compute (folder digests) on first view
+        }
+        // Live-refresh the (cheap) review status ~1s; heavy refresh only on `r`.
         if last_refresh.elapsed() >= Duration::from_secs(1) {
             app.refresh_review();
             last_refresh = Instant::now();
@@ -465,6 +521,12 @@ fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
 
 fn handle_key(app: &mut App, code: KeyCode) {
     let in_tools = app.tab == Tab::Mcp && app.mcp_view == McpView::Tools;
+    // Any key that ISN'T the matching 2nd press of a Skills mutate-confirm cancels it.
+    let is_skills_mutate =
+        app.tab == Tab::Skills && matches!(code, KeyCode::Char('s') | KeyCode::Char('m'));
+    if !is_skills_mutate {
+        app.skills_confirm = None;
+    }
     match code {
         KeyCode::Char('q') => app.quit = true,
         // Esc backs out of the per-tool view first; only quits at the top level.
@@ -498,7 +560,31 @@ fn handle_key(app: &mut App, code: KeyCode) {
             app.update_on_exit = true;
             app.quit = true;
         }
-        KeyCode::Char('r') => app.refresh_all(),
+        // Skills tab: sync (s) / migrate (m) MUTATE the filesystem → 2-key confirm.
+        KeyCode::Char('s') if app.tab == Tab::Skills => {
+            if app.skills_confirm_press('s') {
+                app.apply_skills(false);
+            } else {
+                app.message = Some(
+                    "Press s again to SYNC (add missing hub->agents); any other key cancels".into(),
+                );
+            }
+        }
+        KeyCode::Char('m') if app.tab == Tab::Skills => {
+            if app.skills_confirm_press('m') {
+                app.apply_skills(true);
+            } else {
+                app.message = Some(
+                    "Press m again to MIGRATE (add missing codex-legacy->hub); any other key cancels".into(),
+                );
+            }
+        }
+        KeyCode::Char('r') => {
+            app.refresh_all();
+            if app.tab == Tab::Skills {
+                app.refresh_skills();
+            }
+        }
         _ => {}
     }
 }
@@ -522,6 +608,7 @@ fn ui(f: &mut Frame, app: &App) {
         Tab::Health => render_health(f, app, rows[1]),
         Tab::Review => render_review(f, app, rows[1]),
         Tab::Mcp => render_mcp(f, app, rows[1]),
+        Tab::Skills => render_skills(f, app, rows[1]),
         Tab::Update => render_update(f, app, rows[1]),
     }
 
@@ -533,6 +620,9 @@ fn ui(f: &mut Frame, app: &App) {
             "Tab/Left/Right: tabs | Up/Down: server | Space: on/off | Enter: per-tool | r: refresh | q: quit"
         }
         Tab::Health => "Tab/Left/Right: tabs | Up/Down: scroll | r: refresh | q: quit",
+        Tab::Skills => {
+            "Tab/Left/Right: tabs | Up/Down: scroll | s: sync | m: migrate | r: refresh | q: quit"
+        }
         Tab::Review => "Tab/Left/Right: tabs | r: refresh | q: quit (auto-refreshes ~1s)",
         Tab::Update => {
             "Tab/Left/Right: tabs | c: check | u: update now (exits + applies) | q: quit"
@@ -543,6 +633,22 @@ fn ui(f: &mut Frame, app: &App) {
         None => Line::from(Span::styled(help, Style::default().fg(Color::DarkGray))),
     };
     f.render_widget(Paragraph::new(footer).wrap(Wrap { trim: true }), rows[2]);
+}
+
+fn render_skills(f: &mut Frame, app: &App, area: Rect) {
+    let body = app
+        .skills_report
+        .as_deref()
+        .unwrap_or("Loading skills report (digesting skill folders)...");
+    let p = Paragraph::new(body)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Skills — Claude Code + Codex  (s: sync claude->agents; m: migrate legacy)"),
+        )
+        .wrap(Wrap { trim: false })
+        .scroll((app.skills_scroll, 0));
+    f.render_widget(p, area);
 }
 
 fn render_health(f: &mut Frame, app: &App, area: Rect) {
@@ -767,6 +873,9 @@ mod tests {
             update_line: String::new(),
             update_rx: None,
             update_on_exit: false,
+            skills_report: None,
+            skills_scroll: 0,
+            skills_confirm: None,
             mcp: Some(
                 names
                     .iter()
@@ -792,11 +901,27 @@ mod tests {
         a.next_tab();
         assert!(a.tab == Tab::Mcp);
         a.next_tab();
+        assert!(a.tab == Tab::Skills);
+        a.next_tab();
         assert!(a.tab == Tab::Update);
         a.next_tab();
         assert!(a.tab == Tab::Health); // wrap
         a.prev_tab();
         assert!(a.tab == Tab::Update); // wrap back
+    }
+
+    #[test]
+    fn skills_confirm_is_two_key() {
+        let mut a = test_app(&[]);
+        // First press arms; second matching press confirms.
+        assert!(!a.skills_confirm_press('s'));
+        assert_eq!(a.skills_confirm, Some('s'));
+        assert!(a.skills_confirm_press('s'));
+        assert_eq!(a.skills_confirm, None); // cleared after confirm
+                                            // A different action while one is armed re-arms (does NOT confirm).
+        assert!(!a.skills_confirm_press('s'));
+        assert!(!a.skills_confirm_press('m'));
+        assert_eq!(a.skills_confirm, Some('m'));
     }
 
     #[test]

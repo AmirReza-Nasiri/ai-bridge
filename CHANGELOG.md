@@ -6,6 +6,18 @@ versioning is semver.
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-05-25
+
+### Added
+
+- **Skills tab in the `aibridge status` dashboard (peer-reviewed, 2 rounds → APPROVE)** — manage Agent
+  Skills from the one dashboard instead of the separate `aibridge skills` CLI. Shows the read-only
+  `skills doctor` report (per-root validity + Claude↔cross-agent whole-folder drift), scrollable; `s` syncs
+  the hub → `~/.agents/skills`, `m` migrates legacy `~/.codex/skills` → hub. Both mutating actions require a
+  **2-key confirm** (first press arms with a footer prompt; any other key/tab switch cancels) and remain
+  add-missing-only/atomic/never-overwrite-or-delete. The report is computed lazily on first view so startup
+  stays snappy. (The `aibridge skills …` CLI still works for scripts.)
+
 ## [0.12.0] - 2026-05-25
 
 ### Added
