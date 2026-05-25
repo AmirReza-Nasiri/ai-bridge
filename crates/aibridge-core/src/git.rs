@@ -202,6 +202,13 @@ pub fn object_exists(cwd: &str, oid: &str) -> bool {
     git_ok(cwd, &["cat-file", "-e", &format!("{oid}^{{commit}}")])
 }
 
+/// The absolute git dir for `cwd` (the checkout's `.git`, or a linked worktree's git
+/// dir), or `None` outside a repo. Used to strengthen a repo's identity so a saved
+/// approval can't be reused after the path is reused by a different repo/clone.
+pub fn absolute_git_dir(cwd: &str) -> Option<String> {
+    git_checked(cwd, &["rev-parse", "--absolute-git-dir"])
+}
+
 /// True iff `base` is an ancestor of `HEAD`.
 fn is_ancestor(cwd: &str, base: &str) -> bool {
     git_ok(cwd, &["merge-base", "--is-ancestor", base, "HEAD"])

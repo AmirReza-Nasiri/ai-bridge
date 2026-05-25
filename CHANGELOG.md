@@ -6,6 +6,30 @@ versioning is semver.
 
 ## [Unreleased]
 
+## [0.5.9] - 2026-05-24
+
+### Added (review friction)
+
+- **Plan-gate reload-resume: re-approving an UNCHANGED plan after a VS Code reload is now INSTANT
+  (peer-reviewed, 3 rounds → APPROVE).** The plan gate re-arms on every new user turn by design (each
+  task gets a fresh review), so after a reload the next prompt forced a full, minutes-long Codex round
+  even for the same in-flight task. It now writes a tamper-resistant approval RECEIPT, and a re-submit of
+  the same plan fast-path-approves with no Codex round — without weakening the per-task model:
+  - The receipt lives OUTSIDE the repo (`~/.ai-bridge/plan-state/<repo-id>.json`); the in-repo plan-gate
+    state is agent-writable, so an in-repo receipt could be forged.
+  - A resume is granted ONLY when ALL bindings still hold, else a full review (fail-safe): same plan
+    (stable SHA-256, normalized), same repo identity (canonical toplevel + git dir), the EXACT same HEAD
+    (no lenient ancestor — a post-approval commit can change context via hooks/generated files), a matching
+    `PLAN_RECEIPT_VERSION`, and within a 24h TTL.
+  - `command_classes` are strictly validated against the known risk-class allowlist (missing/non-array/
+    non-string/unknown ⇒ full review), so a malformed/truncated/forged receipt can never authorize, and a
+    resume restores EXACTLY the classes a real reviewer authorized (`RISK-APPROVED`) — never a broader one.
+  - `start_epoch` is unchanged (still re-arms PENDING every prompt); the fast-path lives ONLY in the
+    `plan_gate` tool and keeps the epoch TOCTOU guard. This is reload-resume, NOT cross-task approval reuse.
+  - DECISION (Codex): no MAC/signature — the plan gate's threat model is a COOPERATIVE agent (mistakes +
+    corruption); a malicious agent has filesystem READ (so any on-disk secret is readable) and gets Bash on
+    any real approval, so a MAC would be theater against that adversary. Documented as the threat boundary.
+
 ## [0.5.8] - 2026-05-24
 
 ### Changed (review quality)

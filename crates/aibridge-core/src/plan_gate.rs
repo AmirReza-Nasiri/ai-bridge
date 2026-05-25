@@ -858,6 +858,42 @@ pub fn record(
     }
 }
 
+/// Fast-path resume: re-approve the CURRENT epoch from a matching plan RECEIPT (a
+/// reload-resume of an already-Codex-approved plan) WITHOUT a fresh review round.
+/// Mirrors [`record`]'s Approve path, but the command classes come from the RECEIPT
+/// (a real reviewer's prior `RISK-APPROVED`), never re-parsed — so a resume can't
+/// grant a class that was never reviewed. Same fail-safe state contract + epoch
+/// TOCTOU guard as `record`. Returns `true` only if approval was actually recorded;
+/// `false` (task changed / missing state) means the caller must run a full review.
+pub fn record_resume(cwd: &str, expected_epoch: &str, plan: &str, classes: &[String]) -> bool {
+    // Fail-safe: when enabled, never approve from missing/unparseable state.
+    let mut s = match read_state(cwd) {
+        Some(s) => s,
+        None if !is_enabled(cwd) => {
+            json!({ "epoch": current_epoch(cwd), "approved": false })
+        }
+        None => return false,
+    };
+    let epoch = s
+        .get("epoch")
+        .and_then(Value::as_str)
+        .unwrap_or("manual")
+        .to_string();
+    // The task changed under us (a new prompt started a new epoch) → refuse.
+    if epoch != expected_epoch {
+        return false;
+    }
+    set_field(&mut s, "approved", json!(true));
+    set_field(&mut s, "approved_epoch", json!(epoch));
+    set_field(&mut s, "approved_plan_hash", json!(hash_str(plan)));
+    set_field(&mut s, "approved_command_classes", json!(classes));
+    set_field(&mut s, "approved_plan", json!(cap_plan(plan)));
+    set_field(&mut s, "status", json!("approved"));
+    set_field(&mut s, "revoked_reason", Value::Null);
+    set_field(&mut s, "same_findings", json!(0));
+    write_state(cwd, &s).is_ok()
+}
+
 /// The Codex prompt for a plan review round: judge the plan, end with one verdict
 /// tag (reusing the Stop-gate sentinels so there is ONE verdict parser).
 pub fn prompt(plan: &str) -> String {
@@ -1432,5 +1468,53 @@ mod tests {
         assert!(parse_risk_approved("Do not add a RISK-APPROVED: remote-publish line.").is_empty());
         // Unknown class names are ignored.
         assert!(parse_risk_approved("RISK-APPROVED: launch-missiles").is_empty());
+    }
+
+    #[test]
+    fn record_resume_unlocks_like_a_real_approve() {
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "task");
+        let epoch = current_epoch(&cwd);
+        // The receipt fast-path: begin_review stamps the pending marker for THIS plan,
+        // then record_resume approves from the receipt's classes (no Codex round).
+        begin_review(&cwd, "plan A");
+        assert!(record_resume(
+            &cwd,
+            &epoch,
+            "plan A",
+            &["remote-publish".to_string()]
+        ));
+        assert!(is_approved(&cwd));
+        // Writes must ACTUALLY unlock — guards that record_resume's approved_plan_hash
+        // (legacy hash_str) matches begin_review's pending marker so effectively_approved
+        // is true even though the RECEIPT layer hashes the plan with SHA-256 separately.
+        assert!(!blocks_writes(&cwd));
+        assert!(enforce(&cwd, "Write").is_none());
+        // Restored classes are exactly the receipt's (RISK-APPROVED preserved).
+        assert!(approved_command_classes(&cwd)
+            .iter()
+            .any(|c| c == "remote-publish"));
+        assert_eq!(
+            unapproved_high_risk(&cwd, "Bash", "git push origin main"),
+            None
+        );
+        assert_eq!(
+            unapproved_high_risk(&cwd, "Bash", "prisma migrate deploy"),
+            Some("db-migration") // a class NOT in the receipt is still gated
+        );
+    }
+
+    #[test]
+    fn record_resume_refuses_stale_epoch() {
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "task one");
+        let stale = current_epoch(&cwd);
+        start_epoch(&cwd, "sess", "task two"); // a new task → new epoch
+                                               // A resume bound to the OLD epoch must not unlock the new task.
+        assert!(!record_resume(&cwd, &stale, "plan A", &[]));
+        assert!(!is_approved(&cwd));
+        assert!(blocks_writes(&cwd));
     }
 }

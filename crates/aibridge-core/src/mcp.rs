@@ -555,6 +555,22 @@ impl Server {
         // up front so writes re-block while the new plan is under review (the
         // minutes-long Codex call must not run with stale approval still open).
         crate::plan_gate::begin_review(&cwd, plan);
+        // RELOAD-RESUME fast-path: if a saved receipt shows this EXACT plan was
+        // Codex-approved for this repo at the CURRENT HEAD within TTL, re-approve
+        // instantly — no minutes-long re-review. Bound to plan+repo+HEAD+policy, so
+        // any change falls through to a full review (fail-safe). The gate still fired
+        // for this task (start_epoch re-armed it on this prompt); we only skip the
+        // redundant Codex round, restoring EXACTLY the previously-reviewed classes.
+        if let Some(classes) = crate::plan_receipt::matching_classes(&cwd, plan) {
+            if crate::plan_gate::record_resume(&cwd, &epoch, plan, &classes) {
+                return "<AI-BRIDGE-APPROVE/> Plan APPROVED from a saved receipt — an identical \
+                     plan was Codex-approved for this repo at this HEAD within the last 24h, so no \
+                     fresh review was run (reload-resume). Writes/Bash are unlocked for this task. \
+                     If you changed the plan, edit it and call plan_gate again for a full review."
+                    .to_string();
+            }
+            // record_resume refused (task changed / unwritable state) → full review.
+        }
         // New task epoch → drop the prior plan dialogue so it can't anchor.
         if self.plan_epoch.as_deref() != Some(epoch.as_str()) {
             self.threads.remove(&TopicKey::PlanGate);
@@ -574,10 +590,22 @@ impl Server {
         let verdict = gate::parse_verdict(&review);
         let findings = gate::findings(&review);
         match crate::plan_gate::record(&cwd, &epoch, plan, &verdict, &findings) {
-            crate::plan_gate::Outcome::Approved => format!(
-                "<AI-BRIDGE-APPROVE/> Codex APPROVED the plan — writes/Bash are now unlocked for \
-                 this task. Proceed with execution.\n\n{findings}"
-            ),
+            crate::plan_gate::Outcome::Approved => {
+                // Save a receipt from the SAME classes the reviewer just authorized —
+                // parsed directly from THIS review's findings (the exact source record()
+                // used), NOT read back from mutable state — so the receipt can't drift
+                // from what was approved. Reached only on a real APPROVE.
+                let approved_classes: Vec<String> =
+                    crate::plan_gate::parse_risk_approved(&findings)
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect();
+                crate::plan_receipt::write(&cwd, plan, &approved_classes);
+                format!(
+                    "<AI-BRIDGE-APPROVE/> Codex APPROVED the plan — writes/Bash are now unlocked \
+                     for this task. Proceed with execution.\n\n{findings}"
+                )
+            }
             crate::plan_gate::Outcome::Revise(f) => format!(
                 "Codex REQUESTED CHANGES to the plan. Revise the plan to address these, then call \
                  `plan_gate` again (writes stay blocked until APPROVE):\n\n{f}"
