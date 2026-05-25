@@ -7,7 +7,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 rust-version = "1.82"
 authors = ["AmirReza", "Mohammad (Mo)"]
@@ -23,6 +23,7 @@ serde_json = "1"
 toml = "0.8"
 directories = "5"
 which = "7"
+ratatui = "0.29" # interactive terminal dashboard (`aibridge tui`); re-exports crossterm
 
 [profile.release]
 lto = "thin"

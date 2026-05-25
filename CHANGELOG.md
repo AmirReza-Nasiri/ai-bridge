@@ -6,6 +6,25 @@ versioning is semver.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-05-25
+
+### Added (UX)
+
+- **`aibridge tui` — one interactive terminal dashboard (peer-reviewed, 2 rounds → APPROVE).** Instead of
+  remembering `doctor` + `status` + `review-mcp` separately, a single screen with three tabs:
+  - **Health** — the `doctor` checks, colored by status (scrollable).
+  - **Review** — the live review status (structured from `read_status`: state / phase / elapsed / events /
+    tokens / last-event, plus the `status_report` verdict line), auto-refreshing ~1s.
+  - **Codex MCP** — the review-mcp policy as a checkbox list; **Space toggles** a server on/off for reviews
+    (writes `review-mcp.json`), with an inline note that it applies to the next review child spawn and a
+    `(!)` flag on browser/scrape servers.
+  - Keys: `Tab`/`←`/`→` switch tabs, `↑`/`↓` select/scroll, `Space`/`Enter` toggle, `r` refresh, `q`/`Esc` quit.
+  - Built on ratatui + crossterm. Refuses without an interactive terminal (needs stdin+stdout TTY) so
+    scripts/pipes never hang. Restores the terminal on exit AND via ratatui's panic hook. ASCII-only glyphs
+    for legacy Windows consoles. The TUI is a separate process from the MCP server — it only READS the
+    status files (no shared-state races); a write failure keeps the old toggle state and shows the error
+    inline. The heavy `doctor` checks run on startup + `r` only, never on the refresh tick.
+
 ## [0.6.0] - 2026-05-25
 
 ### Added (review reliability)

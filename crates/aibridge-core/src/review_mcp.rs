@@ -328,6 +328,37 @@ pub fn list_report() -> String {
     out
 }
 
+/// Set a server's review-enabled state, returning `Ok(())` on success (including a
+/// no-op when it's already in the desired state) or `Err(msg)` if the codex config
+/// can't be read, `name` isn't a known server (when enabling), or the write fails.
+/// Used by the TUI (which needs success/failure to keep state + show inline) and by
+/// the CLI helpers below.
+pub fn set_enabled(name: &str, on: bool) -> Result<(), String> {
+    let names = codex_server_names()
+        .ok_or_else(|| "can't read/parse ~/.codex/config.toml — fix it first".to_string())?;
+    if on && !names.iter().any(|n| n == name) {
+        return Err(format!(
+            "'{name}' is not a codex MCP server (known: {})",
+            if names.is_empty() {
+                "(none)".to_string()
+            } else {
+                names.join(", ")
+            }
+        ));
+    }
+    let mut allow = allowlist();
+    let present = allow.iter().any(|a| a == name);
+    if on == present {
+        return Ok(()); // already in the desired state
+    }
+    if on {
+        allow.push(name.to_string());
+    } else {
+        allow.retain(|a| a != name);
+    }
+    write_allowlist(&allow).map_err(|e| format!("write failed: {e}"))
+}
+
 /// `aibridge review-mcp enable <name>` — validates the name is a known codex server.
 pub fn enable(name: &str) -> Result<String, String> {
     let names = codex_server_names().ok_or_else(|| {

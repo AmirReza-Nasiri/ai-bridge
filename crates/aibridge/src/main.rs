@@ -9,6 +9,8 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+mod tui;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "aibridge",
@@ -85,6 +87,9 @@ enum Commands {
         #[command(subcommand)]
         action: ReviewMcpAction,
     },
+    /// Open the interactive dashboard — Health (doctor) + live Review status + Codex-MCP
+    /// toggles — in one terminal screen. Needs an interactive terminal.
+    Tui,
 }
 
 #[derive(Subcommand, Debug)]
@@ -152,6 +157,7 @@ fn main() -> Result<()> {
             HookAction::UserPromptSubmit => hook_user_prompt_submit(),
         },
         Commands::ReviewMcp { action } => review_mcp_cmd(action),
+        Commands::Tui => tui::run(),
     }
 }
 

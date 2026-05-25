@@ -18,3 +18,5 @@ aibridge-core = { path = "../aibridge-core" }
 aibridge-platform = { path = "../aibridge-platform" }
 clap = { workspace = true }
 anyhow = { workspace = true }
+ratatui = { workspace = true }
+serde_json = { workspace = true } # read the live review-status Value in the `tui` dashboard
