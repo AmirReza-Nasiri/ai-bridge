@@ -382,10 +382,9 @@ pub fn last_declined_elicitation(cwd: &str) -> Option<(u64, String)> {
     let content =
         std::fs::read_to_string(Path::new(cwd).join(".ai-bridge").join("elicitations.jsonl"))
             .ok()?;
-    let last = content
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .next_back()?;
+    // `.rfind(..)` (not `.filter(..).next_back()`) — newer stable clippy denies the
+    // latter (`clippy::filter_next`); both return the LAST non-empty line.
+    let last = content.lines().rfind(|l| !l.trim().is_empty())?;
     let v: Value = serde_json::from_str(last).ok()?;
     let ms = v.get("declined_at_ms").and_then(Value::as_u64).unwrap_or(0);
     let msg = v.get("message").and_then(Value::as_str).unwrap_or("");
