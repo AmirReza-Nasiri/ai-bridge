@@ -23,6 +23,13 @@ pub const STATUS_APPROVED: &str = "approved";
 pub const STATUS_BLOCKED: &str = "blocked";
 pub const STATUS_NEEDS_USER: &str = "needs_user";
 
+/// Version of the review SEMANTICS (Stop prompt + bundle format) that an approved-diff
+/// receipt was minted under. A persisted "this diff is approved" fast-path is honored
+/// ONLY when the receipt's version matches — so changing the review prompt/bundle shape
+/// (which can change what "approved" means) automatically invalidates old receipts and
+/// forces a fresh review. Bump this whenever that semantics changes.
+pub const REVIEW_POLICY_VERSION: u32 = 1;
+
 fn now_ms() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -221,6 +228,54 @@ pub fn set_status(cwd: &str, session: &str, status: &str) {
     write_raw(&root, session, &v);
 }
 
+/// Pure receipt check: return the persisted approved-diff hash, but ONLY when the
+/// receipt still matches the current review semantics (`review_policy_version`) AND
+/// the current approved-plan scope (`expect_plan_hash`). Any mismatch — or a
+/// pre-persistence frontier with no receipt fields — yields `None` so the Stop gate
+/// re-reviews. Fail-safe by construction: a stale receipt can never auto-allow.
+fn receipt_allows(v: &Value, expect_plan_hash: u64) -> Option<u64> {
+    if v.get("review_policy_version").and_then(Value::as_u64) != Some(REVIEW_POLICY_VERSION as u64)
+    {
+        return None;
+    }
+    if v.get("allowed_plan_hash").and_then(Value::as_u64) != Some(expect_plan_hash) {
+        return None;
+    }
+    v.get("allowed_diff_hash").and_then(Value::as_u64)
+}
+
+/// The persisted "this exact diff was already approved" hash for the Stop gate's
+/// fast-path, so an MCP reconnect (VS Code reload) does NOT force a redundant,
+/// minutes-long re-review of an unchanged-and-approved diff. Honored only when the
+/// receipt's policy version + approved-plan scope still match (see [`receipt_allows`]);
+/// otherwise `None` → the gate reviews normally. The hash is the same `DefaultHasher`
+/// value the in-memory fast-path uses (`DiffBundle::hash`) so the two paths agree;
+/// a binary upgrade that changes that hash just misses → re-review (never a false allow).
+pub fn read_allowed_hash(cwd: &str, session: &str, expect_plan_hash: u64) -> Option<u64> {
+    let root = crate::git::repo_root(cwd)?;
+    receipt_allows(&read_raw(&root, session)?, expect_plan_hash)
+}
+
+/// Record the approved-diff receipt (diff hash + the approved-plan scope hash it was
+/// approved under + the current policy version) so [`read_allowed_hash`] can fast-path
+/// an identical, same-scope diff after a reconnect. RMW that preserves the frontier
+/// base/status; the atomic temp+rename in [`write_raw`] keeps a concurrent reader safe.
+/// A new task (`on_task_start`) rewrites a fresh object WITHOUT these fields, so the
+/// receipt is naturally cleared when the task changes.
+pub fn set_allowed_hash(cwd: &str, session: &str, diff_hash: u64, plan_hash: u64) {
+    let Some(root) = crate::git::repo_root(cwd) else {
+        return;
+    };
+    let mut v = read_raw(&root, session).unwrap_or_else(|| json!({}));
+    if let Some(o) = v.as_object_mut() {
+        o.insert("allowed_diff_hash".into(), json!(diff_hash));
+        o.insert("allowed_plan_hash".into(), json!(plan_hash));
+        o.insert("review_policy_version".into(), json!(REVIEW_POLICY_VERSION));
+        o.insert("updated_ms".into(), json!(now_ms() as u64));
+    }
+    write_raw(&root, session, &v);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,5 +319,35 @@ mod tests {
         let d = frontier_from(&json!({}));
         assert!(matches!(d.base, BaseKind::None));
         assert_eq!(d.status, STATUS_OPEN);
+    }
+
+    #[test]
+    fn receipt_allows_only_on_matching_policy_and_plan() {
+        let good = json!({
+            "allowed_diff_hash": 12345u64,
+            "allowed_plan_hash": 999u64,
+            "review_policy_version": REVIEW_POLICY_VERSION,
+        });
+        // Same policy + same approved-plan scope ⇒ the diff fast-path is honored.
+        assert_eq!(receipt_allows(&good, 999), Some(12345));
+        // A different approved plan (same diff) must NOT fast-path — re-review the scope.
+        assert_eq!(receipt_allows(&good, 1000), None);
+        // A stale policy version (review semantics changed) must NOT fast-path.
+        let stale = json!({
+            "allowed_diff_hash": 12345u64,
+            "allowed_plan_hash": 999u64,
+            "review_policy_version": REVIEW_POLICY_VERSION + 1,
+        });
+        assert_eq!(receipt_allows(&stale, 999), None);
+        // A pre-persistence frontier (status only, no receipt) ⇒ None (re-review).
+        assert_eq!(receipt_allows(&json!({"status": "approved"}), 999), None);
+        // Plan-scope present but the diff hash missing ⇒ nothing to fast-path.
+        assert_eq!(
+            receipt_allows(
+                &json!({"allowed_plan_hash": 999u64, "review_policy_version": REVIEW_POLICY_VERSION}),
+                999
+            ),
+            None
+        );
     }
 }

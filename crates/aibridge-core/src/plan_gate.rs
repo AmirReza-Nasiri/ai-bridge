@@ -868,8 +868,12 @@ pub fn prompt(plan: &str) -> String {
          unhandled edge cases, risky surfaces (auth/payments/migrations/data-loss/deploy), \
          scope creep, and missing tests.\n\n\
          Write:\n\
-         1. FINDINGS: if the plan is sound, write \"No blocking concerns.\"; otherwise list \
-         concise, actionable changes the agent should make to the plan.\n\
+         1. FINDINGS: if the plan is sound, write \"No blocking concerns.\"; otherwise list ALL \
+         blocking concerns with the plan in THIS single pass — be comprehensive so the agent can \
+         address them together; do NOT hold a known concern back for a later round. Focus on PLAN \
+         blockers (wrong approach, missing steps/invariants, unsafe sequencing, untested risky \
+         surfaces, scope mismatch) — this is a plan review, not a whole-repo audit; do NOT pad \
+         with non-blocking nitpicks.\n\
          2. If — and only if — the plan legitimately REQUIRES high-risk commands that you are \
          approving, add a line listing those classes (omit it entirely otherwise):\n\
          RISK-APPROVED: <comma-separated subset of: remote-publish, db-migration, destructive-fs, \

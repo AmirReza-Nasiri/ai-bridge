@@ -43,8 +43,10 @@ pub fn prompt(diff_bundle: &str) -> String {
 pub fn prompt_with_scope(diff_bundle: &str, approved_plan: Option<&str>) -> String {
     let scope = match approved_plan {
         Some(p) if !p.trim().is_empty() => format!(
-            "\nThis task had a PRE-APPROVED plan/scope. In addition, flag any change clearly \
-             OUTSIDE this scope, or any high-risk action (publish/deploy/migrations/destructive \
+            "\nThis task had a PRE-APPROVED plan/scope; treat it as the INTENDED scope — a \
+             reference, NOT a brittle whitelist (necessary implementation detail that serves the \
+             plan is fine). Flag material deviations: a change clearly OUTSIDE this scope, planned \
+             work that is missing, or any high-risk action (publish/deploy/migrations/destructive \
              shell/data loss) the plan did not mention:\n\
              === APPROVED PLAN ===\n{p}\n=== END APPROVED PLAN ===\n"
         ),
@@ -52,22 +54,32 @@ pub fn prompt_with_scope(diff_bundle: &str, approved_plan: Option<&str>) -> Stri
     };
     format!(
         "You are AI Bridge's Stop-gate peer reviewer.\n\
-         Review ONLY the current uncommitted changes below. Any earlier turns in this \
-         conversation reviewed DIFFERENT, now-superseded diffs — do NOT carry their findings or \
-         assumptions into this review; judge strictly the changes shown here.\n\n\
+         Review the FULL change set for THIS task shown below. It may include work COMMITTED \
+         since the task started AND the current uncommitted working tree — treat ALL sections as \
+         ONE combined task diff and review every section, including any labeled 'committed diff \
+         since task start' (do NOT skip a change just because it is already committed). If the \
+         same issue spans the committed and uncommitted sections, report it ONCE against the \
+         final state. Any earlier turns in this conversation reviewed DIFFERENT, now-superseded \
+         diffs — do NOT carry their findings or assumptions into this review; judge strictly the \
+         changes shown here.\n\n\
          Write:\n\
-         1. FINDINGS: if no blocking issues, write \"No blocking findings.\"; otherwise list \
-         concise, actionable findings with path/line where possible.\n\
+         1. FINDINGS: if no blocking issues, write \"No blocking findings.\"; otherwise list ALL \
+         material blocking findings you can verify from this diff in THIS single pass — be \
+         complete, do NOT defer a known blocker to a later round. Give path/line where possible. \
+         Do NOT pad with speculative issues or non-blocking nitpicks; list those separately (if \
+         at all) and do not let them drive the verdict.\n\
          2. A final line that is EXACTLY one of:\n\
          <AI-BRIDGE-APPROVE/>\n\
          <AI-BRIDGE-REQUEST-CHANGES/>\n\
          <AI-BRIDGE-BLOCKED/>\n\n\
-         Be strict. Use REQUEST-CHANGES for ANY correctness/safety bug — crashes, undefined \
-         names, broken tests, missed requirements, regressions, or unhandled edge cases (empty \
-         input, division by zero, null/None, out-of-bounds). Use APPROVE only when the diff is \
-         genuinely safe to ship as-is. Use BLOCKED only when required context is missing.\n\
+         Be strict. Use REQUEST-CHANGES for ANY introduced or task-relevant correctness/safety \
+         bug — crashes, undefined names, broken tests, missed requirements, regressions, or \
+         unhandled edge cases (empty input, division by zero, null/None, out-of-bounds). A \
+         PRE-EXISTING issue should block only if this task worsens it, relies on it, or the \
+         approved plan claimed to fix it. Use APPROVE only when the diff is genuinely safe to \
+         ship as-is. Use BLOCKED only when required context is missing.\n\
          {scope}\n\
-         === CURRENT CHANGES ===\n{diff_bundle}"
+         === TASK CHANGES (committed since task start + uncommitted) ===\n{diff_bundle}"
     )
 }
 

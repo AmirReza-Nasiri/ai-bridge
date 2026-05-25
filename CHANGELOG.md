@@ -6,6 +6,32 @@ versioning is semver.
 
 ## [Unreleased]
 
+## [0.5.8] - 2026-05-24
+
+### Changed (review quality)
+
+- **Acted on a real-world agent's field report of Stop/plan-gate friction (peer-reviewed, 2 rounds → APPROVE).**
+  Triaged six reported issues against current source: three (`review_diff` untracked-file blindness,
+  no progress stream, commit-before-Stop emptying the review) were already fixed in v0.5.1–v0.5.5 and only
+  needed a window reload. The remaining three are addressed here:
+  - **Stop reviewer was told "review ONLY uncommitted changes" while the bundle now contains committed work too.**
+    Since v0.5.5 the Stop bundle = committed-since-task-start delta + uncommitted tree, but the prompt still
+    said "uncommitted only" — so the reviewer could SKIP the committed section, quietly undercutting the
+    v0.5.5 commit-bypass fix. The prompt now tells the reviewer to treat all sections as ONE combined task
+    diff, review every section (including "committed diff since task start"), and report a spanning issue once.
+  - **Plan gate often needed 2–4 rounds because the reviewer surfaced a NEW pre-existing issue each round.**
+    Both the plan-gate and Stop prompts now ask for ALL blocking findings in a single pass — with anti-noise
+    guardrails (material + verifiable + in-scope only; non-blocking nitpicks listed separately and never
+    driving the verdict; a pre-existing issue blocks only if the task worsens/relies on it or the plan
+    claimed to fix it). The approved plan is framed as intended scope, not a brittle whitelist.
+  - **The Stop "already-approved this exact diff" fast-path lived only in memory, so an MCP reconnect
+    (VS Code reload) forced a redundant minutes-long re-review.** It now persists an approval RECEIPT in the
+    per-task frontier state (`~/.ai-bridge/review-state/...`), bound to the diff hash + the approved-plan
+    scope hash + a `REVIEW_POLICY_VERSION`. A reconnect re-hydrates and fast-path-allows an unchanged,
+    same-scope diff; any mismatch (changed plan, bumped policy, corrupt/absent state) fails safe to a fresh
+    review. A new task clears the receipt. The in-memory GateState key was normalized to the repo root so it
+    can no longer drift from the repo-root-keyed disk state when a Stop fires from a subdirectory.
+
 ## [0.5.7] - 2026-05-24
 
 ### Added

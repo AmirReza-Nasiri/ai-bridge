@@ -666,10 +666,31 @@ impl Server {
             cwd,
             &format!("reviewing diff bundle: {} bytes", bundle.text.len()),
         );
-        let key = format!("{cwd}::{session}");
+        // Key the in-memory GateState by the REPO ROOT (not the raw cwd) so it matches
+        // the repo-root keying the on-disk frontier/receipt use. Otherwise a Stop fired
+        // from a subdir would split one repo's review state across two keys, drifting the
+        // loop/block counters from the persisted allowed-diff receipt (Codex review).
+        let key = format!(
+            "{}::{session}",
+            crate::git::repo_root(cwd).as_deref().unwrap_or(cwd)
+        );
         let dh = bundle.hash;
+        // Read the approved plan ONCE: it scopes the review prompt AND binds the
+        // persisted approval receipt, so a CHANGED plan with an identical diff still
+        // re-reviews (the receipt is keyed by this scope hash).
+        let approved_plan = crate::plan_gate::approved_plan(cwd);
+        let plan_hash = gate::hash_str(approved_plan.as_deref().unwrap_or(""));
         let mut state = self.gates.remove(&key).unwrap_or_default();
-        let decision = self.gate_decide(&mut state, &bundle, cwd);
+        // Hydrate the "already approved this exact diff" fast-path from disk so an MCP
+        // reconnect (VS Code reload) doesn't force a redundant minutes-long re-review.
+        // Honored only when the receipt's policy version + plan scope still match (else
+        // None → review normally). Live in-memory state already wins, so we only fill a
+        // freshly-defaulted slot.
+        if state.last_allowed_diff_hash.is_none() {
+            state.last_allowed_diff_hash =
+                crate::review_frontier::read_allowed_hash(cwd, session, plan_hash);
+        }
+        let decision = self.gate_decide(&mut state, &bundle, cwd, approved_plan.as_deref());
         // Map the outcome to the frontier status so the NEXT task start won't advance
         // the base over unresolved debt. CRUCIAL: an allow is only a genuine APPROVE
         // when the gate recorded THIS diff as allowed; a fail-ask "delivery" allow
@@ -683,6 +704,11 @@ impl Server {
             crate::review_frontier::STATUS_NEEDS_USER
         };
         self.gates.insert(key, state);
+        // Persist the approval receipt so the fast-path survives a reconnect — bound to
+        // the diff hash, the plan scope it was approved under, and the policy version.
+        if status == crate::review_frontier::STATUS_APPROVED {
+            crate::review_frontier::set_allowed_hash(cwd, session, dh, plan_hash);
+        }
         crate::review_frontier::set_status(cwd, session, status);
         decision
     }
@@ -692,6 +718,7 @@ impl Server {
         st: &mut gate::GateState,
         bundle: &crate::git::DiffBundle,
         cwd: &str,
+        approved_plan: Option<&str>,
     ) -> String {
         let dh = bundle.hash;
 
@@ -720,11 +747,10 @@ impl Server {
             }
         }
 
-        // Feed the pre-approved plan (if any) so the reviewer can flag changes that
-        // fall outside the approved scope or high-risk actions the plan never named
+        // The pre-approved plan (read once by the caller) lets the reviewer flag changes
+        // that fall outside the approved scope or high-risk actions the plan never named
         // — the soft-telemetry half of plan-gate v2 (we don't hard-fence files).
-        let approved_plan = crate::plan_gate::approved_plan(cwd);
-        let prompt = gate::prompt_with_scope(&bundle.text, approved_plan.as_deref());
+        let prompt = gate::prompt_with_scope(&bundle.text, approved_plan);
         // Periodic anti-anchoring reset of the reserved review thread (shared bound
         // with manual review_diff; warm-cache speed is kept for the runs between).
         self.tick_gate_reset();
