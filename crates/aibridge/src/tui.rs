@@ -446,8 +446,11 @@ fn handle_key(app: &mut App, code: KeyCode) {
     match code {
         KeyCode::Char('q') => app.quit = true,
         // Esc backs out of the per-tool view first; only quits at the top level.
+        // (Bind first so the arm body isn't a lone `if` — avoids clippy
+        // collapsible_match wanting a side-effecting match guard.)
         KeyCode::Esc => {
-            if !app.mcp_back() {
+            let backed_out = app.mcp_back();
+            if !backed_out {
                 app.quit = true;
             }
         }
