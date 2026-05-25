@@ -6,6 +6,18 @@ versioning is semver.
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-05-25
+
+### Added
+
+- **"Select all / none" for a server's tools in the dashboard's per-tool view (peer-reviewed, 2 rounds → APPROVE).**
+  In the Codex MCP tab, after opening a server's tools: `a` enables ALL of them (mode "all" — incl. future
+  tools), `n` disables all of them (mode "some" with an empty allowlist — server stays enabled, every current
+  tool off). `n` requires a fresh discovery first. Round-1 caught a fail-open: routing "none" through the
+  shared apply path would, on a server that reports ZERO tools, collapse to mode "all" (vacuously "all
+  covered") and silently enable future tools — fixed by writing the empty-allowlist mode explicitly, with a
+  pure `covers_all` helper + a regression test documenting the empty-set edge.
+
 ## [0.10.0] - 2026-05-25
 
 ### Changed (authoritative cross-platform codex detection + single front door)

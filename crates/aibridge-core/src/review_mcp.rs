@@ -789,6 +789,14 @@ pub fn set_tool(server: &str, tool: &str, on: bool) -> Result<String, String> {
     ))
 }
 
+/// Does `enabled` cover EVERY discovered tool? (Pure.) WARNING: with an EMPTY
+/// `discovered` this is vacuously TRUE — so a caller writing an all-DISABLED ("none")
+/// state must NOT route through `apply_tool_selection` (which collapses all-covered to
+/// mode ALL); `set_all_tools(false)` writes mode SOME([]) explicitly instead.
+fn covers_all(discovered: &[String], enabled: &[String]) -> bool {
+    discovered.iter().all(|t| enabled.iter().any(|e| e == t))
+}
+
 /// Persist a per-tool selection: ensure the server is in `allow`; if EVERY discovered
 /// tool is enabled → mode ALL (drop the per-tool entry); else mode SOME with the list
 /// (only discovered names — never junk).
@@ -803,7 +811,7 @@ fn apply_tool_selection(
         allow.push(server.to_string());
     }
     set_allow(&mut cfg, allow);
-    let all_on = discovered.iter().all(|t| enabled.iter().any(|e| e == t));
+    let all_on = covers_all(discovered, enabled);
     if all_on {
         clear_server_tools(&mut cfg, server);
     } else {
@@ -904,6 +912,56 @@ pub fn toggle_tool_cached(server: &str, tool: &str, on: bool) -> Result<String, 
     ))
 }
 
+/// Tools-view "select ALL / NONE". EXPLICIT modes — does NOT route through
+/// `apply_tool_selection`'s all-on collapse (which would turn "none" into mode ALL when
+/// discovery returns an EMPTY tool set, silently enabling future tools — Codex find):
+/// `on` → mode ALL (every tool incl. future); `!on` → mode SOME([]) (server enabled,
+/// all CURRENT tools disabled), forced even if the tool set is empty. "none" needs a
+/// fresh discovery so enforcement won't silently fail-closed and so it's deliberate.
+pub fn set_all_tools(server: &str, on: bool) -> Result<String, String> {
+    let count = if on {
+        None
+    } else {
+        let spec =
+            server_spec(server).ok_or_else(|| format!("'{server}' is not a codex MCP server"))?;
+        Some(
+            crate::tool_discovery::fresh_tools(&spec)
+                .ok_or_else(|| {
+                    "tools aren't freshly discovered — press 'd' to (re)discover first".to_string()
+                })?
+                .len(),
+        )
+    };
+    let mut cfg = read_config();
+    let mut allow = allow_from(&cfg);
+    if !allow.iter().any(|a| a == server) {
+        allow.push(server.to_string());
+    }
+    set_allow(&mut cfg, allow);
+    if on {
+        clear_server_tools(&mut cfg, server); // mode ALL
+    } else {
+        // Force mode SOME([]) explicitly — never collapse to ALL on an empty tool set.
+        if cfg
+            .get("server_tools")
+            .and_then(|v| v.as_object())
+            .is_none()
+        {
+            if let Some(o) = cfg.as_object_mut() {
+                o.insert("server_tools".into(), json!({}));
+            }
+        }
+        if let Some(st) = cfg.get_mut("server_tools").and_then(|v| v.as_object_mut()) {
+            st.insert(server.to_string(), json!({ "enabled_tools": [] }));
+        }
+    }
+    write_config(&cfg).map_err(|e| format!("write failed: {e}"))?;
+    Ok(match count {
+        None => format!("'{server}': ALL tools enabled for reviews"),
+        Some(n) => format!("'{server}': all {n} tool(s) disabled for reviews"),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -929,6 +987,19 @@ enabled = false
             .find(|s| s.name == "chrome-devtools")
             .unwrap();
         assert!(chrome.cmdline.contains("chrome-devtools-mcp"));
+    }
+
+    #[test]
+    fn covers_all_vacuous_on_empty_discovered() {
+        let s = |x: &str| x.to_string();
+        // THE edge: empty discovered ⇒ vacuously "all covered" ⇒ apply_tool_selection
+        // would collapse to mode ALL. set_all_tools(false) must AVOID this path.
+        assert!(covers_all(&[], &[]));
+        // a real tool, none enabled ⇒ NOT all (so a real "none" is a genuine SOME([])).
+        assert!(!covers_all(&[s("a")], &[]));
+        // subset / superset behavior.
+        assert!(covers_all(&[s("a")], &[s("a"), s("b")]));
+        assert!(!covers_all(&[s("a"), s("b")], &[s("a")]));
     }
 
     #[test]

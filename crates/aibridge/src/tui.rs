@@ -380,6 +380,23 @@ impl App {
             Err(e) => self.message = Some(format!("Couldn't toggle '{tool}': {e}")),
         }
     }
+
+    /// 'a' / 'n' in the per-tool view: enable ALL of the open server's tools, or
+    /// disable all of them (cache-based; 'n' needs a fresh discovery).
+    fn set_all_tools_in_view(&mut self, on: bool) {
+        let Some(server) = self.mcp_server.clone() else {
+            return;
+        };
+        match review_mcp::set_all_tools(&server, on) {
+            Ok(m) => {
+                self.load_tool_states();
+                self.message = Some(format!(
+                    "Saved: {m}. Applies to the NEXT review child spawn (reload to start one)."
+                ));
+            }
+            Err(e) => self.message = Some(format!("Couldn't set all tools: {e}")),
+        }
+    }
 }
 
 /// Entry point for `aibridge tui`. Refuses (with a hint) without an interactive
@@ -471,6 +488,8 @@ fn handle_key(app: &mut App, code: KeyCode) {
             app.open_selected_server()
         }
         KeyCode::Enter if in_tools => app.toggle_selected_tool(),
+        KeyCode::Char('a') if in_tools => app.set_all_tools_in_view(true),
+        KeyCode::Char('n') if in_tools => app.set_all_tools_in_view(false),
         KeyCode::Char('d') if in_tools => app.start_discover(),
         KeyCode::Char('c') if app.tab == Tab::Update => app.start_update_check(),
         KeyCode::Char('u') if app.tab == Tab::Update => {
@@ -508,7 +527,7 @@ fn ui(f: &mut Frame, app: &App) {
 
     let help = match app.tab {
         Tab::Mcp if app.mcp_view == McpView::Tools => {
-            "Up/Down: tool | Space/Enter: toggle | d: (re)discover | Esc: back | q: quit"
+            "Up/Down: tool | Space/Enter: toggle | a: all | n: none | d: discover | Esc: back | q: quit"
         }
         Tab::Mcp => {
             "Tab/Left/Right: tabs | Up/Down: server | Space: on/off | Enter: per-tool | r: refresh | q: quit"
@@ -659,7 +678,7 @@ fn render_mcp(f: &mut Frame, app: &App, area: Rect) {
 fn render_mcp_tools(f: &mut Frame, app: &App, area: Rect) {
     let server = app.mcp_server.as_deref().unwrap_or("?");
     let block = Block::default().borders(Borders::ALL).title(format!(
-        "Tools of '{server}' DURING reviews  (Space/Enter: toggle; d: (re)discover; Esc: back)"
+        "Tools of '{server}' DURING reviews  (Space: toggle; a: all; n: none; d: discover; Esc: back)"
     ));
     if app.discovering.as_deref() == Some(server) {
         let p = Paragraph::new(format!(
