@@ -648,6 +648,82 @@ fn apply_tool_selection(
     write_config(&cfg)
 }
 
+/// A server's cached tools for the TUI: (tool, enabled-in-review) pairs from the CACHE
+/// (no launch) + the current mode, plus whether the cache is FRESH (fingerprint still
+/// matches the config). `None` ⇒ the server has never been discovered.
+pub struct CachedTools {
+    pub tools: Vec<(String, bool)>,
+    pub fresh: bool,
+}
+
+/// Tool states for `server` from the cache (no relaunch) — for the TUI's tool view.
+pub fn cached_tool_states(server: &str) -> Option<CachedTools> {
+    let spec = server_spec(server)?;
+    let entry = crate::tool_discovery::cached(server)?;
+    let fresh = entry.fingerprint == spec.fingerprint();
+    let mode = server_mode(server);
+    let tools = entry
+        .tools
+        .into_iter()
+        .map(|t| {
+            let on = match &mode {
+                Mode::All => true,
+                Mode::Off => false,
+                Mode::Some(list) => list.iter().any(|x| x == &t),
+            };
+            (t, on)
+        })
+        .collect();
+    Some(CachedTools { tools, fresh })
+}
+
+/// DISCOVER (launch) a server's tools + cache them — for the TUI's explicit 'd' key.
+/// Slow/networked; the TUI runs it on a background thread.
+pub fn discover_server(server: &str) -> Result<Vec<String>, String> {
+    let spec =
+        server_spec(server).ok_or_else(|| format!("'{server}' is not a codex MCP server"))?;
+    crate::tool_discovery::discover_and_cache(&spec).map_err(|e| format!("discovery failed: {e}"))
+}
+
+/// Toggle ONE tool using the FRESH cache (NO relaunch — for interactive toggling).
+/// `Err` if the cache isn't fresh (the caller should discover first). Turning a tool
+/// OFF that's already off is a no-op (won't accidentally enable an OFF server).
+pub fn toggle_tool_cached(server: &str, tool: &str, on: bool) -> Result<String, String> {
+    let spec =
+        server_spec(server).ok_or_else(|| format!("'{server}' is not a codex MCP server"))?;
+    let discovered = crate::tool_discovery::fresh_tools(&spec).ok_or_else(|| {
+        "tools aren't freshly discovered — press 'd' to (re)discover first".to_string()
+    })?;
+    if !discovered.iter().any(|t| t == tool) {
+        return Err(format!("'{tool}' is not a discovered tool of '{server}'"));
+    }
+    let current: Vec<String> = match server_mode(server) {
+        Mode::Some(list) => list
+            .into_iter()
+            .filter(|t| discovered.contains(t))
+            .collect(),
+        Mode::All => discovered.clone(),
+        Mode::Off => Vec::new(), // server off ⇒ no tools currently on
+    };
+    if !on && !current.iter().any(|t| t == tool) {
+        return Ok(format!("'{tool}' is already off")); // no-op; don't enable an off server
+    }
+    let mut enabled = current;
+    if on {
+        if !enabled.iter().any(|t| t == tool) {
+            enabled.push(tool.to_string());
+        }
+    } else {
+        enabled.retain(|t| t != tool);
+    }
+    apply_tool_selection(server, &discovered, &enabled)
+        .map_err(|e| format!("write failed: {e}"))?;
+    Ok(format!(
+        "'{server}' tool '{tool}' = {}",
+        if on { "on" } else { "off" }
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

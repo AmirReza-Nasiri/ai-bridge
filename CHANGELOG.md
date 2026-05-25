@@ -6,6 +6,25 @@ versioning is semver.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-05-25
+
+### Changed (one dashboard for everything)
+
+- **`aibridge status` now opens the interactive dashboard; everything is managed from it (peer-reviewed → APPROVE).**
+  The user asked for ONE entry point instead of remembering separate commands.
+  - `aibridge status` (interactive TTY) → the dashboard. `aibridge status --watch` (live plain text),
+    `--plain` (one-shot text), or no TTY (pipe/script) still print text, so existing references and logging
+    keep working. `aibridge tui` stays as a hidden alias.
+  - **New Update tab:** shows the installed version; `c` runs a background update-CHECK (read-only); `u`
+    exits the dashboard and THEN self-updates on the normal terminal (so replacing the running binary can't
+    corrupt the screen) — restart afterwards. (Self-update is skipped if the loop ended on an error.)
+  - **Per-TOOL view inside the Codex MCP tab:** Enter on a server opens its tools; `d` discovers them on a
+    background thread (launches the server briefly for tools/list only — never blocks the UI); Space/Enter
+    toggles a tool; Esc backs out. Toggling is cache-based (no relaunch per keystroke) and writes
+    review-mcp.json; a stale cache shows a fail-closed banner ("press d to re-discover"). Late results are
+    server-scoped so navigating away can't clobber another server's view. So `doctor` + live review +
+    per-server AND per-tool review-mcp + self-update are all under the single dashboard.
+
 ## [0.8.0] - 2026-05-25
 
 ### Added (per-tool review-mcp control)

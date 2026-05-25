@@ -54,11 +54,16 @@ enum Commands {
         #[arg(long = "check-updates")]
         check_updates: bool,
     },
-    /// Show the live status of an in-progress Codex review (--watch to follow it).
+    /// Open the interactive dashboard — Health + live Review + Codex-MCP (per-server &
+    /// per-tool) + Update — in one terminal screen. `--watch` follows the review as plain
+    /// text instead; `--plain` prints one text line. Falls back to text without a TTY.
     Status {
-        /// Follow the review live, refreshing each second until it finishes.
+        /// Follow the review live as plain text, refreshing each second until it finishes.
         #[arg(long)]
         watch: bool,
+        /// Print a one-shot plain-text status line (no dashboard).
+        #[arg(long)]
+        plain: bool,
     },
     /// Check for and install a newer AI Bridge release.
     Update {
@@ -87,8 +92,8 @@ enum Commands {
         #[command(subcommand)]
         action: ReviewMcpAction,
     },
-    /// Open the interactive dashboard — Health (doctor) + live Review status + Codex-MCP
-    /// toggles — in one terminal screen. Needs an interactive terminal.
+    /// (Alias of `status`.) Open the interactive dashboard.
+    #[command(hide = true)]
     Tui,
 }
 
@@ -159,7 +164,7 @@ fn main() -> Result<()> {
         },
         Commands::Selftest { full } => doctor_cmd(full, false),
         Commands::Doctor { check_updates } => doctor_cmd(false, check_updates),
-        Commands::Status { watch } => status_cmd(watch),
+        Commands::Status { watch, plain } => status_cmd(watch, plain),
         Commands::Update {
             check,
             yes,
@@ -221,7 +226,20 @@ fn review_mcp_cmd(action: ReviewMcpAction) -> Result<()> {
     Ok(())
 }
 
-fn status_cmd(watch: bool) -> Result<()> {
+fn status_cmd(watch: bool, plain: bool) -> Result<()> {
+    use std::io::IsTerminal;
+    // Default (interactive terminal, no flags) → the dashboard. `--watch`/`--plain`, or
+    // no TTY (a pipe/script), → plain text so nothing hangs and logging still works.
+    if !watch
+        && !plain
+        && std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal()
+        && !std::env::var("TERM")
+            .map(|t| t.eq_ignore_ascii_case("dumb"))
+            .unwrap_or(false)
+    {
+        return tui::run();
+    }
     let cwd = std::env::current_dir()?.to_string_lossy().to_string();
     loop {
         match aibridge_core::progress::status_report(&cwd) {
