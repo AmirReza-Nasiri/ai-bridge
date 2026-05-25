@@ -6,6 +6,31 @@ versioning is semver.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-05-25
+
+### Added (per-tool review-mcp control)
+
+- **`review-mcp` now controls individual TOOLS, not just whole servers (peer-reviewed, 2 rounds → APPROVE).**
+  You can show a codex MCP server's tools and keep only some of them enabled during reviews.
+  - `aibridge review-mcp tools <server>` — DISCOVER a server's tools by briefly launching it (MCP
+    handshake + `tools/list` only — never a tool call, so it can't elicit/hang) and list each with its
+    state. Discovery runs ONLY on this explicit action, never automatically.
+  - `aibridge review-mcp tool <server> <tool> on|off` — keep only some of a server's tools.
+  - **Allowlist model, fail-closed (Codex-required):** a server is `off` (default), `all` tools, or
+    `some` tools. For `some`, AI Bridge computes the codex `disabledTools` denylist as
+    `discovered − enabled` from a FRESH discovery only — the cache is fingerprinted on the server's
+    command/args/env, and a stale/missing cache disables the whole server rather than risk silently
+    re-enabling a newly-added tool. Only discovered tool names are ever passed.
+  - New `tool_discovery` module: cross-platform spawn (`cmd /D /S /C` for Windows `.cmd` shims, direct
+    otherwise), an MCP handshake that answers inbound server requests (ping/roots/elicitation→decline)
+    and skips notifications, a hard timeout + process-tree kill, and a fingerprinted cache at
+    `~/.ai-bridge/mcp-tools-cache.json`.
+  - The shipped per-server commands (`enable`/`disable`/`all`/`none`) and the `tui` keep working
+    unchanged (server-level); per-tool selection is additive (`server_tools` in review-mcp.json).
+  - LIMITATION: codex's per-model tool filtering isn't externally observable, so this relies on codex's
+    own documented `disabledTools` field (verified accepted) and is fail-closed on stale discovery; a
+    model-turn enforcement probe + a TUI per-tool view are tracked follow-ups.
+
 ## [0.7.0] - 2026-05-25
 
 ### Added (UX)

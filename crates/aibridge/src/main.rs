@@ -118,6 +118,20 @@ enum ReviewMcpAction {
     All,
     /// Disable ALL codex MCP servers during reviews (pure reasoning — the default).
     None,
+    /// Discover + list a codex MCP server's TOOLS (briefly launches it for tools/list).
+    Tools {
+        /// The codex MCP server name.
+        server: String,
+    },
+    /// Turn ONE tool of a codex MCP server on/off during reviews (mode "some").
+    Tool {
+        /// The codex MCP server name.
+        server: String,
+        /// The tool name (see `review-mcp tools <server>`).
+        tool: String,
+        /// `on` or `off`.
+        state: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -175,6 +189,34 @@ fn review_mcp_cmd(action: ReviewMcpAction) -> Result<()> {
         ReviewMcpAction::Disable { name } => println!("{}", review_mcp::disable(&name)),
         ReviewMcpAction::All => println!("{}", review_mcp::set_all(true)),
         ReviewMcpAction::None => println!("{}", review_mcp::set_all(false)),
+        ReviewMcpAction::Tools { server } => match review_mcp::tools_report(&server) {
+            Ok(m) => println!("{m}"),
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        },
+        ReviewMcpAction::Tool {
+            server,
+            tool,
+            state,
+        } => {
+            let on = match state.to_ascii_lowercase().as_str() {
+                "on" | "true" | "enable" => true,
+                "off" | "false" | "disable" => false,
+                _ => {
+                    eprintln!("state must be 'on' or 'off'");
+                    std::process::exit(2);
+                }
+            };
+            match review_mcp::set_tool(&server, &tool, on) {
+                Ok(m) => println!("{m}"),
+                Err(e) => {
+                    eprintln!("AI Bridge review-mcp: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
     }
     Ok(())
 }
