@@ -99,6 +99,30 @@ enum Commands {
     /// (Alias of `status`.) Open the interactive dashboard.
     #[command(hide = true)]
     Tui,
+    /// Manage Agent Skills shared by Claude Code AND Codex (incl. the Bridge's reviews):
+    /// inspect, and mirror the `~/.claude/skills` hub into the cross-agent `~/.agents/skills`.
+    Skills {
+        #[command(subcommand)]
+        action: SkillsAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SkillsAction {
+    /// Read-only: show the skill roots, flag invalid skills, and report Claude↔codex sync.
+    Doctor,
+    /// Mirror new `~/.claude/skills` into `~/.agents/skills` so codex/Bridge reviews see them.
+    Sync {
+        /// Actually copy (default is a dry run that only reports what would change).
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Fold legacy `~/.codex/skills` into the `~/.claude/skills` hub (then `sync`).
+    Migrate {
+        /// Actually copy (default is a dry run).
+        #[arg(long)]
+        apply: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -181,6 +205,16 @@ fn main() -> Result<()> {
         },
         Commands::ReviewMcp { action } => review_mcp_cmd(action),
         Commands::Tui => tui::run(),
+        Commands::Skills { action } => {
+            match action {
+                SkillsAction::Doctor => println!("{}", aibridge_core::skills::doctor()),
+                SkillsAction::Sync { apply } => println!("{}", aibridge_core::skills::sync(apply)),
+                SkillsAction::Migrate { apply } => {
+                    println!("{}", aibridge_core::skills::migrate(apply))
+                }
+            }
+            Ok(())
+        }
     }
 }
 

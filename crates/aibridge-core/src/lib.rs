@@ -17,6 +17,7 @@ pub mod plan_receipt;
 pub mod progress;
 pub mod review_frontier;
 pub mod review_mcp;
+pub mod skills;
 pub mod tool_discovery;
 pub mod topics;
 pub mod update;

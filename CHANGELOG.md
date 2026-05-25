@@ -6,6 +6,28 @@ versioning is semver.
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-05-25
+
+### Added
+
+- **`aibridge skills` — keep one Agent-Skills set usable by BOTH Claude Code and Codex (peer-reviewed, 4 rounds → APPROVE).**
+  Agent Skills (the `SKILL.md` open standard) load from different user dirs per tool: Claude Code reads
+  `~/.claude/skills`, Codex reads `~/.agents/skills` (its docs say that, NOT `~/.codex/skills`). AI Bridge's
+  warm review peer IS codex, so what's in `~/.agents/skills` is what the Bridge's reviews can use.
+  - `aibridge skills doctor` (read-only): lists each root, flags real problems (`!` no/empty SKILL.md) vs
+    soft advisories (`~` no description detected — still valid), and reports Claude↔cross-agent drift using a
+    WHOLE-FOLDER digest (changed scripts/assets/dotfiles, not just SKILL.md).
+  - `aibridge skills sync [--apply]`: mirror new skills from the `~/.claude/skills` hub into
+    `~/.agents/skills` so codex + the Bridge see them.
+  - `aibridge skills migrate [--apply]`: fold legacy `~/.codex/skills` into the hub.
+  - SAFETY (Codex-required): dry-run by default; ADD-missing only — never overwrite, never delete; a skill
+    present in both whose folder differs is reported as a CONFLICT to resolve manually; copies are ATOMIC
+    (staged temp dir + verify SKILL.md + rename) so a failed copy can't leave a half-written skill; the drift
+    digest and the copy share ONE inclusion policy (skip only `.git`/`.DS_Store`) so they can't disagree.
+  - Updating skills = manage them in `~/.claude/skills` (Claude marketplace/plugins or a git-tracked folder)
+    then `sync`; a built-in git-source `skills update` + a Context7-only "knowledge" review profile are
+    tracked follow-ups.
+
 ## [0.11.0] - 2026-05-25
 
 ### Added

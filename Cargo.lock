@@ -4,7 +4,7 @@ version = 3
 
 [[package]]
 name = "aibridge"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "aibridge-core",
  "aibridge-platform",
@@ -16,7 +16,7 @@ dependencies = [
 
 [[package]]
 name = "aibridge-core"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "aibridge-platform",
  "anyhow",
@@ -27,7 +27,7 @@ dependencies = [
 
 [[package]]
 name = "aibridge-platform"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "directories",
