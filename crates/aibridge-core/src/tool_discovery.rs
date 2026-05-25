@@ -29,6 +29,8 @@ pub struct ServerSpec {
     pub command: String,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
+    /// The server's working dir from config (relative commands/args need it), if any.
+    pub cwd: Option<String>,
 }
 
 impl ServerSpec {
@@ -52,6 +54,8 @@ impl ServerSpec {
             h.update(v.as_bytes());
             h.update([0u8]);
         }
+        h.update(self.cwd.as_deref().unwrap_or("").as_bytes());
+        h.update([0u8]);
         format!("{:x}", h.finalize())
     }
 }
@@ -246,6 +250,9 @@ pub fn discover(spec: &ServerSpec) -> Result<Vec<String>, String> {
     for (k, v) in &spec.env {
         cmd.env(k, v);
     }
+    if let Some(dir) = &spec.cwd {
+        cmd.current_dir(dir); // honor a server's configured working dir
+    }
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -393,6 +400,7 @@ mod tests {
             command: "npx".into(),
             args: vec!["-y".into(), "pkg".into()],
             env: vec![("K".into(), "V".into())],
+            cwd: None,
         };
         let b = a.clone();
         assert_eq!(a.fingerprint(), b.fingerprint());
@@ -402,6 +410,10 @@ mod tests {
         let mut d = a.clone();
         d.env = vec![("K".into(), "V2".into())];
         assert_ne!(a.fingerprint(), d.fingerprint());
+        // cwd is part of the launch identity → changing it changes the fingerprint.
+        let mut e = a.clone();
+        e.cwd = Some("/proj".into());
+        assert_ne!(a.fingerprint(), e.fingerprint());
     }
 
     #[test]
@@ -411,6 +423,7 @@ mod tests {
             command: "x".into(),
             args: vec![],
             env: vec![("A".into(), "1".into()), ("B".into(), "2".into())],
+            cwd: None,
         };
         let mut b = a.clone();
         b.env.reverse();

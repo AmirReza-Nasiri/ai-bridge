@@ -17,10 +17,17 @@
 //! (reviews run tool-free out of the box; opt servers back in explicitly).
 //!
 //! This is RELIABILITY isolation, NOT a security sandbox (Codex review): it stops
-//! accidental tool invocation during reviews. It enumerates servers from
-//! `~/.codex/config.toml`, so a server defined only in a project-local
-//! `.codex/config.toml` would not be covered (a documented gap; `doctor` says so).
+//! accidental tool invocation during reviews.
+//!
+//! DISPLAY + discovery use codex's AUTHORITATIVE inventory ([`codex_inventory`] =
+//! `codex mcp list --json`, codex's own resolver → correct cross-platform + sees
+//! project/profile/`$CODEX_HOME` config). ENFORCEMENT ([`spawn_overrides`]) still reads
+//! the USER `~/.codex/config.toml` directly (it runs in the no-console MCP host where
+//! spawning codex is unsafe), so review-override coverage is USER-CONFIG ONLY — a
+//! project/profile/system-scoped server is DETECTED + WARNED (doctor) but NOT disabled
+//! by the override. (Codex-reviewed B+; closing that enforcement gap is a follow-up.)
 
+use aibridge_platform::{DefaultPlatform, Platform};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
@@ -160,6 +167,151 @@ pub fn codex_server_names() -> Option<Vec<String>> {
     }
 }
 
+/// One codex MCP server from the AUTHORITATIVE `codex mcp list --json` inventory.
+pub struct CodexServer {
+    pub name: String,
+    /// codex's OWN enabled state (its config) — NOT our review-mcp policy.
+    pub enabled: bool,
+    /// Transport type ("stdio" / "streamable_http" / …). Only stdio is discoverable.
+    pub transport: String,
+    pub command: String,
+    pub args: Vec<String>,
+    /// Explicit env from config. NOTE: codex's `env_vars` (names inherited from the
+    /// parent environment) are NOT stored — discovery inherits the parent env anyway,
+    /// so they're applied automatically; only this explicit map is set on top.
+    pub env: Vec<(String, String)>,
+    /// The server's working dir, if config sets one (relative commands/args need it).
+    pub cwd: Option<String>,
+}
+
+/// Result of asking codex for its MCP inventory.
+pub enum Inventory {
+    /// codex answered: the servers it actually resolves (incl. project `.codex/config.toml`
+    /// + profiles + `$CODEX_HOME` — things a raw `~/.codex/config.toml` read misses).
+    Available(Vec<CodexServer>),
+    /// codex CLI not found / errored / unparseable — callers must NOT report "none
+    /// configured" (show "unknown"); they may fall back to the file read.
+    Unavailable(String),
+}
+
+fn parse_codex_server(v: &Value) -> Option<CodexServer> {
+    let name = v.get("name")?.as_str()?.to_string();
+    let enabled = v.get("enabled").and_then(Value::as_bool).unwrap_or(false);
+    let t = v.get("transport");
+    let get = |k: &str| t.and_then(|t| t.get(k));
+    let transport = get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let command = get("command")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let args = get("args")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let env = get("env")
+        .and_then(Value::as_object)
+        .map(|o| {
+            o.iter()
+                .filter_map(|(k, val)| val.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+    let cwd = get("cwd").and_then(Value::as_str).map(str::to_string);
+    Some(CodexServer {
+        name,
+        enabled,
+        transport,
+        command,
+        args,
+        env,
+        cwd,
+    })
+}
+
+/// Authoritative MCP inventory via `codex mcp list --json` — codex's OWN config resolver,
+/// so it's correct CROSS-PLATFORM and also sees project `.codex/config.toml` + profiles +
+/// env that a raw `~/.codex/config.toml` read misses. Run from `cwd` (project config
+/// resolves relative to it); inherits `$CODEX_HOME`. Launched via `spawn_plan` (node-direct
+/// for the Windows npm shim) so it works even from a no-console host. Used by doctor / TUI /
+/// discovery (NOT spawn_overrides, which keeps the fast file read).
+pub fn codex_inventory(cwd: &str) -> Inventory {
+    let exe = match DefaultPlatform::find_executable("codex") {
+        Ok(e) => e,
+        Err(_) => return Inventory::Unavailable("codex CLI not found on PATH".to_string()),
+    };
+    use std::io::Read;
+    use std::time::{Duration, Instant};
+    let mut child = match DefaultPlatform::spawn_plan(&exe)
+        .into_command()
+        .args(["mcp", "list", "--json"])
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => return Inventory::Unavailable(format!("running codex mcp list: {e}")),
+    };
+    // Read stdout concurrently (so a full pipe can't deadlock the wait) and bound the
+    // whole thing with a timeout — a stalled codex must degrade to Unavailable, never hang.
+    let stdout = child.stdout.take();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut s) = stdout {
+            let _ = s.read_to_end(&mut buf);
+        }
+        let _ = tx.send(buf);
+    });
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Inventory::Unavailable(
+                        "timed out querying codex mcp list --json".to_string(),
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait(); // reap
+                return Inventory::Unavailable(format!("waiting on codex: {e}"));
+            }
+        }
+    };
+    if !status.success() {
+        return Inventory::Unavailable(format!(
+            "codex mcp list exited {}",
+            status
+                .code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "by signal".to_string())
+        ));
+    }
+    let bytes = rx.recv_timeout(Duration::from_secs(2)).unwrap_or_default();
+    let v: Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(e) => return Inventory::Unavailable(format!("codex mcp list JSON: {e}")),
+    };
+    match v.as_array() {
+        Some(arr) => Inventory::Available(arr.iter().filter_map(parse_codex_server).collect()),
+        None => Inventory::Unavailable("codex mcp list JSON was not an array".to_string()),
+    }
+}
+
 /// Whether a server (by name) looks browser/scrape — uses its parsed command line when
 /// available, else the name alone (so a fallback-enumerated server is still judged).
 pub fn server_looks_interactive(name: &str) -> bool {
@@ -244,37 +396,65 @@ pub fn server_mode(name: &str) -> Mode {
     }
 }
 
-/// The launch spec (command/args/env) for `name` from `~/.codex/config.toml`, for
-/// tool discovery + the cache fingerprint. `None` if not a defined server / no config.
+/// The launch spec (command/args/env/cwd) for `name`, for tool discovery + the cache
+/// fingerprint. Prefers codex's AUTHORITATIVE inventory; only when codex can't be
+/// queried does it fall back to the direct `~/.codex/config.toml` read. `None` if the
+/// server isn't a discoverable stdio command.
 pub fn server_spec(name: &str) -> Option<crate::tool_discovery::ServerSpec> {
-    let s = codex_config_path().and_then(|p| std::fs::read_to_string(p).ok())?;
-    let parsed: toml::Value = toml::from_str(&s).ok()?;
-    let def = parsed.get("mcp_servers")?.as_table()?.get(name)?;
-    let command = def.get("command")?.as_str()?.to_string();
-    let args = def
-        .get("args")
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-    let env = def
-        .get("env")
-        .and_then(|v| v.as_table())
-        .map(|t| {
-            t.iter()
-                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                .collect()
-        })
-        .unwrap_or_default();
-    Some(crate::tool_discovery::ServerSpec {
-        name: name.to_string(),
-        command,
-        args,
-        env,
-    })
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| ".".to_string());
+    match codex_inventory(&cwd) {
+        // codex is AUTHORITATIVE: it says exactly what this server is. Only a stdio
+        // server with a command is discoverable; otherwise None — do NOT fall back to
+        // the file (which could launch/fingerprint a DIFFERENT server than codex resolves).
+        Inventory::Available(servers) => {
+            let s = servers.into_iter().find(|s| s.name == name)?;
+            if s.command.is_empty() {
+                return None; // non-stdio / HTTP / unsupported → not discoverable
+            }
+            Some(crate::tool_discovery::ServerSpec {
+                name: s.name,
+                command: s.command,
+                args: s.args,
+                env: s.env,
+                cwd: s.cwd,
+            })
+        }
+        // codex couldn't be queried → best-effort direct config read.
+        Inventory::Unavailable(_) => {
+            let s = codex_config_path().and_then(|p| std::fs::read_to_string(p).ok())?;
+            let parsed: toml::Value = toml::from_str(&s).ok()?;
+            let def = parsed.get("mcp_servers")?.as_table()?.get(name)?;
+            let command = def.get("command")?.as_str()?.to_string();
+            let args = def
+                .get("args")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let env = def
+                .get("env")
+                .and_then(|v| v.as_table())
+                .map(|t| {
+                    t.iter()
+                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let cwd = def.get("cwd").and_then(|v| v.as_str()).map(str::to_string);
+            Some(crate::tool_discovery::ServerSpec {
+                name: name.to_string(),
+                command,
+                args,
+                env,
+                cwd,
+            })
+        }
+    }
 }
 
 /// Serialize a list of tool names as a TOML inline array for a `-c` value. serde_json
@@ -749,6 +929,37 @@ enabled = false
             .find(|s| s.name == "chrome-devtools")
             .unwrap();
         assert!(chrome.cmdline.contains("chrome-devtools-mcp"));
+    }
+
+    #[test]
+    fn parse_codex_server_handles_stdio_http_and_env() {
+        // stdio with env=null + env_vars (inherited, NOT stored) + cwd.
+        let stdio = json!({
+            "name": "next-devtools", "enabled": true,
+            "transport": {"type":"stdio","command":"npx","args":["-y","next-devtools-mcp"],
+                          "env":null,"env_vars":["FOO_TOKEN"],"cwd":"/proj"}
+        });
+        let s = parse_codex_server(&stdio).unwrap();
+        assert_eq!(s.name, "next-devtools");
+        assert!(s.enabled);
+        assert_eq!(s.command, "npx");
+        assert_eq!(s.args, vec!["-y", "next-devtools-mcp"]);
+        assert!(s.env.is_empty()); // env=null → empty (env_vars are inherited, not stored)
+        assert_eq!(s.cwd.as_deref(), Some("/proj"));
+        // stdio with an explicit env map.
+        let withenv =
+            json!({"name":"x","transport":{"type":"stdio","command":"c","env":{"K":"V"}}});
+        assert_eq!(
+            parse_codex_server(&withenv).unwrap().env,
+            vec![("K".to_string(), "V".to_string())]
+        );
+        // HTTP / no command → command empty (server_spec treats it as non-discoverable).
+        let http = json!({"name":"h","enabled":true,"transport":{"type":"streamable_http","url":"https://x"}});
+        let h = parse_codex_server(&http).unwrap();
+        assert_eq!(h.transport, "streamable_http");
+        assert!(h.command.is_empty());
+        // missing name → None.
+        assert!(parse_codex_server(&json!({"transport":{"type":"stdio"}})).is_none());
     }
 
     #[test]

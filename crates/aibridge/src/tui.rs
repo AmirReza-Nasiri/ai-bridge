@@ -174,21 +174,26 @@ impl App {
     }
 
     fn refresh_mcp(&mut self) {
-        self.mcp = review_mcp::codex_server_names().map(|names| {
-            let allow = review_mcp::allowlist();
-            names
-                .into_iter()
-                .map(|name| {
-                    let enabled = allow.iter().any(|a| a == &name);
-                    let interactive = review_mcp::server_looks_interactive(&name);
-                    McpRow {
-                        name,
-                        enabled,
-                        interactive,
-                    }
-                })
-                .collect()
-        });
+        // Authoritative: ask codex (`codex mcp list --json`) so the list is correct
+        // cross-platform + sees project/profile servers; `None` ⇒ codex unavailable.
+        let allow = review_mcp::allowlist();
+        self.mcp = match review_mcp::codex_inventory(&self.cwd) {
+            review_mcp::Inventory::Available(servers) => Some(
+                servers
+                    .into_iter()
+                    .map(|s| {
+                        let enabled = allow.iter().any(|a| a == &s.name);
+                        let interactive = review_mcp::server_looks_interactive(&s.name);
+                        McpRow {
+                            name: s.name,
+                            enabled,
+                            interactive,
+                        }
+                    })
+                    .collect(),
+            ),
+            review_mcp::Inventory::Unavailable(_) => None,
+        };
         // Clamp the selection to the (possibly shorter) list.
         if let Some(rows) = &self.mcp {
             if self.mcp_sel >= rows.len() {
@@ -611,10 +616,11 @@ fn render_mcp(f: &mut Frame, app: &App, area: Rect) {
     match &app.mcp {
         None => {
             let p = Paragraph::new(
-                "WARNING: ~/.codex/config.toml is present but can't be read/parsed.\n\
-                 AI Bridge will REFUSE to run reviews (fail-closed) until it's fixed.",
+                "Couldn't query codex's MCP inventory (`codex mcp list --json` failed — codex not \
+                 on PATH, or it errored). Put codex on PATH and press 'r' to retry. (Reviews still \
+                 enforce the policy from the config file.)",
             )
-            .style(Style::default().fg(Color::Red))
+            .style(Style::default().fg(Color::Yellow))
             .wrap(Wrap { trim: true })
             .block(block);
             f.render_widget(p, area);

@@ -6,6 +6,28 @@ versioning is semver.
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-05-25
+
+### Changed (authoritative cross-platform codex detection + single front door)
+
+- **Detect codex's MCP servers by ASKING codex, not by re-reading its config file (peer-reviewed, 2 rounds → APPROVE).**
+  Prompted by a macOS user worried the detection was wrong. Verified (OpenAI docs + codex's own `--help` +
+  peer review) that `~/.codex/config.toml` IS the universal path (incl. macOS — not `~/Library/...`), so the
+  prior detection was correct; but the better approach is to use codex's own resolver:
+  - New `codex_inventory()` runs `codex mcp list --json` (via the same node-direct spawn the warm peer uses,
+    so it's safe on the Windows npm shim), with a 15s timeout (a stalled codex degrades to "unknown", never
+    hangs). It's correct cross-platform AND also sees project `.codex/config.toml` + profiles + `$CODEX_HOME`
+    + accurate env/cwd that a raw file read misses.
+  - `doctor`, the dashboard's Codex MCP list, and per-tool discovery now use it. A query failure shows
+    "unknown" (never a false "none configured"). Discovery's launch spec gains `cwd`; the fingerprint includes it.
+  - ENFORCEMENT (the review spawn override) still reads the user config file (it runs in the no-console MCP
+    host) — so doctor now WARNS when codex reports a project/profile/system server the override won't disable,
+    instead of implying coverage that doesn't exist.
+- **`aibridge status` is the single front door.** It already opens the dashboard (Health + Review + Codex MCP
+  per-server & per-tool + Update); the now-redundant management subcommands (`doctor`, `update`, `review-mcp`,
+  `tui`) are hidden from `--help` (still functional for hooks/scripts). Type `aibridge status` and manage
+  everything from the TUI.
+
 ## [0.9.0] - 2026-05-25
 
 ### Changed (one dashboard for everything)

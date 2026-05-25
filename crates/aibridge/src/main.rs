@@ -48,7 +48,9 @@ enum Commands {
         #[arg(long)]
         full: bool,
     },
-    /// Diagnose (and optionally repair) the installation.
+    /// Diagnose the installation. (Hidden — it's the `status` dashboard's Health tab;
+    /// still works for scripts/CI.)
+    #[command(hide = true)]
     Doctor {
         /// Also check GitHub for a newer release (network; off by default).
         #[arg(long = "check-updates")]
@@ -65,7 +67,9 @@ enum Commands {
         #[arg(long)]
         plain: bool,
     },
-    /// Check for and install a newer AI Bridge release.
+    /// Check for / install a newer release. (Hidden — it's the `status` dashboard's
+    /// Update tab; still works for scripts.)
+    #[command(hide = true)]
     Update {
         /// Only check + report; don't change anything.
         #[arg(long)]
@@ -85,9 +89,9 @@ enum Commands {
         #[command(subcommand)]
         action: HookAction,
     },
-    /// Control which of codex's own MCP servers stay enabled during AI Bridge
-    /// reviews (default: NONE — reviews run tool-free so a browser/scrape server
-    /// can't stall them). Reload the window to apply a change to a running review.
+    /// Control which codex MCP servers/tools run during reviews. (Hidden — it's the
+    /// `status` dashboard's Codex MCP tab; still works for scripts.)
+    #[command(hide = true)]
     ReviewMcp {
         #[command(subcommand)]
         action: ReviewMcpAction,

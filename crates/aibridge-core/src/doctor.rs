@@ -554,35 +554,53 @@ fn review_mcp_policy() -> Check {
     }
 }
 
-/// Parse top-level codex MCP server names from `config.toml` (`[mcp_servers.<name>]`
-/// headers; nested tables like `.env` collapse to the same server). Read-only — never
-/// launches a server (a probe could itself elicit/hang, the very bug we're tracking).
-fn parse_mcp_server_names(toml: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for line in toml.lines() {
-        if let Some(rest) = line.trim().strip_prefix("[mcp_servers.") {
-            let name: String = rest.chars().take_while(|&c| c != '.' && c != ']').collect();
-            if !name.is_empty() && !out.contains(&name) {
-                out.push(name);
-            }
-        }
-    }
-    out
-}
-
 /// Report codex's configured MCP servers + any RECENT declined elicitation, so the
 /// user can follow up. Informational by default (servers existing is normal); WARNS
 /// only when a tool recently needed interactive input during a review (was declined
 /// headlessly) — that's the actionable case. Reads config + the local log only.
 fn codex_mcp_servers(project: &Path) -> Check {
-    let servers = codex_config_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .map(|s| parse_mcp_server_names(&s))
-        .unwrap_or_default();
-    let listed = if servers.is_empty() {
+    // Authoritative: ask codex (`codex mcp list --json`) — its own resolver, correct
+    // cross-platform + project/profile aware. A failure is "unknown", never "none".
+    let servers = match crate::review_mcp::codex_inventory(&project.display().to_string()) {
+        crate::review_mcp::Inventory::Unavailable(why) => {
+            return check(
+                Status::Warn,
+                "codex MCP servers",
+                format!(
+                    "unknown — couldn't query codex's MCP inventory ({why}). Reviews still \
+                     enforce the policy from the config file; put codex on PATH for an \
+                     authoritative list."
+                ),
+            );
+        }
+        crate::review_mcp::Inventory::Available(servers) => servers,
+    };
+    let names: Vec<String> = servers.iter().map(|s| s.name.clone()).collect();
+    let listed = if names.is_empty() {
         "none configured".to_string()
     } else {
-        format!("{} configured ({})", servers.len(), servers.join(", "))
+        format!("{} configured ({})", names.len(), names.join(", "))
+    };
+
+    // Enforcement (`spawn_overrides`) reads the USER config file; the authoritative
+    // inventory may also include project/profile/system servers that the file read
+    // misses → those would NOT be disabled in reviews. Surface that gap honestly
+    // rather than implying coverage that doesn't exist.
+    let file_names = crate::review_mcp::codex_server_names().unwrap_or_default();
+    let extra: Vec<&str> = names
+        .iter()
+        .filter(|n| !file_names.iter().any(|f| f == *n))
+        .map(String::as_str)
+        .collect();
+    let mismatch = if extra.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " ⚠ {} server(s) come from project/profile config ({}) and are NOT covered by the \
+             review override (which reads user config only) — they could run during reviews.",
+            extra.len(),
+            extra.join(", ")
+        )
     };
 
     let now = std::time::SystemTime::now()
@@ -590,25 +608,25 @@ fn codex_mcp_servers(project: &Path) -> Check {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
     const DAY_MS: u64 = 24 * 60 * 60 * 1000;
-    match crate::progress::last_declined_elicitation(&project.display().to_string()) {
-        Some((ms, summary)) if now.saturating_sub(ms) <= DAY_MS => check(
-            Status::Warn,
-            "codex MCP servers",
-            format!(
-                "{listed}. A tool RECENTLY needed interactive input during a review and was \
-                 declined headlessly: {summary}. Configure that server for headless use (API key \
-                 / non-interactive flag / default target), or run the review interactively."
-            ),
+    let elicit = crate::progress::last_declined_elicitation(&project.display().to_string())
+        .filter(|(ms, _)| now.saturating_sub(*ms) <= DAY_MS);
+    let status = if elicit.is_some() || !extra.is_empty() {
+        Status::Warn
+    } else {
+        Status::Pass
+    };
+    let detail = match elicit {
+        Some((_, summary)) => format!(
+            "{listed}.{mismatch} A tool RECENTLY needed interactive input during a review and was \
+             declined headlessly: {summary}. Configure that server for headless use (API key / \
+             non-interactive flag / default target), or run the review interactively."
         ),
-        _ => check(
-            Status::Pass,
-            "codex MCP servers",
-            format!(
-                "{listed} — codex may use these in reviews; any that need interactive input are \
-                 declined headlessly (no hang). See `aibridge status` / .ai-bridge/elicitations.jsonl"
-            ),
+        None => format!(
+            "{listed}{mismatch} — codex may use these in reviews; any that need interactive input \
+             are declined headlessly (no hang). See `aibridge status` / .ai-bridge/elicitations.jsonl"
         ),
-    }
+    };
+    check(status, "codex MCP servers", detail)
 }
 
 /// The `UserPromptSubmit` task-start hook records the per-task review BASE the Stop
@@ -779,19 +797,7 @@ fn has_aibridge_stop_hook(v: &Value) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_mcp_server_names, parse_reasoning_effort};
-
-    #[test]
-    fn parses_codex_mcp_server_names_deduped() {
-        let toml = "[mcp_servers.chrome-devtools]\ncommand=\"x\"\n\
-                    [mcp_servers.firecrawl]\n[mcp_servers.firecrawl.env]\nKEY=\"v\"\n\
-                    [other_section]\n";
-        let names = parse_mcp_server_names(toml);
-        assert_eq!(
-            names,
-            vec!["chrome-devtools".to_string(), "firecrawl".to_string()]
-        );
-    }
+    use super::parse_reasoning_effort;
 
     #[test]
     fn parses_quoted_and_unquoted() {
