@@ -224,6 +224,44 @@ fn skill_digest(root: Root, name: &str) -> Option<String> {
     Some(dir_digest(&root.path()?.join(name)))
 }
 
+/// Hub→agents mirror state for the doctor "review feed" audit — what codex (and the
+/// Bridge's reviews) actually load from `~/.agents/skills`, AND whether that mirror has
+/// fallen BEHIND the `~/.claude/skills` hub (a stale mirror makes a plain count falsely
+/// green: codex would review against an outdated skill set). Pure counts/digests — no
+/// hardcoded "which skills matter" judgement.
+pub struct MirrorStatus {
+    /// VALID skills in `~/.agents/skills` (exactly what codex sees in reviews).
+    pub agents_valid: usize,
+    /// The `~/.claude/skills` hub has at least one valid skill.
+    pub claude_present: bool,
+    /// Valid hub skills NOT yet mirrored into `~/.agents/skills` (codex can't see them).
+    pub missing_from_agents: usize,
+    /// Same-named skills whose folder DIFFERS between hub and agents (agents is STALE).
+    pub drifted: usize,
+    /// Valid skills in `~/.agents/skills` that are NOT in the hub (codex-installed
+    /// extras) — still visible to codex reviews, so "in sync with the hub" is untrue.
+    pub only_in_agents: usize,
+}
+
+pub fn mirror_status() -> MirrorStatus {
+    let claude = valid_names(Root::Claude);
+    let agents = valid_names(Root::Agents);
+    let missing_from_agents = claude.iter().filter(|n| !agents.contains(n)).count();
+    let only_in_agents = agents.iter().filter(|n| !claude.contains(n)).count();
+    let drifted = claude
+        .iter()
+        .filter(|n| agents.contains(n))
+        .filter(|n| skill_digest(Root::Claude, n) != skill_digest(Root::Agents, n))
+        .count();
+    MirrorStatus {
+        agents_valid: agents.len(),
+        claude_present: !claude.is_empty(),
+        missing_from_agents,
+        drifted,
+        only_in_agents,
+    }
+}
+
 /// `aibridge skills doctor` — read-only: list each root, flag invalid skills, show which
 /// skills are mirrored vs missing between the Claude hub and the cross-agent dir, note
 /// the legacy codex dir, and recommend next steps. Never writes.

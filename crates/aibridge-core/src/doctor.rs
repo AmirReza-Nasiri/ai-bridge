@@ -178,6 +178,7 @@ pub fn run(project: &Path, full: bool, check_updates: bool) -> Report {
     checks.push(task_start_hook(project));
     checks.push(codex_mcp_servers(project));
     checks.push(review_mcp_policy());
+    checks.push(review_feed_skills());
     checks.push(plan_gate_status(project));
     checks.push(install_state(project));
     checks.push(spawned_context(project));
@@ -552,6 +553,65 @@ fn review_mcp_policy() -> Check {
             ),
         )
     }
+}
+
+/// The SKILLS half of the review "feed" audit (the MCP half is `review_mcp_policy`):
+/// how many skills the Bridge's codex reviews actually load from `~/.agents/skills`.
+/// Observability, not intelligence — codex itself auto-selects the relevant skill per
+/// diff; this just makes the feed visible + warns when it's empty/unsynced. No
+/// hardcoded "which skills are critical" judgement (that would fight the no-hardcode rule).
+fn review_feed_skills() -> Check {
+    let m = crate::skills::mirror_status();
+    if m.agents_valid == 0 {
+        return check(
+            Status::Warn,
+            "review feed (skills)",
+            "no skills in ~/.agents/skills — the Bridge's codex reviews have NO skill knowledge; \
+             run `aibridge skills sync` (mirrors the ~/.claude/skills hub)",
+        );
+    }
+    // Stale mirror: a plain count is falsely green when the hub is AHEAD of agents —
+    // codex would review against an outdated skill set. Warn with the drift (Codex find).
+    if m.missing_from_agents > 0 || m.drifted > 0 {
+        return check(
+            Status::Warn,
+            "review feed (skills)",
+            format!(
+                "{} skill(s) in ~/.agents/skills, but the ~/.claude/skills hub is AHEAD \
+                 ({} not mirrored, {} drifted) — codex reviews use the STALE set; \
+                 run `aibridge skills sync`",
+                m.agents_valid, m.missing_from_agents, m.drifted
+            ),
+        );
+    }
+    // Hub fully mirrored, but agents has codex-installed EXTRAS not in the hub — the
+    // feed still includes them, so don't claim plain "in sync" (Codex find).
+    if m.claude_present && m.only_in_agents > 0 {
+        return check(
+            Status::Warn,
+            "review feed (skills)",
+            format!(
+                "{} skill(s) in ~/.agents/skills — hub fully mirrored, but {} are AGENTS-ONLY \
+                 (not in ~/.claude/skills) and still used in codex reviews; fold them into the hub \
+                 (copy to ~/.claude/skills) for one source of truth, or leave them intentionally",
+                m.agents_valid, m.only_in_agents
+            ),
+        );
+    }
+    let sync = if m.claude_present {
+        "fully in sync with the hub"
+    } else {
+        "agents-only (no ~/.claude/skills hub)"
+    };
+    check(
+        Status::Pass,
+        "review feed (skills)",
+        format!(
+            "{} skill(s) in ~/.agents/skills ({sync}) — codex auto-selects the relevant one per \
+             diff; skill/policy changes apply on the next review-peer spawn (reload the window)",
+            m.agents_valid
+        ),
+    )
 }
 
 /// Report codex's configured MCP servers + any RECENT declined elicitation, so the

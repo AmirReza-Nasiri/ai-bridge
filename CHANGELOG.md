@@ -6,6 +6,26 @@ versioning is semver.
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-05-25
+
+### Added (review-feed audit) + architecture freeze
+
+- **`review feed (skills)` doctor check — observability for what the Bridge's reviews actually feed Codex
+  (peer-reviewed, 3 rounds → APPROVE).** After a Codex consult on whether AI Bridge needed more
+  "intelligence" (auto-selecting MCPs/skills per review), the verdict was FREEZE: codex already
+  auto-selects the relevant skill per diff, and a fixed simple MCP policy (context7 on, browser/scrape off)
+  beats per-review auto-selection. The one real gap was observability, not intelligence — so this adds a
+  non-hardcoded audit (no "which skills are critical" list):
+  - `skills::mirror_status()` reports the hub→agents mirror: valid skills in `~/.agents/skills` (what codex
+    loads), hub skills not yet mirrored, same-name skills whose folder digest drifted, and codex-installed
+    agents-only extras.
+  - The check PASSES only when `~/.agents/skills` exactly matches the `~/.claude/skills` hub; it WARNS on an
+    empty feed, a hub that's ahead (unsynced/stale → codex reviews an outdated set), or agents-only extras —
+    closing the false-green where a plain skill count looked fine while the review feed was stale.
+  - Shows in `aibridge doctor` + the dashboard Health tab (no new tab). Pairs with the existing
+    `review-mcp policy` check (the MCP half of the feed) — together they make the effective review feed visible.
+  - This finalizes AI Bridge as feature-complete: no per-review auto-selection, no new intelligence layer.
+
 ## [0.13.0] - 2026-05-25
 
 ### Added
