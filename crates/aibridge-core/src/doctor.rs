@@ -1137,22 +1137,36 @@ fn redact_sensitive_kv(line: &str) -> String {
             i = key_end;
             continue;
         }
-        // Find value end. JSON terminators (`}` / `]`) end the value too.
+        // Find value end. Terminators DEPEND on whether the value was quoted:
+        // - Quoted: ONLY the matching closing quote terminates. Whitespace, commas,
+        //   braces, etc. are part of the value (e.g. `password="correct horse battery"`
+        //   used to leak `horse battery` because the unquoted terminator set was
+        //   applied even when `closing_quote = Some('"')`). Codex Stop-hook round 3
+        //   finding. A simple `\X` escape advances 2 bytes so `"he said \"hi\""`
+        //   doesn't break early on the inner `\"`.
+        // - Unquoted: the JSON/shell-friendly terminator set (whitespace / `,` / `;`
+        //   / `}` / `]`) — unchanged from round 2.
         let value_start = v;
         let mut value_end = value_start;
         while value_end < bytes.len() {
             let b = bytes[value_end];
             match closing_quote {
-                Some(q) if b == q => break,
-                _ if b.is_ascii_whitespace()
-                    || b == b','
-                    || b == b';'
-                    || b == b'}'
-                    || b == b']' =>
-                {
-                    break
+                Some(q) => {
+                    if b == b'\\' && value_end + 1 < bytes.len() {
+                        value_end += 2;
+                        continue;
+                    }
+                    if b == q {
+                        break;
+                    }
+                    value_end += 1;
                 }
-                _ => value_end += 1,
+                None => {
+                    if b.is_ascii_whitespace() || b == b',' || b == b';' || b == b'}' || b == b']' {
+                        break;
+                    }
+                    value_end += 1;
+                }
             }
         }
         if value_end == value_start {
@@ -1584,6 +1598,26 @@ mod sanitize_tests {
         let input = "Hello world this is fine";
         let s = sanitize_text(input);
         assert_eq!(s, input);
+    }
+
+    #[test]
+    fn sanitize_redacts_quoted_value_with_spaces() {
+        // Codex Stop-hook round 3: a quoted password with internal spaces used to
+        // leak the tail because the loop applied the unquoted whitespace
+        // terminator even when `closing_quote = Some('"')`. Now: quoted values
+        // scan until the matching closing quote.
+        let s = sanitize_text(r#"password="correct horse battery""#);
+        assert!(s.contains("password=<redacted>"), "got: {s}");
+        assert!(!s.contains("horse"), "leaked: {s}");
+        assert!(!s.contains("battery"), "leaked: {s}");
+    }
+
+    #[test]
+    fn sanitize_handles_escaped_quote_inside_quoted_value() {
+        // The inner `\"` is an escape — not the closing quote.
+        let s = sanitize_text(r#"secret="he said \"hi\" loudly""#);
+        assert!(s.contains("secret=<redacted>"), "got: {s}");
+        assert!(!s.contains("loudly"), "leaked: {s}");
     }
 
     #[test]
