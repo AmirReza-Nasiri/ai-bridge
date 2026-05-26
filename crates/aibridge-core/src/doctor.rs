@@ -1061,6 +1061,29 @@ fn is_identifier_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
 }
 
+/// Scan `line` for the first occurrence of `q` that ISN'T preceded by a `\X`
+/// escape. Returns the byte index of the unescaped `q`, or `None` if not found.
+/// Symmetric with the `\X = 2 bytes` rule inside `redact_sensitive_kv` so a
+/// multi-line quoted secret terminated by `\"` doesn't end early. Codex
+/// Stop-hook round 4: `sanitize_text` uses this to find where a carried-over
+/// multi-line quoted value ends.
+fn consume_until_unescaped_byte(line: &str, q: u8) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\\' && i + 1 < bytes.len() {
+            i += 2;
+            continue;
+        }
+        if b == q {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Step 3: redact sensitive `key = value` / `key: value` pairs, including JSON
 /// shapes like `"api_key":"sk-..."` and `'access_token': 'abc'`. Match strategy:
 /// - LEFT boundary via `at_word_boundary` (alphanumeric-only), so `OPENAI_API_KEY`
@@ -1071,7 +1094,13 @@ fn is_identifier_byte(b: u8) -> bool {
 ///   whitespace, require `=`/`:`, then optional whitespace + optional opening
 ///   quote, then read the value until any of: whitespace / closing quote / `,` /
 ///   `;` / `}` / `]`. The trailing `}`/`]` are JSON value terminators.
-fn redact_sensitive_kv(line: &str) -> String {
+///
+/// Returns `(rewritten, unclosed_quote)`. `unclosed_quote = Some(q)` when the
+/// function ran off the end of the line still inside a quoted sensitive value
+/// (`sanitize_text` carries this across line boundaries so multi-line credentials
+/// like `private_key="-----BEGIN\nABCDEF\n-----END"` get fully scrubbed instead of
+/// leaking lines 2+). Codex Stop-hook round 4 finding.
+fn redact_sensitive_kv(line: &str) -> (String, Option<u8>) {
     // Build a sorted-by-length-DESC needle list so `api_key` matches before `key`.
     let mut needles: Vec<&str> = SENSITIVE_KEYS.to_vec();
     needles.sort_by_key(|n| std::cmp::Reverse(n.len()));
@@ -1133,6 +1162,21 @@ fn redact_sensitive_kv(line: &str) -> String {
             v += 1;
         }
         if v >= bytes.len() {
+            // EOL right after we consumed an opening quote (e.g. `private_key="`
+            // at end of line). Codex Stop-hook round 4 B2: instead of bailing
+            // and leaving the key visible, treat this as a zero-length quoted
+            // value that ran off the line — emit `<key>=<redacted>` and signal
+            // the carry-state so `sanitize_text` redacts subsequent lines until
+            // the matching closing quote.
+            if let Some(q) = closing_quote {
+                out.push_str(&line[i..key_end]);
+                if let Some(kq) = key_close_quote {
+                    out.push(kq as char);
+                }
+                out.push('=');
+                out.push_str(REDACTED);
+                return (out, Some(q));
+            }
             out.push_str(&line[i..key_end]);
             i = key_end;
             continue;
@@ -1183,6 +1227,16 @@ fn redact_sensitive_kv(line: &str) -> String {
         }
         out.push('=');
         out.push_str(REDACTED);
+        // Did we run off the line still inside a quoted value? If so, signal
+        // the carry-state so `sanitize_text` continues redacting next line.
+        // Codex Stop-hook round 4.
+        let closed = match closing_quote {
+            Some(q) => value_end < bytes.len() && bytes[value_end] == q,
+            None => true,
+        };
+        if !closed {
+            return (out, closing_quote);
+        }
         // Skip past the closing quote on the value, if present.
         i = if let Some(q) = closing_quote {
             if value_end < bytes.len() && bytes[value_end] == q {
@@ -1194,7 +1248,7 @@ fn redact_sensitive_kv(line: &str) -> String {
             value_end
         };
     }
-    out
+    (out, None)
 }
 
 /// Step 4: redact high-entropy standalone tokens. A "token" here is a contiguous
@@ -1236,24 +1290,55 @@ fn redact_high_entropy(line: &str) -> String {
     out
 }
 
+/// Single-line pass through the full pipeline. Returns the line's sanitized
+/// form PLUS any unclosed-quote carry-state from the KV pass (so `sanitize_text`
+/// can continue redacting subsequent lines that are still inside a quoted
+/// sensitive value). Codex Stop-hook round 4.
+fn sanitize_one_line(line: &str) -> (String, Option<u8>) {
+    let s = redact_urls(line);
+    let s = redact_bearer_basic(&s);
+    let (s, carry) = redact_sensitive_kv(&s);
+    let s = redact_high_entropy(&s);
+    (s, carry)
+}
+
 /// Sanitize the whole text. Hand-rolled (no `regex` dep). Pipeline:
 ///   URL credentials/query → bearer/basic → sensitive key=value → high-entropy.
 /// Idempotent: re-running on already-sanitized text yields the same text.
+///
+/// Cross-line carry-state (Codex Stop-hook round 4): when a line ends inside a
+/// quoted sensitive value (e.g. `private_key="-----BEGIN`), the subsequent
+/// lines are dropped entirely until the matching closing quote is seen, then
+/// the rest of that line is sanitized normally. If the remainder itself opens
+/// a new multi-line quoted sensitive value, that carry-state propagates too
+/// (B3). The whole multi-line credential becomes one `<redacted>` on its first
+/// line, blanks in between, and any post-quote tail sanitized normally.
 pub fn sanitize_text(input: &str) -> String {
-    let lines: Vec<String> = input
-        .lines()
-        .map(|l| {
-            let s = redact_urls(l);
-            let s = redact_bearer_basic(&s);
-            let s = redact_sensitive_kv(&s);
-            redact_high_entropy(&s)
-        })
-        .collect();
-    let mut out = lines.join("\n");
-    if input.ends_with('\n') {
-        out.push('\n');
+    let mut out: Vec<String> = Vec::new();
+    let mut carry: Option<u8> = None;
+    for line in input.lines() {
+        let sanitized = if let Some(q) = carry {
+            match consume_until_unescaped_byte(line, q) {
+                Some(close_idx) => {
+                    let remainder = &line[close_idx + 1..];
+                    let (rest, new_carry) = sanitize_one_line(remainder);
+                    carry = new_carry;
+                    rest
+                }
+                None => String::new(),
+            }
+        } else {
+            let (line_out, new_carry) = sanitize_one_line(line);
+            carry = new_carry;
+            line_out
+        };
+        out.push(sanitized);
     }
-    out
+    let mut result = out.join("\n");
+    if input.ends_with('\n') {
+        result.push('\n');
+    }
+    result
 }
 
 // ───────────────────────── Debug-tab report assembly ─────────────────────────
@@ -1598,6 +1683,74 @@ mod sanitize_tests {
         let input = "Hello world this is fine";
         let s = sanitize_text(input);
         assert_eq!(s, input);
+    }
+
+    #[test]
+    fn sanitize_redacts_multi_line_quoted_private_key() {
+        // Codex Stop-hook round 4: a multi-line quoted secret used to leak
+        // lines 2+ because sanitize_text processed each line independently.
+        // Now: cross-line carry-state suppresses the body until the closing
+        // quote.
+        let input = "private_key=\"-----BEGIN PRIVATE KEY-----\nABCDEF1234567890\n-----END PRIVATE KEY-----\"";
+        let s = sanitize_text(input);
+        assert!(s.contains("<redacted>"), "got: {s}");
+        assert!(
+            !s.contains("ABCDEF1234567890"),
+            "body leaked across line boundary: {s:?}"
+        );
+        assert!(!s.contains("-----BEGIN PRIVATE KEY-----"), "got: {s:?}");
+        assert!(!s.contains("-----END PRIVATE KEY-----"), "got: {s:?}");
+    }
+
+    #[test]
+    fn sanitize_multi_line_secret_with_trailing_content_keeps_after_quote() {
+        // Trailing content AFTER the closing quote on the last line should be
+        // sanitized normally (not dropped wholesale and not leaked).
+        let input = "private_key=\"-----BEGIN\nabc123def456\n-----END\" username=alice";
+        let s = sanitize_text(input);
+        assert!(s.contains("<redacted>"), "got: {s}");
+        assert!(!s.contains("abc123def456"), "body leaked: {s:?}");
+        // The non-sensitive `username=alice` survives since `username` isn't a
+        // sensitive key — and it must NOT be eaten by the carry.
+        assert!(s.contains("username=alice"), "trailing dropped: {s:?}");
+    }
+
+    #[test]
+    fn sanitize_multi_line_secret_with_escaped_quote_across_lines() {
+        // Escaped quote (`\"`) inside the body must NOT terminate the carry
+        // early — the `consume_until_unescaped_byte` helper handles `\X` as a
+        // 2-byte sequence.
+        let input = "secret=\"alpha\\\"beta\ngamma\\\"delta\nepsilon\"";
+        let s = sanitize_text(input);
+        assert!(s.contains("<redacted>"), "got: {s}");
+        assert!(!s.contains("gamma"), "body leaked: {s:?}");
+        assert!(!s.contains("epsilon"), "body leaked: {s:?}");
+    }
+
+    #[test]
+    fn sanitize_multi_line_quoted_value_with_opening_quote_at_eol_carries() {
+        // Codex Stop-hook round 4 B2: opening quote is the LAST byte of line 1
+        // (`private_key="\n...`). The v1 code bailed out and left the key
+        // visible. Now: emit <redacted> and carry the quote across lines.
+        let input = "private_key=\"\nleak-me-1\nleak-me-2\"";
+        let s = sanitize_text(input);
+        assert!(s.contains("private_key=<redacted>"), "got: {s:?}");
+        assert!(!s.contains("leak-me-1"), "line 2 leaked: {s:?}");
+        assert!(!s.contains("leak-me-2"), "line 3 leaked: {s:?}");
+    }
+
+    #[test]
+    fn sanitize_carries_new_open_quote_after_closing_previous_carry() {
+        // Codex Stop-hook round 4 B3: after closing one multi-line secret on
+        // a continuation line, a NEW multi-line secret may start in the
+        // remainder. The carry-state must propagate from the remainder pass
+        // forward to the next line.
+        let input = "private_key=\"a\nend\" client_secret=\"b\nleak-tail\nmore-leak\"";
+        let s = sanitize_text(input);
+        assert!(s.contains("private_key=<redacted>"), "got: {s:?}");
+        assert!(s.contains("client_secret=<redacted>"), "got: {s:?}");
+        assert!(!s.contains("leak-tail"), "second secret leaked: {s:?}");
+        assert!(!s.contains("more-leak"), "second secret leaked: {s:?}");
     }
 
     #[test]
