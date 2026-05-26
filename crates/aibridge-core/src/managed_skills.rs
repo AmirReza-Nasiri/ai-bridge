@@ -1439,6 +1439,15 @@ enum Removal {
 /// CLIs stop seeing it), keeping the source folder + lock (marked disabled). Never deletes
 /// a foreign or hand-edited folder, and never RE-records a kept folder as owned.
 pub fn disable(name: &str) -> OpResult {
+    let _guard = match ProcessLock::acquire() {
+        Ok(g) => g,
+        Err(e) => {
+            return OpResult {
+                message: format!("AI Bridge managed skills: {e}"),
+                ok: false,
+            }
+        }
+    };
     let mut lock = read_lock();
     let Some(mut entry) = lock.get(name).cloned() else {
         return OpResult {
@@ -1485,6 +1494,15 @@ pub fn disable(name: &str) -> OpResult {
 /// `managed remove <name>` — disable + delete the source folder + drop the lock entry.
 /// Mirrors are removed only if they are still Bridge-owned (never clobbers user content).
 pub fn remove(name: &str) -> OpResult {
+    let _guard = match ProcessLock::acquire() {
+        Ok(g) => g,
+        Err(e) => {
+            return OpResult {
+                message: format!("AI Bridge managed skills: {e}"),
+                ok: false,
+            }
+        }
+    };
     let mut lock = read_lock();
     let Some(entry) = lock.get(name).cloned() else {
         return OpResult {

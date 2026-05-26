@@ -6,6 +6,31 @@ versioning is semver.
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-05-25
+
+### Added — every `managed-skills` action is now in `aibridge status` (no CLI required)
+
+- **Interactive managed-skills list in the Skills tab.** The tab is split: an interactive list of the
+  declared managed skills on top (one row per skill — selection highlighted; attention rows colored
+  yellow) and the read-only personal-skills doctor on the bottom. Each row shows enabled/disabled, the
+  pinned ref (or `local`), and the current state ("in sync", "update available (pin changed)", "claude
+  mirror edited (drift)", "collision (foreign)", etc.) — all OFFLINE, computed from manifest + lock +
+  filesystem digests.
+- **Per-skill actions, all from the TUI (each gated by the same 2-key confirm we use for `s`/`m`/`i`):**
+  - **Enter** = install/update the selected skill (background thread — the only networked action).
+  - **`p`** = apply --repair (re-mirror an owned-but-hand-edited copy).
+  - **`o`** = apply --adopt (take over a byte-identical foreign folder).
+  - **`d`** = disable (remove owned mirrors; keeps source + lock; partial result is LOUD in the footer).
+  - **`x`** = remove (mirrors + source folder + lock entry; ownership-checked).
+  - **`n`** = init (writes a starter manifest if absent — nothing installs).
+  - **`i`** = apply ALL (existing, unchanged).
+- **Navigation:** Up/Down selects a managed-skill row; PageUp/PageDown scrolls the personal-skills
+  doctor panel. The footer shows the active key map; the manifest path is shown in the panel title so
+  you can edit it externally and `r` to refresh.
+- Nothing about the safety model changes — the same engine + the same digest-bound journal + process
+  lock + ownership checks (Codex-approved in 0.15.0) — this release just makes every action reachable
+  without leaving the dashboard.
+
 ## [0.15.0] - 2026-05-25
 
 ### Added — `aibridge skills managed`: Bridge-owned, pinned, shareable skill provisioning (peer-reviewed by Codex, 4 rounds → APPROVE)

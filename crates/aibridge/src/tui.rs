@@ -28,6 +28,27 @@ use std::time::{Duration, Instant};
 use aibridge_core::doctor::{self, Check, Status};
 use aibridge_core::{progress, review_mcp, skills};
 
+/// Format a managed-skills `OpResult` into a single footer line. When `ok == false`, the
+/// loud `⚠ NOT fully …` line is preferred so a partial failure is never hidden behind a
+/// terser "kept …" / "removed …" line that happens to come earlier in the message.
+fn format_managed_message(action: &str, r: &aibridge_core::managed_skills::OpResult) -> String {
+    let pick = |needles: &[&str]| -> Option<String> {
+        r.message
+            .lines()
+            .find(|l| needles.iter().any(|n| l.contains(n)))
+            .map(|l| l.trim().to_string())
+    };
+    if !r.ok {
+        let warn = pick(&["⚠", "NOT fully", "! "]).or_else(|| pick(&["kept", "removed"]));
+        let key = warn.unwrap_or_else(|| format!("{action}: failed"));
+        format!("{action} (PARTIAL) — {key}")
+    } else {
+        let key = pick(&["removed", "kept", "installed", "wrote", "ADDED"])
+            .unwrap_or_else(|| format!("{action}: done"));
+        format!("{action} — {key}")
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Health,
@@ -105,13 +126,19 @@ struct App {
     /// until first viewed so startup stays snappy (the digest reads many skill files).
     skills_report: Option<String>,
     skills_scroll: u16,
-    /// Pending 2-key confirm for a MUTATING Skills action (`Some('s')`/`Some('m')`/
-    /// `Some('i')`): the action only runs on the SECOND matching press; any other key
-    /// cancels it.
+    /// Pending 2-key confirm for a MUTATING Skills action — letters (`s`/`m`/`i`/`n`/`d`/
+    /// `x`/`p`/`o`) and a sentinel `\n` for Enter (the per-skill install). The action only
+    /// runs on the SECOND matching press; any other key cancels it.
     skills_confirm: Option<char>,
     /// In-flight `managed apply` (background thread → channel) so the network fetch never
     /// blocks the event loop; the result line folds back into the footer.
     managed_apply_rx: Option<std::sync::mpsc::Receiver<String>>,
+    /// One row per managed skill (loaded OFFLINE via `statuses()` on refresh).
+    managed_rows: Vec<aibridge_core::managed_skills::SkillStatus>,
+    /// Currently-selected row in the managed list (clamped on refresh).
+    managed_sel: usize,
+    /// `Some(err)` ⇒ the manifest is missing/invalid (the list shows the hint to `n` init).
+    managed_error: Option<String>,
     message: Option<String>,
     quit: bool,
 }
@@ -142,6 +169,9 @@ impl App {
             skills_scroll: 0,
             skills_confirm: None,
             managed_apply_rx: None,
+            managed_rows: Vec::new(),
+            managed_sel: 0,
+            managed_error: None,
             message: None,
             quit: false,
         };
@@ -149,33 +179,99 @@ impl App {
         app
     }
 
-    /// (Re)compute the Skills doctor report (folder digests → not on the fast tick).
-    /// Includes the OFFLINE managed-skills status section.
+    /// (Re)compute the Skills doctor reports (folder digests → not on the fast tick):
+    /// the personal-skills doctor (the bottom panel) AND the per-skill managed status list
+    /// (the top panel — interactive). Both are OFFLINE.
     fn refresh_skills(&mut self) {
-        self.skills_report = Some(format!(
-            "{}\n\n{}",
-            skills::doctor(),
-            aibridge_core::managed_skills::doctor()
-        ));
+        self.skills_report = Some(skills::doctor());
+        match aibridge_core::managed_skills::statuses() {
+            Ok(rows) => {
+                self.managed_rows = rows;
+                self.managed_error = None;
+            }
+            Err(e) => {
+                self.managed_rows = Vec::new();
+                self.managed_error = Some(e);
+            }
+        }
+        if self.managed_sel >= self.managed_rows.len() {
+            self.managed_sel = self.managed_rows.len().saturating_sub(1);
+        }
     }
 
-    /// Start a background `managed apply` (ALL enabled skills). This is the one networked
-    /// managed action (git fetch), so it runs off the event loop. Idempotent in flight.
-    fn start_managed_apply(&mut self) {
+    /// Start a background `managed apply` for the given target (ALL or a single skill name).
+    /// `apply` is the only networked managed action, so it runs off the event loop.
+    /// Idempotent in flight.
+    fn start_managed_apply(
+        &mut self,
+        target: aibridge_core::managed_skills::Target,
+        repair: bool,
+        adopt: bool,
+    ) {
         if self.managed_apply_rx.is_some() {
             return;
         }
+        let label = match &target {
+            aibridge_core::managed_skills::Target::All => "all".to_string(),
+            aibridge_core::managed_skills::Target::One(n) => n.clone(),
+        };
+        let mut flags = Vec::new();
+        if repair {
+            flags.push("--repair");
+        }
+        if adopt {
+            flags.push("--adopt");
+        }
+        let flag_str = if flags.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", flags.join(" "))
+        };
         let (tx, rx) = std::sync::mpsc::channel();
         self.managed_apply_rx = Some(rx);
-        self.message = Some("Applying managed skills (fetching pinned sources)...".into());
+        self.message = Some(format!(
+            "Applying managed skills{flag_str} ({label}) — fetching pinned sources..."
+        ));
         std::thread::spawn(move || {
-            let r = aibridge_core::managed_skills::apply(
-                aibridge_core::managed_skills::Target::All,
-                false,
-                false,
-            );
+            let r = aibridge_core::managed_skills::apply(target, repair, adopt);
             let _ = tx.send(r.message);
         });
+    }
+
+    /// `n` in TUI → write a starter manifest (no fetch, no install). Refreshes after.
+    fn managed_init(&mut self) {
+        let msg = aibridge_core::managed_skills::init();
+        self.message = Some(msg.lines().next().unwrap_or("init").to_string());
+        self.refresh_skills();
+    }
+
+    /// `d` in TUI → disable the selected managed skill. Synchronous (filesystem-only);
+    /// the core acquires the process lock, so a CLI apply in another terminal would block
+    /// here — but the TUI's own apply-in-flight guard prevents that locally.
+    fn managed_disable_selected(&mut self) {
+        let Some(name) = self.selected_managed() else {
+            return;
+        };
+        let r = aibridge_core::managed_skills::disable(&name);
+        // On a partial, SURFACE the loud ⚠ line so the user actually sees the failure.
+        self.message = Some(format_managed_message(&format!("disable {name}"), &r));
+        self.refresh_skills();
+    }
+
+    /// `x` in TUI → remove the selected managed skill (synchronous; same lock semantics).
+    fn managed_remove_selected(&mut self) {
+        let Some(name) = self.selected_managed() else {
+            return;
+        };
+        let r = aibridge_core::managed_skills::remove(&name);
+        self.message = Some(format_managed_message(&format!("remove {name}"), &r));
+        self.refresh_skills();
+    }
+
+    fn selected_managed(&self) -> Option<String> {
+        self.managed_rows
+            .get(self.managed_sel)
+            .map(|s| s.name.clone())
     }
 
     /// Poll the in-flight managed apply; on completion refresh the report + surface a line.
@@ -322,7 +418,11 @@ impl App {
                 }
             },
             Tab::Health => self.health_scroll = self.health_scroll.saturating_add(1),
-            Tab::Skills => self.skills_scroll = self.skills_scroll.saturating_add(1),
+            Tab::Skills => {
+                if !self.managed_rows.is_empty() && self.managed_sel + 1 < self.managed_rows.len() {
+                    self.managed_sel += 1;
+                }
+            }
             Tab::Review | Tab::Update => {}
         }
     }
@@ -333,7 +433,7 @@ impl App {
                 McpView::Tools => self.tool_sel = self.tool_sel.saturating_sub(1),
             },
             Tab::Health => self.health_scroll = self.health_scroll.saturating_sub(1),
-            Tab::Skills => self.skills_scroll = self.skills_scroll.saturating_sub(1),
+            Tab::Skills => self.managed_sel = self.managed_sel.saturating_sub(1),
             Tab::Review | Tab::Update => {}
         }
     }
@@ -569,12 +669,31 @@ fn handle_key(app: &mut App, code: KeyCode) {
     let in_tools = app.tab == Tab::Mcp && app.mcp_view == McpView::Tools;
     // Any key that ISN'T the matching 2nd press of a Skills mutate-confirm cancels it.
     let is_skills_mutate = app.tab == Tab::Skills
-        && matches!(
+        && (matches!(
             code,
-            KeyCode::Char('s') | KeyCode::Char('m') | KeyCode::Char('i')
-        );
+            KeyCode::Char('s')
+                | KeyCode::Char('m')
+                | KeyCode::Char('i')
+                | KeyCode::Char('n')
+                | KeyCode::Char('d')
+                | KeyCode::Char('x')
+                | KeyCode::Char('p')
+                | KeyCode::Char('o')
+        ) || matches!(code, KeyCode::Enter));
     if !is_skills_mutate {
         app.skills_confirm = None;
+    }
+    // CONCURRENCY GUARD: while a background `managed apply` is in flight, refuse every
+    // mutating managed/personal-skill key. Without this guard, pressing `d`/`x` (which run
+    // synchronously on the UI thread) would race the apply thread on the same lockfile +
+    // mirrors. The core ProcessLock would catch a cross-process race, but a same-process
+    // race needs a UI-level guard — keys aren't a concurrency primitive.
+    if is_skills_mutate && app.managed_apply_rx.is_some() {
+        app.message = Some(
+            "A managed apply is already in progress — wait for it to finish, then try again."
+                .into(),
+        );
+        return;
     }
     match code {
         KeyCode::Char('q') => app.quit = true,
@@ -631,12 +750,109 @@ fn handle_key(app: &mut App, code: KeyCode) {
         // Managed skills: 'i' = apply ALL (fetch pinned sources + mirror) → 2-key confirm.
         KeyCode::Char('i') if app.tab == Tab::Skills => {
             if app.skills_confirm_press('i') {
-                app.start_managed_apply();
+                app.start_managed_apply(aibridge_core::managed_skills::Target::All, false, false);
             } else {
                 app.message = Some(
                     "Press i again to INSTALL/UPDATE all managed skills (fetches pinned sources); any other key cancels".into(),
                 );
             }
+        }
+        // Managed skills: 'n' = init starter manifest → 2-key confirm.
+        KeyCode::Char('n') if app.tab == Tab::Skills => {
+            if app.skills_confirm_press('n') {
+                app.managed_init();
+            } else {
+                app.message = Some(
+                    "Press n again to write a starter manifest at ~/.ai-bridge/skills-managed.toml (nothing installs); any other key cancels".into(),
+                );
+            }
+        }
+        // Managed skills: Enter = INSTALL/UPDATE the selected skill → 2-key confirm.
+        KeyCode::Enter if app.tab == Tab::Skills => {
+            if app.selected_managed().is_none() {
+                app.message = Some(
+                    "No managed skill selected (the list is empty — press 'n' to init a manifest, then add entries)".into(),
+                );
+            } else if app.skills_confirm_press('\n') {
+                if let Some(name) = app.selected_managed() {
+                    app.start_managed_apply(
+                        aibridge_core::managed_skills::Target::One(name),
+                        false,
+                        false,
+                    );
+                }
+            } else if let Some(n) = app.selected_managed() {
+                app.message = Some(format!(
+                    "Press Enter again to INSTALL/UPDATE {n} (fetches pinned source); any other key cancels"
+                ));
+            }
+        }
+        // Managed skills: 'p' = apply selected with --repair (re-mirror a drifted owned).
+        KeyCode::Char('p') if app.tab == Tab::Skills => {
+            if app.selected_managed().is_none() {
+                app.skills_confirm = None;
+            } else if app.skills_confirm_press('p') {
+                if let Some(name) = app.selected_managed() {
+                    app.start_managed_apply(
+                        aibridge_core::managed_skills::Target::One(name),
+                        true,
+                        false,
+                    );
+                }
+            } else if let Some(n) = app.selected_managed() {
+                app.message = Some(format!(
+                    "Press p again to REPAIR {n} (re-mirror an owned-but-hand-edited copy, discarding edits); any other key cancels"
+                ));
+            }
+        }
+        // Managed skills: 'o' = apply selected with --adopt (take over an identical foreign).
+        KeyCode::Char('o') if app.tab == Tab::Skills => {
+            if app.selected_managed().is_none() {
+                app.skills_confirm = None;
+            } else if app.skills_confirm_press('o') {
+                if let Some(name) = app.selected_managed() {
+                    app.start_managed_apply(
+                        aibridge_core::managed_skills::Target::One(name),
+                        false,
+                        true,
+                    );
+                }
+            } else if let Some(n) = app.selected_managed() {
+                app.message = Some(format!(
+                    "Press o again to ADOPT {n} (take over an existing byte-identical foreign folder); any other key cancels"
+                ));
+            }
+        }
+        // Managed skills: 'd' = disable selected (remove owned mirrors; keep source+lock).
+        KeyCode::Char('d') if app.tab == Tab::Skills => {
+            if app.selected_managed().is_none() {
+                app.skills_confirm = None;
+            } else if app.skills_confirm_press('d') {
+                app.managed_disable_selected();
+            } else if let Some(n) = app.selected_managed() {
+                app.message = Some(format!(
+                    "Press d again to DISABLE {n} (remove Bridge mirrors from both CLI dirs; source+lock kept); any other key cancels"
+                ));
+            }
+        }
+        // Managed skills: 'x' = remove selected (mirrors + source + lock entry; ownership-checked).
+        KeyCode::Char('x') if app.tab == Tab::Skills => {
+            if app.selected_managed().is_none() {
+                app.skills_confirm = None;
+            } else if app.skills_confirm_press('x') {
+                app.managed_remove_selected();
+            } else if let Some(n) = app.selected_managed() {
+                app.message = Some(format!(
+                    "Press x again to REMOVE {n} (delete owned mirrors + source + lock entry); any other key cancels"
+                ));
+            }
+        }
+        // Skills tab: PgUp/PgDn scroll the personal-skills doctor (bottom panel).
+        KeyCode::PageDown if app.tab == Tab::Skills => {
+            app.skills_scroll = app.skills_scroll.saturating_add(4);
+        }
+        KeyCode::PageUp if app.tab == Tab::Skills => {
+            app.skills_scroll = app.skills_scroll.saturating_sub(4);
         }
         KeyCode::Char('r') => {
             app.refresh_all();
@@ -680,7 +896,7 @@ fn ui(f: &mut Frame, app: &App) {
         }
         Tab::Health => "Tab/Left/Right: tabs | Up/Down: scroll | r: refresh | q: quit",
         Tab::Skills => {
-            "Tab/Left/Right: tabs | Up/Down: scroll | s: sync | m: migrate | i: apply managed | r: refresh | q: quit"
+            "Up/Dn: select | Enter: install | p: repair | o: adopt | d: disable | x: remove | i: apply all | n: init | s/m: sync/migrate | PgUp/Dn: scroll | r: refresh | q: quit"
         }
         Tab::Review => "Tab/Left/Right: tabs | r: refresh | q: quit (auto-refreshes ~1s)",
         Tab::Update => {
@@ -695,18 +911,63 @@ fn ui(f: &mut Frame, app: &App) {
 }
 
 fn render_skills(f: &mut Frame, app: &App, area: Rect) {
+    // TOP: interactive managed-skills list. BOTTOM: read-only personal-skills doctor.
+    let rows =
+        Layout::vertical([Constraint::Percentage(55), Constraint::Percentage(45)]).split(area);
+
+    let manifest_hint = "manifest: ~/.ai-bridge/skills-managed.toml — edit externally, then 'r'";
+    let items: Vec<ListItem> = if let Some(err) = &app.managed_error {
+        vec![ListItem::new(format!(
+            "(no managed skills — {err}. Press 'n' to init a starter manifest.)"
+        ))]
+    } else if app.managed_rows.is_empty() {
+        vec![ListItem::new(
+            "(no managed skills declared yet. Press 'n' to init a starter manifest.)",
+        )]
+    } else {
+        app.managed_rows
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let mark = if s.attention { "!" } else { " " };
+                let en = if s.enabled { "on " } else { "off" };
+                let prefix = if i == app.managed_sel { ">" } else { " " };
+                let line = format!(
+                    "{prefix} {mark} {:<22} [{en}] {:<10} {}",
+                    s.name, s.pin, s.state
+                );
+                let style = if i == app.managed_sel {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else if s.attention {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    Style::default()
+                };
+                ListItem::new(line).style(style)
+            })
+            .collect()
+    };
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(format!("Managed skills  ({manifest_hint})")),
+    );
+    f.render_widget(list, rows[0]);
+
     let body = app
         .skills_report
         .as_deref()
-        .unwrap_or("Loading skills report (digesting skill folders)...");
-    let p =
-        Paragraph::new(body)
-            .block(Block::default().borders(Borders::ALL).title(
-                "Skills — Claude Code + Codex  (s: sync; m: migrate; i: apply managed [all])",
-            ))
-            .wrap(Wrap { trim: false })
-            .scroll((app.skills_scroll, 0));
-    f.render_widget(p, area);
+        .unwrap_or("Loading personal-skills report (digesting skill folders)...");
+    let p = Paragraph::new(body)
+        .block(Block::default().borders(Borders::ALL).title(
+            "Personal skills — Claude Code + Codex  (s: sync hub→agents; m: migrate legacy)",
+        ))
+        .wrap(Wrap { trim: false })
+        .scroll((app.skills_scroll, 0));
+    f.render_widget(p, rows[1]);
 }
 
 fn render_health(f: &mut Frame, app: &App, area: Rect) {
@@ -935,6 +1196,9 @@ mod tests {
             skills_scroll: 0,
             skills_confirm: None,
             managed_apply_rx: None,
+            managed_rows: Vec::new(),
+            managed_sel: 0,
+            managed_error: None,
             mcp: Some(
                 names
                     .iter()
@@ -981,6 +1245,50 @@ mod tests {
         assert!(!a.skills_confirm_press('s'));
         assert!(!a.skills_confirm_press('m'));
         assert_eq!(a.skills_confirm, Some('m'));
+    }
+
+    #[test]
+    fn in_flight_apply_blocks_mutating_skill_keys() {
+        // Regression for the Codex finding: while a managed apply is in flight (the rx
+        // channel is held), every mutating key on the Skills tab must NO-OP with a clear
+        // "already in progress" footer message and NOT arm the 2-key confirm. This is the
+        // same-process concurrency guard (the core ProcessLock is the cross-process one).
+        let mut a = test_app(&[]);
+        a.tab = Tab::Skills;
+        a.managed_rows
+            .push(aibridge_core::managed_skills::SkillStatus {
+                name: "react-doctor".into(),
+                enabled: true,
+                state: "in sync".into(),
+                attention: false,
+                pin: "deadbeef".into(),
+            });
+        a.managed_sel = 0;
+        let (_tx, rx) = std::sync::mpsc::channel::<String>();
+        a.managed_apply_rx = Some(rx);
+        for key in [
+            KeyCode::Char('d'),
+            KeyCode::Char('x'),
+            KeyCode::Char('i'),
+            KeyCode::Char('n'),
+            KeyCode::Char('p'),
+            KeyCode::Char('o'),
+            KeyCode::Char('s'),
+            KeyCode::Char('m'),
+            KeyCode::Enter,
+        ] {
+            a.message = None;
+            a.skills_confirm = None;
+            handle_key(&mut a, key);
+            assert!(
+                a.message
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("already in progress"),
+                "key {key:?} did not surface the in-flight footer message"
+            );
+            assert_eq!(a.skills_confirm, None, "key {key:?} armed the confirm");
+        }
     }
 
     #[test]
