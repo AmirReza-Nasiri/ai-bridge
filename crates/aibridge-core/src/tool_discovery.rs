@@ -23,7 +23,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const DISCOVER_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// A codex MCP server's launch spec (from `~/.codex/config.toml`).
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ServerSpec {
     pub name: String,
     pub command: String,

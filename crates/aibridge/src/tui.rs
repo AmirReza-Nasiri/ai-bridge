@@ -26,7 +26,7 @@ use std::io::IsTerminal;
 use std::time::{Duration, Instant};
 
 use aibridge_core::doctor::{self, Check, Status};
-use aibridge_core::{progress, review_mcp, skills};
+use aibridge_core::{claude_mcp, progress, review_mcp, skills};
 
 /// Format a managed-skills `OpResult` into a single footer line. When `ok == false`, the
 /// loud `⚠ NOT fully …` line is preferred so a partial failure is never hidden behind a
@@ -53,20 +53,35 @@ fn format_managed_message(action: &str, r: &aibridge_core::managed_skills::OpRes
 enum Tab {
     Health,
     Review,
+    ClaudeMcpInspector,
     Mcp,
     Skills,
     Update,
+    Debug,
 }
 
 impl Tab {
-    const ALL: [Tab; 5] = [Tab::Health, Tab::Review, Tab::Mcp, Tab::Skills, Tab::Update];
+    /// Tab order: Claude MCP Inspector comes BEFORE Codex MCP per the user's request
+    /// (mac dogfood, 2026-05-26). The Inspector is view-only in v1; safe management
+    /// (config edits + restart UX) is deliberately a follow-up plan.
+    const ALL: [Tab; 7] = [
+        Tab::Health,
+        Tab::Review,
+        Tab::ClaudeMcpInspector,
+        Tab::Mcp,
+        Tab::Skills,
+        Tab::Update,
+        Tab::Debug,
+    ];
     fn title(self) -> &'static str {
         match self {
             Tab::Health => "Health",
             Tab::Review => "Review",
+            Tab::ClaudeMcpInspector => "Claude MCP Inspector",
             Tab::Mcp => "Codex MCP",
             Tab::Skills => "Skills",
             Tab::Update => "Update",
+            Tab::Debug => "Debug",
         }
     }
     fn index(self) -> usize {
@@ -91,6 +106,11 @@ enum McpView {
 
 /// A finished background discovery: (server name, discovered tools or error).
 type DiscoverResult = (String, Result<Vec<String>, String>);
+
+/// A finished Claude-side discovery: (server name, tools or error). Same shape as the
+/// codex `DiscoverResult` but kept separate so a late codex-tab message can't poison
+/// the Claude inspector's per-tool view (and vice versa).
+type ClaudeDiscoverResult = (String, Result<Vec<String>, String>);
 
 /// What a background `bump_prepare` or `bump_commit` produced.
 enum BumpFlowMsg {
@@ -161,6 +181,31 @@ struct App {
     /// `B`/`U` in-flight on a background thread (lock would freeze the UI if held in the
     /// event loop).
     bump_rx: Option<std::sync::mpsc::Receiver<BumpFlowMsg>>,
+    /// Claude MCP Inspector — read-only inventory + per-tool discovery. v1 management
+    /// (toggle/edit/restart-nudge) is a follow-up plan; mutating keys no-op here with
+    /// a "view-only" footer message so the user gets feedback, not silence.
+    claude_inventory: Option<Vec<claude_mcp::ClaudeServer>>,
+    claude_inventory_error: Option<String>,
+    /// Non-fatal warnings from the Claude MCP merge (e.g. one source corrupt while
+    /// the other loaded). Codex Stop-gate F2: surfaced ABOVE the empty-state hint
+    /// so a corrupt `~/.claude.json` plus an empty project `.mcp.json` no longer
+    /// silently reports "no MCPs configured".
+    claude_warnings: Vec<String>,
+    claude_sel: usize,
+    claude_view: McpView,
+    claude_server: Option<claude_mcp::ClaudeServer>,
+    claude_tool_rows: Vec<String>,
+    claude_tools_known: bool,
+    claude_tool_sel: usize,
+    claude_discover_rx: Option<std::sync::mpsc::Receiver<ClaudeDiscoverResult>>,
+    claude_discovering: Option<String>,
+    /// Debug tab — assembled lazily on first view + on `r`. The report is built on a
+    /// worker thread (the codex handshake inside `doctor::run` can take a few seconds)
+    /// so the UI keeps drawing. While in flight, `debug_text` shows the building
+    /// notice.
+    debug_text: Option<String>,
+    debug_rx: Option<std::sync::mpsc::Receiver<String>>,
+    debug_scroll: u16,
     message: Option<String>,
     quit: bool,
 }
@@ -197,11 +242,176 @@ impl App {
             upstream_candidates: std::collections::HashMap::new(),
             pending_bump: None,
             bump_rx: None,
+            claude_inventory: None,
+            claude_inventory_error: None,
+            claude_warnings: Vec::new(),
+            claude_sel: 0,
+            claude_view: McpView::Servers,
+            claude_server: None,
+            claude_tool_rows: Vec::new(),
+            claude_tools_known: false,
+            claude_tool_sel: 0,
+            claude_discover_rx: None,
+            claude_discovering: None,
+            debug_text: None,
+            debug_rx: None,
+            debug_scroll: 0,
             message: None,
             quit: false,
         };
         app.refresh_all();
         app
+    }
+
+    /// Reload the Claude MCP inventory (offline; just reads ~/.claude.json + the
+    /// closest-ancestor `.mcp.json`). Warnings from `merge_inventory` flow into
+    /// `claude_warnings` so the Inspector renders them even when there are no
+    /// servers to list.
+    fn refresh_claude(&mut self) {
+        match claude_mcp::inventory(std::path::Path::new(&self.cwd)) {
+            claude_mcp::Inventory::Available { servers, warnings } => {
+                self.claude_inventory = Some(servers);
+                self.claude_inventory_error = None;
+                self.claude_warnings = warnings;
+            }
+            claude_mcp::Inventory::Unavailable(why) => {
+                self.claude_inventory = None;
+                self.claude_inventory_error = Some(why);
+                self.claude_warnings = Vec::new();
+            }
+        }
+        if let Some(rows) = &self.claude_inventory {
+            if self.claude_sel >= rows.len() {
+                self.claude_sel = rows.len().saturating_sub(1);
+            }
+        }
+    }
+
+    /// Enter the selected Claude server's per-tool view.
+    fn open_selected_claude(&mut self) {
+        if self.tab != Tab::ClaudeMcpInspector || self.claude_view != McpView::Servers {
+            return;
+        }
+        let Some(server) = self
+            .claude_inventory
+            .as_ref()
+            .and_then(|rows| rows.get(self.claude_sel))
+            .cloned()
+        else {
+            return;
+        };
+        self.claude_server = Some(server);
+        self.claude_view = McpView::Tools;
+        self.claude_tool_sel = 0;
+        self.claude_tool_rows.clear();
+        self.claude_tools_known = false;
+    }
+
+    /// Esc: leave the per-tool view back to the server list.
+    fn claude_back(&mut self) -> bool {
+        if self.tab == Tab::ClaudeMcpInspector && self.claude_view == McpView::Tools {
+            self.claude_view = McpView::Servers;
+            self.claude_server = None;
+            self.claude_tool_rows.clear();
+            self.claude_tools_known = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 'd' in the Claude Inspector's per-tool view: discover the open server's tools on
+    /// a BACKGROUND thread. Goes through `claude_mcp::discover` which uses
+    /// `tool_discovery::discover` (the UNCACHED entry point) so the codex cache is
+    /// never touched.
+    fn start_claude_discover(&mut self) {
+        if self.tab != Tab::ClaudeMcpInspector
+            || self.claude_view != McpView::Tools
+            || self.claude_discovering.is_some()
+        {
+            return;
+        }
+        let Some(server) = self.claude_server.clone() else {
+            return;
+        };
+        let name = server.name.clone();
+        let cwd = self.cwd.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.claude_discover_rx = Some(rx);
+        self.claude_discovering = Some(name.clone());
+        self.message = Some(format!(
+            "Discovering '{name}' (Claude side) — launching it briefly..."
+        ));
+        std::thread::spawn(move || {
+            let r = claude_mcp::discover(&server, std::path::Path::new(&cwd));
+            let _ = tx.send((name, r));
+        });
+    }
+
+    fn poll_claude_discover(&mut self) {
+        let Some(rx) = &self.claude_discover_rx else {
+            return;
+        };
+        if let Ok((server, res)) = rx.try_recv() {
+            self.claude_discover_rx = None;
+            self.claude_discovering = None;
+            if self.claude_server.as_ref().map(|s| s.name.clone()) == Some(server.clone()) {
+                match res {
+                    Ok(tools) => {
+                        self.claude_tool_rows = tools;
+                        self.claude_tools_known = true;
+                        self.message = Some(format!(
+                            "Discovered {} tool(s) of '{server}' (Claude side).",
+                            self.claude_tool_rows.len()
+                        ));
+                    }
+                    Err(e) => {
+                        self.claude_tool_rows.clear();
+                        self.claude_tools_known = true;
+                        self.message = Some(format!("Discovery of '{server}' failed: {e}"));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Footer message for any mutating key the Claude Inspector intercepts. Kept as a
+    /// single string so the v2 management plan can rewrite it in one place.
+    fn claude_view_only_message(&mut self) {
+        self.message = Some(
+            "view-only — to toggle, edit ~/.claude.json (or the project's .mcp.json) and \
+             restart Claude. Management UX is a follow-up."
+                .into(),
+        );
+    }
+
+    /// Kick off (or re-run on `r`) the Debug-tab report build on a worker thread. The
+    /// `doctor::debug_report` call spawns codex briefly + queries the Claude inventory,
+    /// so doing it on the event loop would freeze the UI for a few seconds.
+    fn start_debug_build(&mut self) {
+        if self.debug_rx.is_some() {
+            return;
+        }
+        let cwd = self.cwd.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.debug_rx = Some(rx);
+        self.debug_text = Some(
+            "Building debug report (this can take a few seconds while the Codex handshake runs)..."
+                .to_string(),
+        );
+        std::thread::spawn(move || {
+            let report = doctor::debug_report(std::path::Path::new(&cwd));
+            let _ = tx.send(report);
+        });
+    }
+
+    fn poll_debug_build(&mut self) {
+        if let Some(rx) = &self.debug_rx {
+            if let Ok(text) = rx.try_recv() {
+                self.debug_text = Some(text);
+                self.debug_rx = None;
+            }
+        }
     }
 
     /// (Re)compute the Skills doctor reports (folder digests → not on the fast tick):
@@ -526,11 +736,13 @@ impl App {
     }
 
     /// Full refresh (startup + `r`): runs the doctor checks (no network), reloads the
-    /// review status, and re-reads the MCP policy. Not called on the fast input tick.
+    /// review status, and re-reads the MCP policies (codex + claude). Not called on
+    /// the fast input tick.
     fn refresh_all(&mut self) {
         self.checks = doctor::run(std::path::Path::new(&self.cwd), false, false).checks;
         self.refresh_review();
         self.refresh_mcp();
+        self.refresh_claude();
         if self.mcp_view == McpView::Tools {
             self.load_tool_states();
         }
@@ -594,7 +806,22 @@ impl App {
                     }
                 }
             },
+            Tab::ClaudeMcpInspector => match self.claude_view {
+                McpView::Servers => {
+                    if let Some(rows) = &self.claude_inventory {
+                        if self.claude_sel + 1 < rows.len() {
+                            self.claude_sel += 1;
+                        }
+                    }
+                }
+                McpView::Tools => {
+                    if self.claude_tool_sel + 1 < self.claude_tool_rows.len() {
+                        self.claude_tool_sel += 1;
+                    }
+                }
+            },
             Tab::Health => self.health_scroll = self.health_scroll.saturating_add(1),
+            Tab::Debug => self.debug_scroll = self.debug_scroll.saturating_add(1),
             Tab::Skills => {
                 if !self.managed_rows.is_empty() && self.managed_sel + 1 < self.managed_rows.len() {
                     self.managed_sel += 1;
@@ -609,7 +836,12 @@ impl App {
                 McpView::Servers => self.mcp_sel = self.mcp_sel.saturating_sub(1),
                 McpView::Tools => self.tool_sel = self.tool_sel.saturating_sub(1),
             },
+            Tab::ClaudeMcpInspector => match self.claude_view {
+                McpView::Servers => self.claude_sel = self.claude_sel.saturating_sub(1),
+                McpView::Tools => self.claude_tool_sel = self.claude_tool_sel.saturating_sub(1),
+            },
             Tab::Health => self.health_scroll = self.health_scroll.saturating_sub(1),
+            Tab::Debug => self.debug_scroll = self.debug_scroll.saturating_sub(1),
             Tab::Skills => self.managed_sel = self.managed_sel.saturating_sub(1),
             Tab::Review | Tab::Update => {}
         }
@@ -829,11 +1061,16 @@ fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
         }
         app.poll_update(); // fold in a finished background update-check
         app.poll_discover(); // fold in a finished background tool-discovery
+        app.poll_claude_discover(); // fold in a finished Claude-side discovery
         app.poll_managed_apply(); // fold in a finished background managed-skills apply
         app.poll_check_upstream(); // fold in the upstream probe result
         app.poll_bump(); // fold in a finished bump prepare/commit
+        app.poll_debug_build(); // fold in a finished Debug-report build
         if app.tab == Tab::Skills && app.skills_report.is_none() {
             app.refresh_skills(); // lazy first compute (folder digests) on first view
+        }
+        if app.tab == Tab::Debug && app.debug_text.is_none() && app.debug_rx.is_none() {
+            app.start_debug_build(); // lazy first build on first view
         }
         // Live-refresh the (cheap) review status ~1s; heavy refresh only on `r`.
         if last_refresh.elapsed() >= Duration::from_secs(1) {
@@ -888,7 +1125,7 @@ fn handle_key(app: &mut App, code: KeyCode) {
         // (Bind first so the arm body isn't a lone `if` — avoids clippy
         // collapsible_match wanting a side-effecting match guard.)
         KeyCode::Esc => {
-            let backed_out = app.mcp_back();
+            let backed_out = app.mcp_back() || app.claude_back();
             if !backed_out {
                 app.quit = true;
             }
@@ -898,8 +1135,9 @@ fn handle_key(app: &mut App, code: KeyCode) {
         KeyCode::Down | KeyCode::Char('j') => app.move_down(),
         KeyCode::Up | KeyCode::Char('k') => app.move_up(),
         // Space toggles: a tool in the per-tool view, else the selected server.
+        // Tab-guarded so the Claude Inspector's view-only Space arm below can fire.
         KeyCode::Char(' ') if in_tools => app.toggle_selected_tool(),
-        KeyCode::Char(' ') => app.toggle_selected_mcp(),
+        KeyCode::Char(' ') if app.tab == Tab::Mcp => app.toggle_selected_mcp(),
         // Enter opens a server's tools (server list) or toggles a tool (tool view).
         KeyCode::Enter if app.tab == Tab::Mcp && app.mcp_view == McpView::Servers => {
             app.open_selected_server()
@@ -908,6 +1146,35 @@ fn handle_key(app: &mut App, code: KeyCode) {
         KeyCode::Char('a') if in_tools => app.set_all_tools_in_view(true),
         KeyCode::Char('n') if in_tools => app.set_all_tools_in_view(false),
         KeyCode::Char('d') if in_tools => app.start_discover(),
+        // Claude MCP Inspector: VIEW-ONLY navigation. Enter opens a server's tool view;
+        // mutating keys (Space anywhere, `a`/`n` in tools view) no-op with a "view-only"
+        // footer so the user gets feedback instead of silence.
+        KeyCode::Enter
+            if app.tab == Tab::ClaudeMcpInspector && app.claude_view == McpView::Servers =>
+        {
+            app.open_selected_claude()
+        }
+        KeyCode::Char(' ') if app.tab == Tab::ClaudeMcpInspector => app.claude_view_only_message(),
+        KeyCode::Enter
+            if app.tab == Tab::ClaudeMcpInspector && app.claude_view == McpView::Tools =>
+        {
+            app.claude_view_only_message()
+        }
+        KeyCode::Char('a')
+            if app.tab == Tab::ClaudeMcpInspector && app.claude_view == McpView::Tools =>
+        {
+            app.claude_view_only_message()
+        }
+        KeyCode::Char('n')
+            if app.tab == Tab::ClaudeMcpInspector && app.claude_view == McpView::Tools =>
+        {
+            app.claude_view_only_message()
+        }
+        KeyCode::Char('d')
+            if app.tab == Tab::ClaudeMcpInspector && app.claude_view == McpView::Tools =>
+        {
+            app.start_claude_discover()
+        }
         KeyCode::Char('c') if app.tab == Tab::Update => app.start_update_check(),
         KeyCode::Char('u') if app.tab == Tab::Update => {
             // The actual self-replace runs after the TUI exits (clean terminal + real
@@ -1068,6 +1335,12 @@ fn handle_key(app: &mut App, code: KeyCode) {
             if app.tab == Tab::Skills {
                 app.refresh_skills();
             }
+            if app.tab == Tab::Debug {
+                // Force a rebuild — the previous text is replaced with the building
+                // notice and a fresh worker is kicked off (idempotent if one's in flight).
+                app.debug_text = None;
+                app.start_debug_build();
+            }
         }
         _ => {}
     }
@@ -1091,9 +1364,11 @@ fn ui(f: &mut Frame, app: &App) {
     match app.tab {
         Tab::Health => render_health(f, app, rows[1]),
         Tab::Review => render_review(f, app, rows[1]),
+        Tab::ClaudeMcpInspector => render_claude_inspector(f, app, rows[1]),
         Tab::Mcp => render_mcp(f, app, rows[1]),
         Tab::Skills => render_skills(f, app, rows[1]),
         Tab::Update => render_update(f, app, rows[1]),
+        Tab::Debug => render_debug(f, app, rows[1]),
     }
 
     let help = match app.tab {
@@ -1103,6 +1378,12 @@ fn ui(f: &mut Frame, app: &App) {
         Tab::Mcp => {
             "Tab/Left/Right: tabs | Up/Down: server | Space: on/off | Enter: per-tool | r: refresh | q: quit"
         }
+        Tab::ClaudeMcpInspector if app.claude_view == McpView::Tools => {
+            "Up/Down: tool | d: discover | Esc: back | (view-only — toggles disabled) | q: quit"
+        }
+        Tab::ClaudeMcpInspector => {
+            "Tab/Left/Right: tabs | Up/Down: server | Enter: view tools | r: refresh | (view-only — toggles via ~/.claude.json) | q: quit"
+        }
         Tab::Health => "Tab/Left/Right: tabs | Up/Down: scroll | r: refresh | q: quit",
         Tab::Skills => {
             "Up/Dn: select | Enter: install | M: migrate-and-install | U: check upstream | B: bump (preview→commit) | p: repair | o: adopt | d: disable | x: remove | i: apply all | n: init | s/m: personal sync/migrate | r: refresh | q: quit"
@@ -1111,6 +1392,7 @@ fn ui(f: &mut Frame, app: &App) {
         Tab::Update => {
             "Tab/Left/Right: tabs | c: check | u: update now (exits + applies) | q: quit"
         }
+        Tab::Debug => "Tab/Left/Right: tabs | Up/Down: scroll | r: rebuild | q: quit",
     };
     let footer = match &app.message {
         Some(m) => Line::from(Span::styled(m.clone(), Style::default().fg(Color::Yellow))),
@@ -1355,6 +1637,238 @@ fn render_mcp_tools(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(List::new(items).block(block), area);
 }
 
+/// What the Inspector's top-level view should show. Pure (no ratatui types) so the
+/// decision logic is unit-testable — the Codex Stop-gate F2 regression was that the
+/// render path took its empty-state branch even when warnings should have been
+/// surfaced instead. The unit test `claude_inspector_view_prefers_warnings_over_empty_state`
+/// locks the precedence down.
+#[derive(Debug, PartialEq, Eq)]
+enum InspectorView {
+    /// `Inventory::Unavailable(why)` — couldn't read any source.
+    Error(String),
+    /// Servers list is empty but at least one source had a parse/read error. Show
+    /// the warnings INSTEAD of the cheerful "no servers configured" hint.
+    WarningsOnly(Vec<String>),
+    /// Nothing wrong, nothing to show — render the friendly empty-state hint.
+    Empty,
+    /// Some servers (+ possibly warnings).
+    Servers { warnings: Vec<String> },
+    /// We haven't actually called `refresh_claude` yet (initial App state); ask the
+    /// user to press `r`.
+    NotLoaded,
+}
+
+fn claude_inspector_view(
+    inventory: Option<&[claude_mcp::ClaudeServer]>,
+    error: Option<&str>,
+    warnings: &[String],
+) -> InspectorView {
+    if let Some(e) = error {
+        return InspectorView::Error(e.to_string());
+    }
+    let Some(rows) = inventory else {
+        return InspectorView::NotLoaded;
+    };
+    if rows.is_empty() {
+        if !warnings.is_empty() {
+            return InspectorView::WarningsOnly(warnings.to_vec());
+        }
+        return InspectorView::Empty;
+    }
+    InspectorView::Servers {
+        warnings: warnings.to_vec(),
+    }
+}
+
+/// Claude MCP Inspector — view-only. Mirrors the Codex MCP server-list / tool-view
+/// shape so muscle memory transfers; only DISCOVERY is functional (no toggling).
+fn render_claude_inspector(f: &mut Frame, app: &App, area: Rect) {
+    if app.claude_view == McpView::Tools {
+        render_claude_inspector_tools(f, app, area);
+        return;
+    }
+    let block = Block::default().borders(Borders::ALL).title(
+        "Claude MCP Inspector  (Enter: view tools  ·  view-only: toggles via ~/.claude.json)",
+    );
+    let view = claude_inspector_view(
+        app.claude_inventory.as_deref(),
+        app.claude_inventory_error.as_deref(),
+        &app.claude_warnings,
+    );
+    match view {
+        InspectorView::Error(err) => {
+            let p = Paragraph::new(err)
+                .style(Style::default().fg(Color::Yellow))
+                .wrap(Wrap { trim: true })
+                .block(block);
+            f.render_widget(p, area);
+        }
+        InspectorView::NotLoaded => {
+            let p = Paragraph::new("Claude MCP inventory not loaded yet — press 'r' to refresh.")
+                .style(Style::default().fg(Color::Yellow))
+                .wrap(Wrap { trim: true })
+                .block(block);
+            f.render_widget(p, area);
+        }
+        InspectorView::WarningsOnly(warnings) => {
+            let mut text = String::from(
+                "Couldn't fully load Claude MCP configuration. \
+                 The Inspector reached at least one source but the following had problems:\n\n",
+            );
+            for w in &warnings {
+                text.push_str("  ! ");
+                text.push_str(w);
+                text.push('\n');
+            }
+            text.push_str(
+                "\nFix the source above (or add `mcpServers` entries) and press 'r' to reload.",
+            );
+            let p = Paragraph::new(text)
+                .style(Style::default().fg(Color::Yellow))
+                .wrap(Wrap { trim: true })
+                .block(block);
+            f.render_widget(p, area);
+        }
+        InspectorView::Empty => {
+            let p = Paragraph::new(
+                "No Claude MCP servers configured. Add one with `claude mcp add -s user` or commit \
+                 a project `.mcp.json`. Reload the dashboard with 'r' afterwards.",
+            )
+            .wrap(Wrap { trim: true })
+            .block(block);
+            f.render_widget(p, area);
+        }
+        InspectorView::Servers { warnings } => {
+            // Build a single List with optional yellow warning rows on top, then a
+            // separator, then the servers.
+            let rows = app.claude_inventory.as_deref().unwrap_or(&[]);
+            let mut items: Vec<ListItem> = Vec::new();
+            for w in &warnings {
+                items.push(
+                    ListItem::new(Line::from(format!("  ! {w}")))
+                        .style(Style::default().fg(Color::Yellow)),
+                );
+            }
+            if !warnings.is_empty() {
+                items.push(ListItem::new(Line::from("  ───────────────────────")));
+            }
+            for (i, s) in rows.iter().enumerate() {
+                let scope = match &s.scope {
+                    claude_mcp::ClaudeScope::User { .. } => "user",
+                    claude_mcp::ClaudeScope::Project { .. } => "project",
+                };
+                let overrides = if s.overrides_user {
+                    "  (overrides user)"
+                } else {
+                    ""
+                };
+                let line = format!(
+                    "  {:<20} [{scope:<7}] [{transport}]{overrides}",
+                    s.name,
+                    transport = s.transport.label()
+                );
+                let style = if i == app.claude_sel {
+                    Style::default().add_modifier(Modifier::REVERSED)
+                } else if s.overrides_user {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    Style::default()
+                };
+                items.push(ListItem::new(Line::from(line)).style(style));
+            }
+            f.render_widget(List::new(items).block(block), area);
+        }
+    }
+}
+
+fn render_claude_inspector_tools(f: &mut Frame, app: &App, area: Rect) {
+    let server_name = app
+        .claude_server
+        .as_ref()
+        .map(|s| s.name.clone())
+        .unwrap_or_else(|| "?".into());
+    let block = Block::default().borders(Borders::ALL).title(format!(
+        "Tools of Claude server '{server_name}'  (d: discover · view-only · Esc: back)"
+    ));
+    if app.claude_discovering.as_deref() == Some(server_name.as_str()) {
+        let p = Paragraph::new(format!(
+            "Discovering '{server_name}' (Claude side) — launching it briefly..."
+        ))
+        .wrap(Wrap { trim: true })
+        .block(block);
+        f.render_widget(p, area);
+        return;
+    }
+    // If the selected server isn't stdio, give the user a transport-aware panel so
+    // they know WHY 'd' wouldn't work (parity with the Codex side's HTTP message).
+    let stdio = matches!(
+        app.claude_server.as_ref().map(|s| &s.transport),
+        Some(claude_mcp::Transport::Stdio { .. })
+    );
+    if !stdio {
+        let label = app
+            .claude_server
+            .as_ref()
+            .map(|s| s.transport.label().to_string())
+            .unwrap_or_else(|| "?".into());
+        let p = Paragraph::new(format!(
+            "'{server_name}' uses transport '{label}' — tool discovery requires stdio.\n\nTo toggle \
+             this server in Claude, edit ~/.claude.json (or the project's .mcp.json) and restart \
+             Claude. Management UX is a follow-up plan."
+        ))
+        .wrap(Wrap { trim: true })
+        .block(block);
+        f.render_widget(p, area);
+        return;
+    }
+    if !app.claude_tools_known {
+        let p = Paragraph::new(
+            "Tools haven't been discovered yet.\n\nPress 'd' to discover — this briefly launches \
+             the server (tools/list only; never calls a tool, so it can't hang).",
+        )
+        .wrap(Wrap { trim: true })
+        .block(block);
+        f.render_widget(p, area);
+        return;
+    }
+    if app.claude_tool_rows.is_empty() {
+        let p = Paragraph::new("(the server reported no tools)")
+            .wrap(Wrap { trim: true })
+            .block(block);
+        f.render_widget(p, area);
+        return;
+    }
+    let items: Vec<ListItem> = app
+        .claude_tool_rows
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let style = if i == app.claude_tool_sel {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            ListItem::new(Line::from(format!("  {name}"))).style(style)
+        })
+        .collect();
+    f.render_widget(List::new(items).block(block), area);
+}
+
+fn render_debug(f: &mut Frame, app: &App, area: Rect) {
+    let body = app.debug_text.clone().unwrap_or_else(|| {
+        "Press 'r' to build the debug report (this can take a few seconds).".to_string()
+    });
+    let p = Paragraph::new(body)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Debug  (auto-sanitized; review before sharing publicly)"),
+        )
+        .wrap(Wrap { trim: false })
+        .scroll((app.debug_scroll, 0));
+    f.render_widget(p, area);
+}
+
 fn render_update(f: &mut Frame, app: &App, area: Rect) {
     let lines = vec![
         Line::from(format!("Installed: {}", aibridge_core::VERSION_FULL)),
@@ -1421,17 +1935,35 @@ mod tests {
                     .collect(),
             ),
             mcp_sel: 0,
+            claude_inventory: None,
+            claude_inventory_error: None,
+            claude_warnings: Vec::new(),
+            claude_sel: 0,
+            claude_view: McpView::Servers,
+            claude_server: None,
+            claude_tool_rows: Vec::new(),
+            claude_tools_known: false,
+            claude_tool_sel: 0,
+            claude_discover_rx: None,
+            claude_discovering: None,
+            debug_text: None,
+            debug_rx: None,
+            debug_scroll: 0,
             message: None,
             quit: false,
         }
     }
 
     #[test]
-    fn tab_navigation_wraps() {
+    fn tab_navigation_wraps_all_seven() {
+        // Tab order: Health, Review, ClaudeMcpInspector, Mcp, Skills, Update, Debug.
+        // (Claude before Codex per the user's macOS dogfood request.)
         let mut a = test_app(&[]);
         assert!(a.tab == Tab::Health);
         a.next_tab();
         assert!(a.tab == Tab::Review);
+        a.next_tab();
+        assert!(a.tab == Tab::ClaudeMcpInspector);
         a.next_tab();
         assert!(a.tab == Tab::Mcp);
         a.next_tab();
@@ -1439,9 +1971,110 @@ mod tests {
         a.next_tab();
         assert!(a.tab == Tab::Update);
         a.next_tab();
-        assert!(a.tab == Tab::Health); // wrap
+        assert!(a.tab == Tab::Debug);
+        a.next_tab();
+        assert!(a.tab == Tab::Health); // wrap forward
         a.prev_tab();
-        assert!(a.tab == Tab::Update); // wrap back
+        assert!(a.tab == Tab::Debug); // wrap backward
+    }
+
+    #[test]
+    fn claude_inspector_view_only_message_set_on_mutating_keys() {
+        // Pressing Space anywhere on the Claude Inspector must produce the view-only
+        // footer (not silence, not a no-op without feedback). Regression for the v1
+        // scope contract.
+        let mut a = test_app(&[]);
+        a.tab = Tab::ClaudeMcpInspector;
+        a.claude_view_only_message();
+        let msg = a.message.unwrap_or_default();
+        assert!(
+            msg.contains("view-only"),
+            "expected 'view-only' in footer, got: {msg:?}"
+        );
+        assert!(
+            msg.contains("~/.claude.json"),
+            "expected ~/.claude.json hint, got: {msg:?}"
+        );
+    }
+
+    #[test]
+    fn claude_inspector_view_prefers_warnings_over_empty_state() {
+        // Codex Stop-gate F2 regression test: when servers list is empty BUT a
+        // source had a read/parse error (warning present), the Inspector must
+        // render the warning, NOT the cheerful "no MCPs configured" hint.
+        let warnings = vec!["user-scope (~/.claude.json): parse error".to_string()];
+        let v = claude_inspector_view(Some(&[]), None, &warnings);
+        match v {
+            InspectorView::WarningsOnly(w) => assert_eq!(w, warnings),
+            other => panic!("expected WarningsOnly, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn claude_inspector_view_empty_no_warnings_is_empty_hint() {
+        let v = claude_inspector_view(Some(&[]), None, &[]);
+        assert_eq!(v, InspectorView::Empty);
+    }
+
+    #[test]
+    fn claude_inspector_view_error_wins_over_everything() {
+        let v = claude_inspector_view(Some(&[]), Some("oh no"), &["w".into()]);
+        match v {
+            InspectorView::Error(e) => assert_eq!(e, "oh no"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn claude_inspector_view_servers_carries_warnings() {
+        // Servers PLUS warnings → Servers variant carries the warnings forward, so
+        // a corrupt user-scope alongside a working project-scope still gets a
+        // visible yellow notice instead of being silently dropped.
+        let rows = vec![claude_mcp::ClaudeServer {
+            name: "x".into(),
+            scope: claude_mcp::ClaudeScope::Project {
+                source: std::path::PathBuf::from("/p/.mcp.json"),
+            },
+            transport: claude_mcp::Transport::Stdio {
+                command: "echo".into(),
+                args: vec![],
+                env: vec![],
+                cwd_field: None,
+            },
+            overrides_user: false,
+        }];
+        let warnings = vec!["user-scope (~/.claude.json): parse error".to_string()];
+        let v = claude_inspector_view(Some(&rows), None, &warnings);
+        match v {
+            InspectorView::Servers { warnings: w } => assert_eq!(w, warnings),
+            other => panic!("expected Servers, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn claude_back_unwinds_only_from_tools_view() {
+        let mut a = test_app(&[]);
+        a.tab = Tab::ClaudeMcpInspector;
+        // From the server list, back does nothing (top-level Esc would quit).
+        assert!(!a.claude_back());
+        // Simulate having entered the tools view.
+        a.claude_view = McpView::Tools;
+        a.claude_server = Some(claude_mcp::ClaudeServer {
+            name: "x".into(),
+            scope: claude_mcp::ClaudeScope::User {
+                source: std::path::PathBuf::from("/u/.claude.json"),
+            },
+            transport: claude_mcp::Transport::Stdio {
+                command: "echo".into(),
+                args: vec![],
+                env: vec![],
+                cwd_field: None,
+            },
+            overrides_user: false,
+        });
+        assert!(a.claude_back());
+        assert!(matches!(a.claude_view, McpView::Servers));
+        assert!(a.claude_server.is_none());
     }
 
     #[test]

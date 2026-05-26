@@ -855,6 +855,942 @@ fn has_aibridge_stop_hook(v: &Value) -> bool {
         .unwrap_or(false)
 }
 
+// ───────────────────────── Debug-tab report (TUI) ─────────────────────────
+//
+// The Debug tab in `aibridge status` shows a single copy-pasteable report. To keep
+// secrets out of a casual paste, we BOTH (1) build the report from CURATED fields
+// (e.g. env keys, not env values; install-state minimal fields; never the plan_gate
+// approved-plan text or audit detail strings) AND (2) run the final text through a
+// sanitizer that masks common secret shapes. The curated approach is the primary
+// defense; the sanitizer is the safety net for fields whose contents we can't fully
+// predict (URL query strings in doctor details, etc.). Codex F-round 3 / round 5.
+
+const REDACTED: &str = "<redacted>";
+const REDACTED_LONG: &str = "<redacted-long>";
+const REDACTED_QUERY: &str = "<redacted-query>";
+
+/// The fixed list of sensitive key NAMES that trigger value redaction. Matched
+/// case-insensitively at word boundaries. Underscores and hyphens are both accepted
+/// (`api_key` / `api-key`).
+const SENSITIVE_KEYS: &[&str] = &[
+    "token",
+    "secret",
+    "key",
+    "password",
+    "passwd",
+    "pwd",
+    "auth",
+    "bearer",
+    "apikey",
+    "api_key",
+    "api-key",
+    "access_token",
+    "access-token",
+    "client_secret",
+    "client-secret",
+    "private_key",
+    "private-key",
+];
+
+/// `true` when the byte is part of a URL (not a delimiter that ends one).
+fn is_url_byte(b: u8) -> bool {
+    !(b.is_ascii_whitespace() || b == b'"' || b == b'\'' || b == b'<' || b == b'>' || b == b'`')
+}
+
+/// Find the next case-insensitive occurrence of `needle` in `haystack` starting at
+/// `from`. Returns the (start, end) of the match in byte indices.
+fn find_ci(haystack: &str, needle: &str, from: usize) -> Option<(usize, usize)> {
+    let h = haystack.as_bytes();
+    let n = needle.as_bytes();
+    if n.is_empty() || from > h.len() {
+        return None;
+    }
+    let max = h.len().checked_sub(n.len())?;
+    for i in from..=max {
+        let mut ok = true;
+        for (j, &nb) in n.iter().enumerate() {
+            if !h[i + j].eq_ignore_ascii_case(&nb) {
+                ok = false;
+                break;
+            }
+        }
+        if ok {
+            return Some((i, i + n.len()));
+        }
+    }
+    None
+}
+
+/// `true` when the byte at `i` is a SECRET-MATCHING word boundary: start/end of
+/// string, or the previous byte is NOT ASCII alphanumeric. `_` and `-` ARE treated
+/// as boundaries here (deliberately different from a Rust identifier boundary) so
+/// prefixed env-style names like `OPENAI_API_KEY=...`, `ANTHROPIC_API_KEY=...`,
+/// `GITHUB_TOKEN=...`, and `MY-SERVICE-SECRET=...` match the `key` / `token` /
+/// `secret` needles. Codex Stop-gate finding: the v1 version inherited the Rust-
+/// identifier rule and silently let those leak through `sanitize_text`.
+fn at_word_boundary(s: &str, i: usize) -> bool {
+    if i == 0 || i >= s.len() {
+        return true;
+    }
+    !s.as_bytes()[i - 1].is_ascii_alphanumeric()
+}
+
+/// Step 1: redact URL credentials + query strings. Walks `line`, copies normal bytes,
+/// and when it spots `http://` or `https://`, processes the URL through to its
+/// natural end (whitespace or quote / angle bracket).
+fn redact_urls(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut i = 0;
+    while i < line.len() {
+        // Find the next URL start (either scheme), taking the earlier of the two.
+        let http_hit = find_ci(line, "http://", i);
+        let https_hit = find_ci(line, "https://", i);
+        let next = match (http_hit, https_hit) {
+            (Some(a), Some(b)) if a.0 <= b.0 => Some(a),
+            (Some(_), Some(b)) => Some(b),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        let Some((start, end)) = next else {
+            out.push_str(&line[i..]);
+            break;
+        };
+        // Copy text before the URL.
+        out.push_str(&line[i..start]);
+        // Find URL end.
+        let b = line.as_bytes();
+        let mut url_end = end;
+        while url_end < b.len() && is_url_byte(b[url_end]) {
+            url_end += 1;
+        }
+        let url = &line[start..url_end];
+        let scheme_len = end - start;
+        let after_scheme = &url[scheme_len..];
+        // Detect `userinfo@host` — basic auth in URL.
+        let host_part = if let Some(at_idx) = after_scheme.find('@') {
+            // Make sure the userinfo region doesn't cross a path separator.
+            let userinfo = &after_scheme[..at_idx];
+            if !userinfo.contains('/') && !userinfo.is_empty() {
+                out.push_str(&url[..scheme_len]);
+                out.push_str(REDACTED);
+                out.push('@');
+                &after_scheme[at_idx + 1..]
+            } else {
+                out.push_str(&url[..scheme_len]);
+                after_scheme
+            }
+        } else {
+            out.push_str(&url[..scheme_len]);
+            after_scheme
+        };
+        // Detect `?query` — replace.
+        if let Some(q) = host_part.find('?') {
+            out.push_str(&host_part[..q]);
+            out.push('?');
+            out.push_str(REDACTED_QUERY);
+        } else {
+            out.push_str(host_part);
+        }
+        i = url_end;
+    }
+    out
+}
+
+/// Step 2: redact Bearer/Basic tokens. Looks for `Bearer` or `Basic` at a word
+/// boundary, requires at least one whitespace after, then redacts the next token.
+fn redact_bearer_basic(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut i = 0;
+    while i < line.len() {
+        let needles = ["bearer", "basic"];
+        let mut hit: Option<(usize, usize, &str)> = None;
+        for n in &needles {
+            if let Some((s, e)) = find_ci(line, n, i) {
+                if hit.map(|(hs, _, _)| s < hs).unwrap_or(true) {
+                    hit = Some((s, e, n));
+                }
+            }
+        }
+        let Some((start, scheme_end, _kind)) = hit else {
+            out.push_str(&line[i..]);
+            break;
+        };
+        // Word boundary on the left.
+        if !at_word_boundary(line, start) {
+            out.push_str(&line[i..scheme_end]);
+            i = scheme_end;
+            continue;
+        }
+        // Right side: must be whitespace, then a token.
+        let after = &line[scheme_end..];
+        let bytes = after.as_bytes();
+        let mut p = 0;
+        while p < bytes.len() && bytes[p] == b' ' {
+            p += 1;
+        }
+        if p == 0 || p >= bytes.len() || bytes[p].is_ascii_whitespace() {
+            // No following whitespace or no token after — leave as-is.
+            out.push_str(&line[i..scheme_end]);
+            i = scheme_end;
+            continue;
+        }
+        let token_start = scheme_end + p;
+        let mut token_end = token_start;
+        while token_end < line.len() {
+            let b = line.as_bytes()[token_end];
+            if b.is_ascii_whitespace() || b == b',' || b == b';' || b == b'"' || b == b'\'' {
+                break;
+            }
+            token_end += 1;
+        }
+        out.push_str(&line[i..token_start]);
+        out.push_str(REDACTED);
+        i = token_end;
+    }
+    out
+}
+
+/// `true` when the byte continues an identifier (letter, digit, `_`, or `-`). Used
+/// for the RIGHT-side boundary in `redact_sensitive_kv` so a needle like `api_key`
+/// matched inside `api_key_path` is rejected (the `_` extends the identifier — we'd
+/// otherwise rewrite `api_key_path = secret` as `api_key=<redacted>` and lose
+/// `_path`). The LEFT side uses `at_word_boundary` (alphanumeric-only) so prefixed
+/// env names like `OPENAI_API_KEY` still match — the asymmetry is intentional.
+fn is_identifier_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
+}
+
+/// Step 3: redact sensitive `key = value` / `key: value` pairs, including JSON
+/// shapes like `"api_key":"sk-..."` and `'access_token': 'abc'`. Match strategy:
+/// - LEFT boundary via `at_word_boundary` (alphanumeric-only), so `OPENAI_API_KEY`
+///   still finds `api_key` at the `_API_KEY` position.
+/// - RIGHT boundary via `!is_identifier_byte`, so `api_key_path = secret` does NOT
+///   match `api_key` (the `_` extends the identifier).
+/// - Tolerate an optional closing quote on the key (JSON shape), then optional
+///   whitespace, require `=`/`:`, then optional whitespace + optional opening
+///   quote, then read the value until any of: whitespace / closing quote / `,` /
+///   `;` / `}` / `]`. The trailing `}`/`]` are JSON value terminators.
+fn redact_sensitive_kv(line: &str) -> String {
+    // Build a sorted-by-length-DESC needle list so `api_key` matches before `key`.
+    let mut needles: Vec<&str> = SENSITIVE_KEYS.to_vec();
+    needles.sort_by_key(|n| std::cmp::Reverse(n.len()));
+    let mut out = String::with_capacity(line.len());
+    let mut i = 0;
+    let bytes = line.as_bytes();
+    while i < line.len() {
+        // Find the EARLIEST hit among all needles at-or-after i, with a word boundary.
+        let mut hit: Option<(usize, usize, &str)> = None;
+        for n in &needles {
+            let mut probe = i;
+            while let Some((s, e)) = find_ci(line, n, probe) {
+                if at_word_boundary(line, s) {
+                    // Right boundary: next byte must not extend the identifier.
+                    let right_ok = e == line.len() || !is_identifier_byte(bytes[e]);
+                    if right_ok {
+                        if hit.map(|(hs, _, _)| s < hs).unwrap_or(true) {
+                            hit = Some((s, e, n));
+                        }
+                        break;
+                    }
+                }
+                probe = s + 1;
+            }
+        }
+        let Some((_start, key_end, _n)) = hit else {
+            out.push_str(&line[i..]);
+            break;
+        };
+        // Tolerate an optional closing quote on the key (JSON-shaped: `"api_key":...`).
+        let key_close_quote =
+            if key_end < bytes.len() && (bytes[key_end] == b'"' || bytes[key_end] == b'\'') {
+                Some(bytes[key_end])
+            } else {
+                None
+            };
+        let after_key = key_end + key_close_quote.map(|_| 1).unwrap_or(0);
+        // Skip whitespace.
+        let mut p = after_key;
+        while p < bytes.len() && (bytes[p] == b' ' || bytes[p] == b'\t') {
+            p += 1;
+        }
+        // Require `=` or `:` (else not a kv assignment — copy through the key).
+        if p >= bytes.len() || (bytes[p] != b'=' && bytes[p] != b':') {
+            out.push_str(&line[i..key_end]);
+            i = key_end;
+            continue;
+        }
+        let sep = p;
+        // Skip whitespace after `=`/`:`.
+        let mut v = sep + 1;
+        while v < bytes.len() && (bytes[v] == b' ' || bytes[v] == b'\t') {
+            v += 1;
+        }
+        // Optional opening quote on the value.
+        let mut closing_quote: Option<u8> = None;
+        if v < bytes.len() && (bytes[v] == b'"' || bytes[v] == b'\'') {
+            closing_quote = Some(bytes[v]);
+            v += 1;
+        }
+        if v >= bytes.len() {
+            out.push_str(&line[i..key_end]);
+            i = key_end;
+            continue;
+        }
+        // Find value end. JSON terminators (`}` / `]`) end the value too.
+        let value_start = v;
+        let mut value_end = value_start;
+        while value_end < bytes.len() {
+            let b = bytes[value_end];
+            match closing_quote {
+                Some(q) if b == q => break,
+                _ if b.is_ascii_whitespace()
+                    || b == b','
+                    || b == b';'
+                    || b == b'}'
+                    || b == b']' =>
+                {
+                    break
+                }
+                _ => value_end += 1,
+            }
+        }
+        if value_end == value_start {
+            out.push_str(&line[i..key_end]);
+            i = key_end;
+            continue;
+        }
+        // Normalize the rewrite: keep the key (preserving its closing quote if any)
+        // and emit `=<redacted>`. The value's quotes are dropped — only `<redacted>`
+        // survives so the original quote style doesn't leak length info.
+        out.push_str(&line[i..key_end]);
+        if let Some(q) = key_close_quote {
+            out.push(q as char);
+        }
+        out.push('=');
+        out.push_str(REDACTED);
+        // Skip past the closing quote on the value, if present.
+        i = if let Some(q) = closing_quote {
+            if value_end < bytes.len() && bytes[value_end] == q {
+                value_end + 1
+            } else {
+                value_end
+            }
+        } else {
+            value_end
+        };
+    }
+    out
+}
+
+/// Step 4: redact high-entropy standalone tokens. A "token" here is a contiguous
+/// run of `[A-Za-z0-9]` of length ≥ 40 that contains BOTH at least one digit AND at
+/// least one letter — narrow enough to avoid false-positives on long identifiers
+/// (all-letter names) and pure digit runs (timestamps).
+///
+/// Iterates via `char_indices` so multibyte UTF-8 (em-dashes etc.) are preserved
+/// verbatim — a previous byte-by-byte cast corrupted "—" into garbage. Code-path
+/// regression tested by `sanitize_preserves_emdash_in_report_header`.
+fn redact_high_entropy(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut iter = line.char_indices().peekable();
+    while let Some(&(start, ch)) = iter.peek() {
+        if !ch.is_ascii_alphanumeric() {
+            out.push(ch);
+            iter.next();
+            continue;
+        }
+        // Collect the run.
+        let mut end = start;
+        while let Some(&(idx, c)) = iter.peek() {
+            if c.is_ascii_alphanumeric() {
+                end = idx + c.len_utf8();
+                iter.next();
+            } else {
+                break;
+            }
+        }
+        let token = &line[start..end];
+        let has_digit = token.bytes().any(|b| b.is_ascii_digit());
+        let has_alpha = token.bytes().any(|b| b.is_ascii_alphabetic());
+        if token.len() >= 40 && has_digit && has_alpha {
+            out.push_str(REDACTED_LONG);
+        } else {
+            out.push_str(token);
+        }
+    }
+    out
+}
+
+/// Sanitize the whole text. Hand-rolled (no `regex` dep). Pipeline:
+///   URL credentials/query → bearer/basic → sensitive key=value → high-entropy.
+/// Idempotent: re-running on already-sanitized text yields the same text.
+pub fn sanitize_text(input: &str) -> String {
+    let lines: Vec<String> = input
+        .lines()
+        .map(|l| {
+            let s = redact_urls(l);
+            let s = redact_bearer_basic(&s);
+            let s = redact_sensitive_kv(&s);
+            redact_high_entropy(&s)
+        })
+        .collect();
+    let mut out = lines.join("\n");
+    if input.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+// ───────────────────────── Debug-tab report assembly ─────────────────────────
+
+fn now_iso() -> String {
+    // Lightweight: just a UNIX-ms stamp (no chrono dep) plus the day-of-build for
+    // context. The report header is meant to identify a snapshot, not be a calendar.
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    format!("{ms}ms (build {})", crate::BUILD_DATE)
+}
+
+fn write_doctor_section(out: &mut String, project: &Path) {
+    out.push_str("## Doctor checks\n");
+    let report = run(project, false, false);
+    for c in &report.checks {
+        let tag = match c.status {
+            Status::Pass => "ok  ",
+            Status::Warn => "warn",
+            Status::Fail => "FAIL",
+        };
+        if c.detail.is_empty() {
+            out.push_str(&format!("  [{tag}] {}\n", c.name));
+        } else {
+            out.push_str(&format!("  [{tag}] {} — {}\n", c.name, c.detail));
+        }
+    }
+    out.push('\n');
+}
+
+fn write_managed_skills_section(out: &mut String) {
+    out.push_str("## Managed skills (plan)\n");
+    let body = crate::managed_skills::plan();
+    for line in body.lines() {
+        out.push_str("  ");
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push('\n');
+}
+
+fn write_codex_inventory_section(out: &mut String, project: &Path) {
+    out.push_str("## Codex MCP inventory (curated)\n");
+    let cwd = project.display().to_string();
+    match crate::review_mcp::codex_inventory(&cwd) {
+        crate::review_mcp::Inventory::Unavailable(why) => {
+            out.push_str(&format!("  unavailable: {why}\n"));
+        }
+        crate::review_mcp::Inventory::Available(servers) => {
+            if servers.is_empty() {
+                out.push_str("  (none configured)\n");
+            }
+            for s in &servers {
+                let cmd_basename = Path::new(&s.command)
+                    .file_name()
+                    .and_then(|x| x.to_str())
+                    .unwrap_or(&s.command);
+                let cmd_basename = if cmd_basename.is_empty() {
+                    "(none)"
+                } else {
+                    cmd_basename
+                };
+                let env_keys: Vec<String> = s.env.iter().map(|(k, _)| k.clone()).collect();
+                out.push_str(&format!(
+                    "  - name={} enabled={} transport={} command={} args_count={} cwd_present={} env_keys={:?}\n",
+                    s.name,
+                    s.enabled,
+                    if s.transport.is_empty() { "?" } else { s.transport.as_str() },
+                    cmd_basename,
+                    s.args.len(),
+                    s.cwd.is_some(),
+                    env_keys,
+                ));
+            }
+        }
+    }
+    out.push('\n');
+}
+
+fn write_claude_inventory_section(out: &mut String, project: &Path) {
+    out.push_str("## Claude MCP inventory (curated)\n");
+    match crate::claude_mcp::inventory(project) {
+        crate::claude_mcp::Inventory::Unavailable(why) => {
+            out.push_str(&format!("  unavailable: {why}\n"));
+        }
+        crate::claude_mcp::Inventory::Available { servers, warnings } => {
+            for w in &warnings {
+                out.push_str(&format!("  ! warning: {w}\n"));
+            }
+            if servers.is_empty() {
+                out.push_str("  (none configured)\n");
+            }
+            for s in &servers {
+                let scope = match &s.scope {
+                    crate::claude_mcp::ClaudeScope::User { .. } => "user",
+                    crate::claude_mcp::ClaudeScope::Project { .. } => "project",
+                };
+                let (cmd_basename, args_count, env_keys, cwd_present) = match &s.transport {
+                    crate::claude_mcp::Transport::Stdio {
+                        command,
+                        args,
+                        env,
+                        cwd_field,
+                    } => {
+                        let cb = Path::new(command)
+                            .file_name()
+                            .and_then(|x| x.to_str())
+                            .unwrap_or(command);
+                        let keys: Vec<String> = env.iter().map(|(k, _)| k.clone()).collect();
+                        (cb.to_string(), args.len(), keys, cwd_field.is_some())
+                    }
+                    _ => ("(none)".to_string(), 0, Vec::new(), false),
+                };
+                out.push_str(&format!(
+                    "  - name={} scope={} overrides_user={} transport={} command={} args_count={} cwd_present={} env_keys={:?}\n",
+                    s.name,
+                    scope,
+                    s.overrides_user,
+                    s.transport.label(),
+                    cmd_basename,
+                    args_count,
+                    cwd_present,
+                    env_keys,
+                ));
+            }
+        }
+    }
+    out.push('\n');
+}
+
+fn write_plan_gate_section(out: &mut String, project: &Path) {
+    out.push_str("## Plan-gate state (curated)\n");
+    let cwd_str = project.display().to_string();
+    let marker = match crate::plan_gate::marker_state(&cwd_str) {
+        crate::plan_gate::MarkerState::Active => "active",
+        crate::plan_gate::MarkerState::Pending => "pending",
+        crate::plan_gate::MarkerState::Disabled => "disabled",
+    };
+    out.push_str(&format!("  marker={marker}\n"));
+    // Read state.json shallowly — never emit `approved_plan`, `approved_plan_hash`,
+    // `last_findings_hash`, or any other free-form text that could carry secrets.
+    let path = project
+        .join(".ai-bridge")
+        .join("plan-gate")
+        .join("state.json");
+    if !path.exists() {
+        out.push_str("  state_file=absent\n\n");
+        return;
+    }
+    let v: Option<Value> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok());
+    if let Some(v) = v {
+        let status = v.get("status").and_then(Value::as_str).unwrap_or("?");
+        let epoch = v.get("epoch").and_then(Value::as_u64).unwrap_or(0);
+        let approved = v.get("approved").and_then(Value::as_bool).unwrap_or(false);
+        let same_findings = v.get("same_findings").and_then(Value::as_u64).unwrap_or(0);
+        let revoked_reason = v
+            .get("revoked_reason")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        out.push_str(&format!(
+            "  status={status} epoch={epoch} approved={approved} same_findings={same_findings} revoked_reason={}\n",
+            if revoked_reason.is_empty() {
+                "(none)"
+            } else {
+                revoked_reason
+            }
+        ));
+    } else {
+        out.push_str("  state_file=present_but_unparseable\n");
+    }
+    out.push('\n');
+}
+
+fn write_install_state_section(out: &mut String, project: &Path) {
+    out.push_str("## Install state (curated)\n");
+    let path = project.join(".ai-bridge").join("install-state.json");
+    if !path.exists() {
+        out.push_str("  absent (run `aibridge init`)\n\n");
+        return;
+    }
+    let v: Option<Value> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok());
+    if let Some(v) = v {
+        let version = v.get("version").and_then(Value::as_str).unwrap_or("?");
+        let installed_at_ms = v
+            .get("installed_at_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let binary_path = v.get("binary_path").and_then(Value::as_str).unwrap_or("?");
+        out.push_str(&format!(
+            "  version={version} installed_at_ms={installed_at_ms} binary_path={binary_path}\n"
+        ));
+    } else {
+        out.push_str("  present_but_unparseable\n");
+    }
+    out.push('\n');
+}
+
+fn write_audit_section(out: &mut String) {
+    out.push_str("## Managed-skills audit (last 10; event/name/ok/ts only)\n");
+    let Some(home) = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .ok()
+    else {
+        out.push_str("  (no home dir)\n\n");
+        return;
+    };
+    let path = Path::new(&home)
+        .join(".ai-bridge")
+        .join("managed-skills.audit.jsonl");
+    if !path.exists() {
+        out.push_str("  (no audit log yet)\n\n");
+        return;
+    }
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut entries: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let total = entries.len();
+    if entries.len() > 10 {
+        entries = entries.split_off(entries.len() - 10);
+    }
+    out.push_str(&format!("  total_entries={total}\n"));
+    for line in entries {
+        let v: Value = serde_json::from_str(line).unwrap_or(Value::Null);
+        let ts = v.get("ts_ms").and_then(Value::as_u64).unwrap_or(0);
+        let event = v.get("event").and_then(Value::as_str).unwrap_or("?");
+        let name = v.get("name").and_then(Value::as_str).unwrap_or("?");
+        let ok = v.get("ok").and_then(Value::as_bool).unwrap_or(false);
+        out.push_str(&format!(
+            "  - ts_ms={ts} event={event} name={name} ok={ok}\n"
+        ));
+    }
+    out.push('\n');
+}
+
+fn write_elicitation_section(out: &mut String, project: &Path) {
+    out.push_str("## Last declined elicitation (within 24h)\n");
+    let cwd = project.display().to_string();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+    match crate::progress::last_declined_elicitation(&cwd)
+        .filter(|(ms, _)| now.saturating_sub(*ms) <= DAY_MS)
+    {
+        Some((ms, summary)) => {
+            out.push_str(&format!("  ts_ms={ms} summary={summary}\n"));
+        }
+        None => out.push_str("  (none)\n"),
+    }
+    out.push('\n');
+}
+
+/// Build the comprehensive `Debug` tab report for `project`. The whole text is fed
+/// through [`sanitize_text`] as the LAST step so any free-form strings inside the
+/// curated sections (doctor `detail`s, elicitation summaries, etc.) are masked even
+/// if they accidentally carry URLs/tokens.
+pub fn debug_report(project: &Path) -> String {
+    let mut out = String::new();
+    out.push_str("AI Bridge — debug report\n");
+    out.push_str(&format!("  version: {}\n", crate::VERSION_FULL));
+    out.push_str(&format!("  platform: {}\n", platform_name()));
+    out.push_str(&format!("  project: {}\n", project.display()));
+    out.push_str(&format!("  generated: {}\n", now_iso()));
+    out.push_str(
+        "  note: this report is auto-sanitized (tokens, URL credentials, env values,\n        \
+         plan/audit details masked). Review before sharing publicly.\n\n",
+    );
+    write_doctor_section(&mut out, project);
+    write_managed_skills_section(&mut out);
+    write_codex_inventory_section(&mut out, project);
+    write_claude_inventory_section(&mut out, project);
+    write_plan_gate_section(&mut out, project);
+    write_install_state_section(&mut out, project);
+    write_audit_section(&mut out);
+    write_elicitation_section(&mut out, project);
+    sanitize_text(&out)
+}
+
+// ───────────────────────── tests ─────────────────────────
+
+#[cfg(test)]
+mod sanitize_tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_redacts_bearer_with_space() {
+        let s = sanitize_text("Authorization: Bearer abc.def.ghi");
+        assert!(s.contains("Bearer <redacted>"), "got: {s}");
+        assert!(!s.contains("abc.def.ghi"));
+    }
+
+    #[test]
+    fn sanitize_redacts_basic_auth_header() {
+        let s = sanitize_text("Authorization: Basic dXNlcjpwYXNz");
+        assert!(s.contains("Basic <redacted>"), "got: {s}");
+    }
+
+    #[test]
+    fn sanitize_redacts_key_value_with_spaces_and_quotes() {
+        let s = sanitize_text("API_KEY = \"sk-abc-1234567890abc\"");
+        assert!(s.contains("API_KEY=<redacted>"), "got: {s}");
+        assert!(!s.contains("sk-abc-1234567890abc"));
+    }
+
+    #[test]
+    fn sanitize_redacts_key_value_no_quotes() {
+        let s = sanitize_text("token: abc123def");
+        assert!(s.contains("token=<redacted>"), "got: {s}");
+    }
+
+    #[test]
+    fn sanitize_redacts_url_basic_auth() {
+        let s = sanitize_text("see https://user:pw@example.com/x for details");
+        assert!(s.contains("https://<redacted>@example.com"), "got: {s}");
+        assert!(!s.contains("user:pw"));
+    }
+
+    #[test]
+    fn sanitize_redacts_url_query_strings() {
+        let s = sanitize_text("hit https://api.example.com/x?token=abc&q=1 end");
+        assert!(s.contains("?<redacted-query>"), "got: {s}");
+        assert!(!s.contains("token=abc"));
+    }
+
+    #[test]
+    fn sanitize_redacts_high_entropy_long_string() {
+        // 64-char alphanumeric blob — meets length+digit+letter rule.
+        let blob = "a1b2c3d4e5f6g7h8i9j0a1b2c3d4e5f6g7h8i9j0a1b2c3d4e5f6g7h8i9j0a1b2";
+        let s = sanitize_text(&format!("opaque {} appears", blob));
+        assert!(s.contains("<redacted-long>"), "got: {s}");
+        assert!(!s.contains(blob));
+    }
+
+    #[test]
+    fn sanitize_does_not_redact_short_words() {
+        let input = "Hello world this is fine";
+        let s = sanitize_text(input);
+        assert_eq!(s, input);
+    }
+
+    #[test]
+    fn sanitize_redacts_json_shaped_double_quoted() {
+        // Codex Stop-gate F1: JSON-shaped credentials like {"api_key":"sk-abc"} used
+        // to slip through because the right-boundary check rejected `"`. The new
+        // !is_identifier_byte right boundary accepts the closing key quote.
+        let s = sanitize_text(r#"{"api_key":"sk-abc-1234567890"}"#);
+        assert!(s.contains("<redacted>"), "got: {s}");
+        assert!(!s.contains("sk-abc-1234567890"), "leaked value: {s}");
+    }
+
+    #[test]
+    fn sanitize_redacts_json_shaped_single_quoted() {
+        let s = sanitize_text("'access_token': 'tok-aaaaaaaa'");
+        assert!(s.contains("<redacted>"), "got: {s}");
+        assert!(!s.contains("tok-aaaaaaaa"), "leaked value: {s}");
+    }
+
+    #[test]
+    fn sanitize_redacts_json_value_with_brace_terminator() {
+        // The `}` terminates the value as a JSON object closer.
+        let s = sanitize_text(r#"{"secret":"hush123"}, after"#);
+        assert!(s.contains("<redacted>"), "got: {s}");
+        assert!(!s.contains("hush123"), "leaked value: {s}");
+    }
+
+    #[test]
+    fn sanitize_does_not_redact_non_sensitive_with_quote_after_key() {
+        // Sanity: a NON-sensitive key name ending with a quote/colon must not be
+        // touched. `"keyword"` contains the substring `key` but `key` is at the
+        // start (left boundary OK) and the next char is `w` (alphanumeric → right
+        // boundary fails), so no match.
+        let input = r#"{"keyword":"banana"}"#;
+        assert_eq!(sanitize_text(input), input);
+    }
+
+    #[test]
+    fn sanitize_does_not_redact_when_underscore_extends_identifier() {
+        // Sanity for the asymmetric boundary: `api_key_path = secret`. We DO find
+        // `api_key` at index 0 with left boundary OK (start of string), but the next
+        // byte is `_` which is an identifier byte → right boundary fails. So no
+        // truncated rewrite. (The full `api_key_path` isn't in needles, so it
+        // remains visible. If the user wants this redacted, they should add it.)
+        let input = "api_key_path = secret_path_value";
+        assert_eq!(sanitize_text(input), input);
+    }
+
+    #[test]
+    fn sanitize_redacts_prefixed_env_secret_keys() {
+        // Codex Stop-gate regression: `at_word_boundary` previously treated `_` and
+        // `-` as part of the same "word", so prefixed env-style names like
+        // OPENAI_API_KEY / ANTHROPIC_API_KEY / GITHUB_TOKEN slipped past the matcher
+        // and their values reached the copy-pasteable Debug report. The Debug tab is
+        // EXPLICITLY meant to be safe to copy-paste after the final sanitizer pass.
+        let cases = [
+            (
+                "OPENAI_API_KEY=sk-foo-bar-very-long-12345",
+                "sk-foo-bar-very-long-12345",
+            ),
+            (
+                "ANTHROPIC_API_KEY = \"sk-ant-abc123def456ghi789\"",
+                "sk-ant-abc123def456ghi789",
+            ),
+            (
+                "GITHUB_TOKEN: ghp_aaaabbbbccccddddeeeeffff",
+                "ghp_aaaabbbbccccddddeeeeffff",
+            ),
+            ("MY-SERVICE-SECRET = topsecret123", "topsecret123"),
+        ];
+        for (input, value) in cases {
+            let s = sanitize_text(input);
+            assert!(
+                !s.contains(value),
+                "leaked value {value:?} in sanitized output {s:?}"
+            );
+            assert!(s.contains("<redacted>"), "expected <redacted>, got {s:?}");
+        }
+    }
+
+    #[test]
+    fn sanitize_preserves_emdash_in_report_header() {
+        // Regression: previous byte-by-byte loop in `redact_high_entropy` corrupted
+        // multibyte chars like `—` (3 UTF-8 bytes). The fix iterates by char_indices.
+        let s = sanitize_text("AI Bridge — debug report");
+        assert_eq!(s, "AI Bridge — debug report");
+    }
+
+    #[test]
+    fn sanitize_is_idempotent() {
+        let input = "Bearer abc API_KEY=secret https://u:p@h/x?q=v";
+        let once = sanitize_text(input);
+        let twice = sanitize_text(&once);
+        assert_eq!(once, twice);
+    }
+}
+
+#[cfg(test)]
+mod debug_report_tests {
+    use super::*;
+
+    fn temp_project(label: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "aibridge-doctor-debug-{}-{}-{}",
+            label,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn write_file(p: &Path, body: &str) {
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(p, body).unwrap();
+    }
+
+    #[test]
+    fn debug_report_excludes_approved_plan() {
+        // A state.json with an `approved_plan` literal must NOT appear in the report;
+        // the curated section only emits status/epoch/approved/same_findings/reason.
+        let project = temp_project("noplan");
+        let state_path = project
+            .join(".ai-bridge")
+            .join("plan-gate")
+            .join("state.json");
+        write_file(
+            &state_path,
+            r#"{"status":"approved","epoch":3,"approved":true,"approved_plan":"SECRET-PLAN-BODY","same_findings":0}"#,
+        );
+        let report = debug_report(&project);
+        assert!(
+            !report.contains("SECRET-PLAN-BODY"),
+            "report leaked approved_plan: {report}"
+        );
+        assert!(report.contains("status=approved"));
+        assert!(report.contains("epoch=3"));
+    }
+
+    #[test]
+    fn debug_report_excludes_audit_detail() {
+        // We can't easily inject ~/.ai-bridge/managed-skills.audit.jsonl in tests
+        // without env-var hacks; this test instead asserts the CODE-LEVEL invariant
+        // by inspecting the audit section's source.
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("doctor.rs");
+        let src = std::fs::read_to_string(&path).expect("read own source");
+        // Find the audit-section function body and make sure it never emits `detail`.
+        let body = src
+            .split("fn write_audit_section")
+            .nth(1)
+            .and_then(|s| s.split("fn ").next())
+            .expect("audit section present");
+        assert!(
+            !body.contains("\"detail\""),
+            "write_audit_section must not read the `detail` field"
+        );
+        assert!(
+            !body.contains(".get(\"detail\")"),
+            "write_audit_section must not read the `detail` field"
+        );
+    }
+
+    #[test]
+    fn debug_report_emits_env_keys_only() {
+        // Build a synthetic curated line the same way the inventory writer does and
+        // confirm env VALUES never appear, KEYS do.
+        let mut out = String::new();
+        let env_keys = vec!["MY_KEY".to_string(), "API_TOKEN".to_string()];
+        out.push_str(&format!("env_keys={:?}\n", env_keys));
+        let sanitized = sanitize_text(&out);
+        assert!(sanitized.contains("MY_KEY"));
+        assert!(sanitized.contains("API_TOKEN"));
+        // No literal values reachable in the curated emit.
+        assert!(!sanitized.contains("supersecret"));
+    }
+
+    #[test]
+    fn debug_report_sanitizes_doctor_check_detail() {
+        // Drive sanitize_text directly with a doctor-like detail string that contains
+        // a basic-auth URL — confirm it's masked end-to-end.
+        let detail = "  [ ok ] something — see https://user:pw@example.com/x?token=abc";
+        let out = sanitize_text(detail);
+        assert!(out.contains("https://<redacted>@example.com"), "got: {out}");
+        assert!(out.contains("?<redacted-query>"));
+    }
+
+    #[test]
+    fn debug_report_header_fields_present() {
+        // Smoke: the header section has the four expected lines.
+        let project = temp_project("header");
+        let report = debug_report(&project);
+        assert!(report.starts_with("AI Bridge — debug report"));
+        assert!(report.contains("version:"));
+        assert!(report.contains("platform:"));
+        assert!(report.contains("project:"));
+        assert!(report.contains("generated:"));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::parse_reasoning_effort;

@@ -4,6 +4,7 @@
 //! [`plan_gate`]), [`git`] diffing, persisted consult [`topics`], the rtk
 //! [`optimizer`] hook, [`install`] wiring, [`doctor`] checks, and [`update`].
 
+pub mod claude_mcp;
 pub mod codex;
 pub mod doctor;
 pub mod gate;

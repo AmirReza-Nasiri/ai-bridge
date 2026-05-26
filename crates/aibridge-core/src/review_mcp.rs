@@ -396,63 +396,118 @@ pub fn server_mode(name: &str) -> Mode {
     }
 }
 
+/// Typed lookup result for a codex MCP server by name. Distinguishes a stdio server
+/// (discoverable), a non-stdio server (HTTP/SSE — present in codex's config but tool
+/// discovery requires stdio), and "not configured". Codex pointed out the v1
+/// confusion: a HTTP-transport server like context7 was reported as "is not a codex
+/// MCP server" because `server_spec` only returned `Some` for stdio.
+#[derive(Debug)]
+pub enum ServerLookup {
+    /// Stdio server with a discoverable command — pass to `tool_discovery::discover`.
+    Stdio(crate::tool_discovery::ServerSpec),
+    /// Configured but uses a non-stdio transport (e.g. `streamable_http`, `sse`). The
+    /// server-level allow/disallow still applies during reviews; only per-tool
+    /// discovery via launch is unavailable.
+    NonStdio { transport: String },
+    /// The name isn't in codex's resolved inventory (and not in the fallback config).
+    Unknown,
+    /// codex CLI couldn't be queried AND the fallback config read also failed.
+    Unavailable(String),
+}
+
 /// The launch spec (command/args/env/cwd) for `name`, for tool discovery + the cache
-/// fingerprint. Prefers codex's AUTHORITATIVE inventory; only when codex can't be
-/// queried does it fall back to the direct `~/.codex/config.toml` read. `None` if the
-/// server isn't a discoverable stdio command.
+/// fingerprint. Thin wrapper over `server_lookup` kept for back-compat with the
+/// existing per-tool enforcement paths (which only need to know "is this discoverable
+/// stdio yes/no").
 pub fn server_spec(name: &str) -> Option<crate::tool_discovery::ServerSpec> {
+    match server_lookup(name) {
+        ServerLookup::Stdio(spec) => Some(spec),
+        _ => None,
+    }
+}
+
+/// Authoritative-then-fallback lookup for a codex MCP server. Used by `discover_server`
+/// to give a transport-aware error message (rather than the v1 "is not a codex MCP
+/// server", which confused HTTP-transport users).
+pub fn server_lookup(name: &str) -> ServerLookup {
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| ".".to_string());
     match codex_inventory(&cwd) {
-        // codex is AUTHORITATIVE: it says exactly what this server is. Only a stdio
-        // server with a command is discoverable; otherwise None — do NOT fall back to
-        // the file (which could launch/fingerprint a DIFFERENT server than codex resolves).
-        Inventory::Available(servers) => {
-            let s = servers.into_iter().find(|s| s.name == name)?;
-            if s.command.is_empty() {
-                return None; // non-stdio / HTTP / unsupported → not discoverable
+        // codex is AUTHORITATIVE: it tells us the transport, so we can distinguish
+        // stdio from HTTP/SSE without a second guess.
+        Inventory::Available(servers) => match servers.into_iter().find(|s| s.name == name) {
+            None => ServerLookup::Unknown,
+            Some(s) if !s.command.is_empty() => {
+                ServerLookup::Stdio(crate::tool_discovery::ServerSpec {
+                    name: s.name,
+                    command: s.command,
+                    args: s.args,
+                    env: s.env,
+                    cwd: s.cwd,
+                })
             }
-            Some(crate::tool_discovery::ServerSpec {
-                name: s.name,
-                command: s.command,
-                args: s.args,
-                env: s.env,
-                cwd: s.cwd,
-            })
-        }
-        // codex couldn't be queried → best-effort direct config read.
-        Inventory::Unavailable(_) => {
-            let s = codex_config_path().and_then(|p| std::fs::read_to_string(p).ok())?;
-            let parsed: toml::Value = toml::from_str(&s).ok()?;
-            let def = parsed.get("mcp_servers")?.as_table()?.get(name)?;
-            let command = def.get("command")?.as_str()?.to_string();
-            let args = def
-                .get("args")
-                .and_then(|v| v.as_array())
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default();
-            let env = def
-                .get("env")
+            Some(s) => ServerLookup::NonStdio {
+                transport: if s.transport.is_empty() {
+                    "non-stdio".to_string()
+                } else {
+                    s.transport
+                },
+            },
+        },
+        // codex couldn't be queried → best-effort direct config read. The config file
+        // doesn't carry the transport type explicitly, so we infer: `command` present
+        // ⇒ stdio; `url` present and no `command` ⇒ HTTP-like (Unknown transport name
+        // since the file doesn't say). Falling through to Unknown when neither is
+        // present matches the original `server_spec` semantics.
+        Inventory::Unavailable(why) => {
+            let Some(s) = codex_config_path().and_then(|p| std::fs::read_to_string(p).ok()) else {
+                return ServerLookup::Unavailable(why);
+            };
+            let Ok(parsed) = toml::from_str::<toml::Value>(&s) else {
+                return ServerLookup::Unavailable(why);
+            };
+            let Some(def) = parsed
+                .get("mcp_servers")
                 .and_then(|v| v.as_table())
-                .map(|t| {
-                    t.iter()
-                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                        .collect()
+                .and_then(|t| t.get(name))
+            else {
+                return ServerLookup::Unknown;
+            };
+            if let Some(command) = def.get("command").and_then(|v| v.as_str()) {
+                let args = def
+                    .get("args")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let env = def
+                    .get("env")
+                    .and_then(|v| v.as_table())
+                    .map(|t| {
+                        t.iter()
+                            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let cwd = def.get("cwd").and_then(|v| v.as_str()).map(str::to_string);
+                ServerLookup::Stdio(crate::tool_discovery::ServerSpec {
+                    name: name.to_string(),
+                    command: command.to_string(),
+                    args,
+                    env,
+                    cwd,
                 })
-                .unwrap_or_default();
-            let cwd = def.get("cwd").and_then(|v| v.as_str()).map(str::to_string);
-            Some(crate::tool_discovery::ServerSpec {
-                name: name.to_string(),
-                command,
-                args,
-                env,
-                cwd,
-            })
+            } else if def.get("url").and_then(|v| v.as_str()).is_some() {
+                ServerLookup::NonStdio {
+                    transport: "non-stdio".to_string(),
+                }
+            } else {
+                ServerLookup::Unknown
+            }
         }
     }
 }
@@ -865,12 +920,29 @@ pub fn cached_tool_states(server: &str) -> Option<CachedTools> {
     Some(CachedTools { tools, fresh })
 }
 
+/// The user-facing error string for the NonStdio branch of `discover_server`. Pure +
+/// unit-tested so a future tweak (wording / pluralization) can't break the contract
+/// the TUI relies on (names the server, names the transport, points to the workaround).
+pub(crate) fn nonstdio_discovery_error(server: &str, transport: &str) -> String {
+    format!(
+        "'{server}' uses transport '{transport}' — tool discovery requires stdio; \
+         the server-level toggle on the previous view still applies during reviews"
+    )
+}
+
 /// DISCOVER (launch) a server's tools + cache them — for the TUI's explicit 'd' key.
-/// Slow/networked; the TUI runs it on a background thread.
+/// Slow/networked; the TUI runs it on a background thread. Returns a transport-aware
+/// error when the server is configured but uses a non-stdio transport (HTTP/SSE) so
+/// the user sees WHY discovery isn't available rather than the misleading v1 "is not
+/// a codex MCP server" (Codex finding — context7 on macOS).
 pub fn discover_server(server: &str) -> Result<Vec<String>, String> {
-    let spec =
-        server_spec(server).ok_or_else(|| format!("'{server}' is not a codex MCP server"))?;
-    crate::tool_discovery::discover_and_cache(&spec).map_err(|e| format!("discovery failed: {e}"))
+    match server_lookup(server) {
+        ServerLookup::Stdio(spec) => crate::tool_discovery::discover_and_cache(&spec)
+            .map_err(|e| format!("discovery failed: {e}")),
+        ServerLookup::NonStdio { transport } => Err(nonstdio_discovery_error(server, &transport)),
+        ServerLookup::Unknown => Err(format!("'{server}' is not a codex MCP server")),
+        ServerLookup::Unavailable(why) => Err(format!("codex inventory unavailable: {why}")),
+    }
 }
 
 /// Toggle ONE tool using the FRESH cache (NO relaunch — for interactive toggling).
@@ -1000,6 +1072,93 @@ enabled = false
         // subset / superset behavior.
         assert!(covers_all(&[s("a")], &[s("a"), s("b")]));
         assert!(!covers_all(&[s("a"), s("b")], &[s("a")]));
+    }
+
+    /// Helper: synthesise the `ServerLookup::Stdio` / `NonStdio` branch from a parsed
+    /// `CodexServer`. Mirrors the `Inventory::Available` arm of `server_lookup` but
+    /// without touching the real codex CLI (so the unit test is hermetic).
+    fn lookup_from_codex_server(s: CodexServer) -> ServerLookup {
+        if !s.command.is_empty() {
+            ServerLookup::Stdio(crate::tool_discovery::ServerSpec {
+                name: s.name,
+                command: s.command,
+                args: s.args,
+                env: s.env,
+                cwd: s.cwd,
+            })
+        } else {
+            ServerLookup::NonStdio {
+                transport: if s.transport.is_empty() {
+                    "non-stdio".to_string()
+                } else {
+                    s.transport
+                },
+            }
+        }
+    }
+
+    #[test]
+    fn server_lookup_distinguishes_http() {
+        // A `streamable_http` server in codex's inventory has an empty `command`. The
+        // lookup must surface that as `NonStdio { transport: "streamable_http" }`
+        // (NOT the v1 misleading "is not a codex MCP server").
+        let http_v = json!({
+            "name": "context7",
+            "enabled": true,
+            "transport": {"type": "streamable_http", "url": "https://mcp.context7.com/mcp"}
+        });
+        let parsed = parse_codex_server(&http_v).expect("parses");
+        match lookup_from_codex_server(parsed) {
+            ServerLookup::NonStdio { transport } => assert_eq!(transport, "streamable_http"),
+            other => panic!("expected NonStdio, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn server_lookup_stdio_returns_spec() {
+        let stdio_v = json!({
+            "name": "fs",
+            "transport": {"type": "stdio", "command": "npx", "args": ["@anthropic/mcp-fs"]}
+        });
+        let parsed = parse_codex_server(&stdio_v).expect("parses");
+        match lookup_from_codex_server(parsed) {
+            ServerLookup::Stdio(spec) => {
+                assert_eq!(spec.name, "fs");
+                assert_eq!(spec.command, "npx");
+                assert_eq!(spec.args, vec!["@anthropic/mcp-fs"]);
+            }
+            other => panic!("expected Stdio, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn server_lookup_unknown_transport_falls_back_to_generic_label() {
+        // A transport-less / unparsed server reaches the NonStdio branch with the
+        // synthesized "non-stdio" label rather than an empty string.
+        let weird = json!({"name": "weird", "transport": null});
+        let parsed = parse_codex_server(&weird).expect("parses");
+        match lookup_from_codex_server(parsed) {
+            ServerLookup::NonStdio { transport } => assert_eq!(transport, "non-stdio"),
+            other => panic!("expected NonStdio, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn discover_server_http_error_message_mentions_transport() {
+        // Calls the SAME formatter the production path uses — so a future wording
+        // change is caught here rather than at runtime. Regression for the misleading
+        // v1 "is not a codex MCP server" on HTTP-transport servers.
+        let err = nonstdio_discovery_error("context7", "streamable_http");
+        assert!(err.contains("'context7'"), "names the server");
+        assert!(err.contains("streamable_http"), "names the transport");
+        assert!(
+            err.contains("server-level toggle"),
+            "guides the user to the workaround"
+        );
+        assert!(
+            !err.contains("is not a codex MCP server"),
+            "must NOT regress to the v1 misleading wording"
+        );
     }
 
     #[test]
