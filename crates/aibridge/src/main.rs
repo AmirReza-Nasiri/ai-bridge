@@ -123,6 +123,43 @@ enum SkillsAction {
         #[arg(long)]
         apply: bool,
     },
+    /// Bridge-managed skills: declare a pinned set in a manifest, fetch them once, and
+    /// mirror into BOTH Claude + Codex skill dirs (shareable across machines).
+    Managed {
+        #[command(subcommand)]
+        action: ManagedAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ManagedAction {
+    /// Write a starter manifest (`~/.ai-bridge/skills-managed.toml`) — nothing installs.
+    Init,
+    /// OFFLINE: show each managed skill's status (manifest vs lock vs filesystem).
+    Plan,
+    /// Fetch + install/update managed skills (the only command that touches the network).
+    Apply {
+        /// Apply one skill by name (default: all enabled skills).
+        name: Option<String>,
+        /// Re-mirror a skill whose mirror was hand-edited (discards those edits).
+        #[arg(long)]
+        repair: bool,
+        /// Take over a same-named foreign skill folder whose content is byte-identical.
+        #[arg(long)]
+        adopt: bool,
+    },
+    /// OFFLINE: same as `plan` (alias kept for muscle memory).
+    Doctor,
+    /// Remove a managed skill's mirrors from both CLI dirs (keeps the source + lock).
+    Disable {
+        /// The managed skill name.
+        name: String,
+    },
+    /// Fully remove a managed skill (mirrors if owned + source folder + lock entry).
+    Remove {
+        /// The managed skill name.
+        name: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -211,6 +248,43 @@ fn main() -> Result<()> {
                 SkillsAction::Sync { apply } => println!("{}", aibridge_core::skills::sync(apply)),
                 SkillsAction::Migrate { apply } => {
                     println!("{}", aibridge_core::skills::migrate(apply))
+                }
+                SkillsAction::Managed { action } => {
+                    use aibridge_core::managed_skills as ms;
+                    // init/plan/doctor are read-only (always ok); apply/disable/remove report
+                    // ok=false on a partial → the CLI exits non-zero (for scripts/CI).
+                    let res = match action {
+                        ManagedAction::Init => ms::OpResult {
+                            message: ms::init(),
+                            ok: true,
+                        },
+                        ManagedAction::Plan => ms::OpResult {
+                            message: ms::plan(),
+                            ok: true,
+                        },
+                        ManagedAction::Doctor => ms::OpResult {
+                            message: ms::doctor(),
+                            ok: true,
+                        },
+                        ManagedAction::Apply {
+                            name,
+                            repair,
+                            adopt,
+                        } => ms::apply(
+                            match name {
+                                Some(n) => ms::Target::One(n),
+                                None => ms::Target::All,
+                            },
+                            repair,
+                            adopt,
+                        ),
+                        ManagedAction::Disable { name } => ms::disable(&name),
+                        ManagedAction::Remove { name } => ms::remove(&name),
+                    };
+                    println!("{}", res.message);
+                    if !res.ok {
+                        std::process::exit(1);
+                    }
                 }
             }
             Ok(())

@@ -6,6 +6,42 @@ versioning is semver.
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-05-25
+
+### Added — `aibridge skills managed`: Bridge-owned, pinned, shareable skill provisioning (peer-reviewed by Codex, 4 rounds → APPROVE)
+
+- **Declare a curated set of Agent Skills ONCE in a manifest; the Bridge fetches them at pinned
+  versions into a folder it owns and MIRRORS them into BOTH `~/.claude/skills` (Claude Code) and
+  `~/.agents/skills` (Codex + the Bridge's reviews) — so one definition serves both CLIs, and a
+  committed manifest serves both developers' machines.** Motivated by wanting react-doctor (and skills
+  like it) available to both tools without per-machine manual installs.
+- **Three-folder model (resolves the ownership/drift problem):** the source of truth is a THIRD folder
+  `~/.ai-bridge/skills/<name>` that no CLI reads; mirrors are byte-for-byte copies. A lockfile records
+  the digest the Bridge wrote, so it can PROVE which mirror folders are its own and NEVER clobbers a
+  user's hand-made skill.
+- **Commands:** `managed init` (writes a disabled, all-commented starter manifest — nothing installs),
+  `managed plan`/`managed doctor` (OFFLINE status: manifest vs lock vs filesystem; the recovery surface
+  after an interrupted apply), `managed apply [name] [--repair] [--adopt]` (the ONLY networked command:
+  fetch + install/update; `--repair` overwrites an owned-but-hand-edited mirror, `--adopt` takes over a
+  byte-identical foreign folder — independent flags), `managed disable <name>` (remove the Bridge's own
+  mirrors, keep the source + lock), `managed remove <name>` (remove owned mirrors + source + lock entry).
+- **In `aibridge status` (Skills tab):** the offline managed status is shown; `i` = apply ALL managed
+  skills, run on a background thread (the only networked managed action, off the event loop) behind a
+  2-key confirm. Server/status rendering stays fully offline.
+- **Safety (hard guarantees, Codex-vetted across 4 rounds):** git sources are PINNED to a full 40-hex
+  commit SHA only (no short SHAs, no branch/tag tracking; exact `rev-parse HEAD` check); `status`/`plan`
+  are OFFLINE (network only in `apply`); v1 NEVER executes skill tooling (no `npx … install`, no test
+  command — verification is filesystem-only); a digest-bound transaction journal makes a mid-apply crash
+  detectable and idempotently repairable (a post-crash user edit, a 3rd digest, is NOT silently
+  overwritten); the lockfile is persisted BEFORE the journal is cleared, per skill; a heartbeated process
+  lock prevents concurrent applies from racing (a live long apply is never falsely reaped; a crashed
+  owner is reaped after 5 min); skill names are cross-platform-hardened (no traversal, no trailing dot,
+  no Windows reserved devices, case-insensitive de-dup); fetched content with any symlink is refused;
+  git runs with interactive auth disabled + a 120s timeout. `disable`/`remove`/`apply` exit non-zero on
+  a partial (e.g. a kept hand-edited mirror is reported LOUDLY as still visible).
+- **No hardcoding:** the starter manifest ships only disabled, commented examples; react-doctor appears
+  only as a comment, never special-cased in code.
+
 ## [0.14.0] - 2026-05-25
 
 ### Added (review-feed audit) + architecture freeze

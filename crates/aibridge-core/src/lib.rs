@@ -10,6 +10,7 @@ pub mod gate;
 pub mod git;
 pub mod health;
 pub mod install;
+pub mod managed_skills;
 pub mod mcp;
 pub mod optimizer;
 pub mod plan_gate;

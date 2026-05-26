@@ -37,7 +37,7 @@ pub enum Root {
 }
 
 impl Root {
-    fn path(self) -> Option<PathBuf> {
+    pub(crate) fn path(self) -> Option<PathBuf> {
         let h = home()?;
         Some(match self {
             Root::Claude => h.join(".claude").join("skills"),
@@ -198,7 +198,7 @@ fn collect_files(base: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
 /// SHA-256 over a directory's WHOLE content (every included file's relpath + bytes,
 /// sorted) — so drift detection catches changed scripts/assets/templates/dotfiles, not
 /// just `SKILL.md`. Stable across runs/platforms. A missing/empty dir → fixed digest.
-fn dir_digest(dir: &Path) -> String {
+pub(crate) fn dir_digest(dir: &Path) -> String {
     use sha2::{Digest, Sha256};
     let mut files: Vec<(String, PathBuf)> = Vec::new();
     collect_files(dir, dir, &mut files);
@@ -380,7 +380,7 @@ fn copy_skill_atomic(src: &Path, to_dir: &Path, name: &str) -> std::io::Result<(
 /// Recursively copy `src` dir into `dst` (must not exist). Skips the SAME housekeeping
 /// the digest ignores ([`ignored_inside_skill`]) so copy + drift-detection never disagree.
 /// Best-effort; returns the first IO error.
-fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
+pub(crate) fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dst)?;
     for ent in std::fs::read_dir(src)? {
         let ent = ent?;

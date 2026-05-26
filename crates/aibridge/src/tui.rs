@@ -105,9 +105,13 @@ struct App {
     /// until first viewed so startup stays snappy (the digest reads many skill files).
     skills_report: Option<String>,
     skills_scroll: u16,
-    /// Pending 2-key confirm for a MUTATING Skills action (`Some('s')`/`Some('m')`):
-    /// the action only runs on the SECOND matching press; any other key cancels it.
+    /// Pending 2-key confirm for a MUTATING Skills action (`Some('s')`/`Some('m')`/
+    /// `Some('i')`): the action only runs on the SECOND matching press; any other key
+    /// cancels it.
     skills_confirm: Option<char>,
+    /// In-flight `managed apply` (background thread → channel) so the network fetch never
+    /// blocks the event loop; the result line folds back into the footer.
+    managed_apply_rx: Option<std::sync::mpsc::Receiver<String>>,
     message: Option<String>,
     quit: bool,
 }
@@ -137,6 +141,7 @@ impl App {
             skills_report: None,
             skills_scroll: 0,
             skills_confirm: None,
+            managed_apply_rx: None,
             message: None,
             quit: false,
         };
@@ -145,8 +150,48 @@ impl App {
     }
 
     /// (Re)compute the Skills doctor report (folder digests → not on the fast tick).
+    /// Includes the OFFLINE managed-skills status section.
     fn refresh_skills(&mut self) {
-        self.skills_report = Some(skills::doctor());
+        self.skills_report = Some(format!(
+            "{}\n\n{}",
+            skills::doctor(),
+            aibridge_core::managed_skills::doctor()
+        ));
+    }
+
+    /// Start a background `managed apply` (ALL enabled skills). This is the one networked
+    /// managed action (git fetch), so it runs off the event loop. Idempotent in flight.
+    fn start_managed_apply(&mut self) {
+        if self.managed_apply_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.managed_apply_rx = Some(rx);
+        self.message = Some("Applying managed skills (fetching pinned sources)...".into());
+        std::thread::spawn(move || {
+            let r = aibridge_core::managed_skills::apply(
+                aibridge_core::managed_skills::Target::All,
+                false,
+                false,
+            );
+            let _ = tx.send(r.message);
+        });
+    }
+
+    /// Poll the in-flight managed apply; on completion refresh the report + surface a line.
+    fn poll_managed_apply(&mut self) {
+        if let Some(rx) = &self.managed_apply_rx {
+            if let Ok(out) = rx.try_recv() {
+                self.managed_apply_rx = None;
+                self.refresh_skills();
+                let key = out
+                    .lines()
+                    .find(|l| l.contains(" : "))
+                    .map(|l| l.trim().to_string())
+                    .unwrap_or_else(|| "managed apply: done".into());
+                self.message = Some(format!("managed apply done — {key} (reload Claude/Codex)"));
+            }
+        }
     }
 
     /// 2-key confirm gate for a mutating Skills action: returns true (and clears) on the
@@ -507,6 +552,7 @@ fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
         }
         app.poll_update(); // fold in a finished background update-check
         app.poll_discover(); // fold in a finished background tool-discovery
+        app.poll_managed_apply(); // fold in a finished background managed-skills apply
         if app.tab == Tab::Skills && app.skills_report.is_none() {
             app.refresh_skills(); // lazy first compute (folder digests) on first view
         }
@@ -522,8 +568,11 @@ fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
 fn handle_key(app: &mut App, code: KeyCode) {
     let in_tools = app.tab == Tab::Mcp && app.mcp_view == McpView::Tools;
     // Any key that ISN'T the matching 2nd press of a Skills mutate-confirm cancels it.
-    let is_skills_mutate =
-        app.tab == Tab::Skills && matches!(code, KeyCode::Char('s') | KeyCode::Char('m'));
+    let is_skills_mutate = app.tab == Tab::Skills
+        && matches!(
+            code,
+            KeyCode::Char('s') | KeyCode::Char('m') | KeyCode::Char('i')
+        );
     if !is_skills_mutate {
         app.skills_confirm = None;
     }
@@ -579,6 +628,16 @@ fn handle_key(app: &mut App, code: KeyCode) {
                 );
             }
         }
+        // Managed skills: 'i' = apply ALL (fetch pinned sources + mirror) → 2-key confirm.
+        KeyCode::Char('i') if app.tab == Tab::Skills => {
+            if app.skills_confirm_press('i') {
+                app.start_managed_apply();
+            } else {
+                app.message = Some(
+                    "Press i again to INSTALL/UPDATE all managed skills (fetches pinned sources); any other key cancels".into(),
+                );
+            }
+        }
         KeyCode::Char('r') => {
             app.refresh_all();
             if app.tab == Tab::Skills {
@@ -621,7 +680,7 @@ fn ui(f: &mut Frame, app: &App) {
         }
         Tab::Health => "Tab/Left/Right: tabs | Up/Down: scroll | r: refresh | q: quit",
         Tab::Skills => {
-            "Tab/Left/Right: tabs | Up/Down: scroll | s: sync | m: migrate | r: refresh | q: quit"
+            "Tab/Left/Right: tabs | Up/Down: scroll | s: sync | m: migrate | i: apply managed | r: refresh | q: quit"
         }
         Tab::Review => "Tab/Left/Right: tabs | r: refresh | q: quit (auto-refreshes ~1s)",
         Tab::Update => {
@@ -640,14 +699,13 @@ fn render_skills(f: &mut Frame, app: &App, area: Rect) {
         .skills_report
         .as_deref()
         .unwrap_or("Loading skills report (digesting skill folders)...");
-    let p = Paragraph::new(body)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Skills — Claude Code + Codex  (s: sync claude->agents; m: migrate legacy)"),
-        )
-        .wrap(Wrap { trim: false })
-        .scroll((app.skills_scroll, 0));
+    let p =
+        Paragraph::new(body)
+            .block(Block::default().borders(Borders::ALL).title(
+                "Skills — Claude Code + Codex  (s: sync; m: migrate; i: apply managed [all])",
+            ))
+            .wrap(Wrap { trim: false })
+            .scroll((app.skills_scroll, 0));
     f.render_widget(p, area);
 }
 
@@ -876,6 +934,7 @@ mod tests {
             skills_report: None,
             skills_scroll: 0,
             skills_confirm: None,
+            managed_apply_rx: None,
             mcp: Some(
                 names
                     .iter()
