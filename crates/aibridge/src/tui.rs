@@ -152,6 +152,20 @@ struct App {
     update_line: String,
     update_rx: Option<std::sync::mpsc::Receiver<String>>,
     update_on_exit: bool,
+    /// CLI-update rows (codex / claude / rtk). Loaded on a background thread the
+    /// first time the Update tab is entered and on `r`. Each row drives `u` in
+    /// concert with `update_sel`. Codex Stop-gate R6: mutation runs AFTER TUI
+    /// exit via `pending_cli_updates`; never inside the alt-screen.
+    cli_checks: Vec<aibridge_core::cli_update::CliCheck>,
+    cli_checks_rx: Option<std::sync::mpsc::Receiver<Vec<aibridge_core::cli_update::CliCheck>>>,
+    /// MCP version-pin status (read-only). Loaded alongside `cli_checks`.
+    mcp_pins: Vec<aibridge_core::cli_update::McpVersionStatus>,
+    /// Selected row on the Update tab. Index space is: 0=SelfAibridge, 1..=cli,
+    /// remaining=MCP pins.
+    update_sel: usize,
+    /// Mutating CLI commands queued by `u` on a CLI row; drained AFTER the TUI
+    /// exits (mirrors `update_on_exit` for the aibridge self-update).
+    pending_cli_updates: Vec<aibridge_core::cli_update::CliCheck>,
     /// Skills tab: the (lazily-computed) personal-skills `skills::doctor()` text. Kept
     /// for backward-compat with the Health rendering; managed-skills now own the tab UI.
     skills_report: Option<String>,
@@ -232,6 +246,11 @@ impl App {
             update_line: "Press 'c' to check for a newer release.".to_string(),
             update_rx: None,
             update_on_exit: false,
+            cli_checks: Vec::new(),
+            cli_checks_rx: None,
+            mcp_pins: Vec::new(),
+            update_sel: 0,
+            pending_cli_updates: Vec::new(),
             skills_report: None,
             skills_confirm: None,
             managed_apply_rx: None,
@@ -733,6 +752,84 @@ impl App {
                 self.update_rx = None;
             }
         }
+        if let Some(rx) = &self.cli_checks_rx {
+            if let Ok(checks) = rx.try_recv() {
+                self.cli_checks = checks;
+                self.cli_checks_rx = None;
+            }
+        }
+    }
+
+    /// Start a background CLI-checks worker (codex / claude / rtk). Read-only —
+    /// no mutation. Idempotent while one is in flight.
+    fn start_cli_checks(&mut self) {
+        if self.cli_checks_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.cli_checks_rx = Some(rx);
+        std::thread::spawn(move || {
+            let runner = aibridge_core::cli_update::RealCommandRunner;
+            let _ = tx.send(aibridge_core::cli_update::check_all(&runner));
+        });
+        // MCP pins are cheap (local config only) — load synchronously.
+        self.mcp_pins = aibridge_core::cli_update::scan_mcps(std::path::Path::new(&self.cwd));
+    }
+
+    /// Total rows on the Update tab: 1 (aibridge self) + N CLI checks + M MCP pins.
+    fn update_row_count(&self) -> usize {
+        1 + self.cli_checks.len() + self.mcp_pins.len()
+    }
+
+    /// Clamp `update_sel` into the valid range; saturate at 0 when empty.
+    fn clamp_update_sel(&mut self) {
+        let n = self.update_row_count();
+        if n == 0 {
+            self.update_sel = 0;
+        } else if self.update_sel >= n {
+            self.update_sel = n - 1;
+        }
+    }
+
+    /// Handle `u` on the Update tab. Routes by which row is selected:
+    /// - Row 0 (aibridge self) → existing `update_on_exit = true; quit = true`.
+    /// - CLI row with `suggested_command.is_some()` and verified pkg-manager
+    ///   source → enqueue into `pending_cli_updates` and exit the TUI.
+    /// - CLI row that's manual-only / unknown → show `manual_note`, no mutation.
+    /// - MCP pin row → never mutates; print a hint.
+    fn handle_update_action(&mut self) {
+        let idx = self.update_sel;
+        if idx == 0 {
+            // SelfAibridge: defer mutation to after TUI exit (existing path).
+            self.update_on_exit = true;
+            self.quit = true;
+            return;
+        }
+        let cli_idx = idx - 1;
+        if cli_idx < self.cli_checks.len() {
+            let c = &self.cli_checks[cli_idx];
+            if c.up_to_date() {
+                self.message = Some(format!("{} is up to date — nothing to do.", c.tool));
+                return;
+            }
+            if c.suggested_command.is_none() || !c.source.is_verified_pkg_manager() {
+                // Manual-only / unknown — show the hint, no mutation.
+                self.message = Some(format!(
+                    "{}: manual update — {}",
+                    c.tool,
+                    c.manual_note.as_deref().unwrap_or("see docs")
+                ));
+                return;
+            }
+            // Verified package-manager source: enqueue + exit TUI to run after-restore.
+            self.pending_cli_updates.push(c.clone());
+            self.quit = true;
+            return;
+        }
+        // Otherwise it's an MCP-pin row — read-only.
+        self.message = Some(
+            "MCP version pins are read-only in this view; edit ~/.claude.json or .mcp.json to change".into(),
+        );
     }
 
     /// Full refresh (startup + `r`): runs the doctor checks (no network), reloads the
@@ -827,7 +924,11 @@ impl App {
                     self.managed_sel += 1;
                 }
             }
-            Tab::Review | Tab::Update => {}
+            Tab::Update => {
+                self.update_sel = self.update_sel.saturating_add(1);
+                self.clamp_update_sel();
+            }
+            Tab::Review => {}
         }
     }
     fn move_up(&mut self) {
@@ -843,7 +944,8 @@ impl App {
             Tab::Health => self.health_scroll = self.health_scroll.saturating_sub(1),
             Tab::Debug => self.debug_scroll = self.debug_scroll.saturating_sub(1),
             Tab::Skills => self.managed_sel = self.managed_sel.saturating_sub(1),
-            Tab::Review | Tab::Update => {}
+            Tab::Update => self.update_sel = self.update_sel.saturating_sub(1),
+            Tab::Review => {}
         }
     }
     fn selected_mcp(&self) -> Option<(&str, bool)> {
@@ -1042,6 +1144,43 @@ pub fn run() -> Result<()> {
             Err(e) => eprintln!("AI Bridge update: {e}"),
         }
     }
+    // Codex Stop-gate R6: mutating CLI commands run in the RESTORED terminal so
+    // brew/npm progress + prompts are visible. Each pending row gets a default-no
+    // confirmation; the user can cancel any single row without aborting the batch.
+    if res.is_ok() && !app.pending_cli_updates.is_empty() {
+        use aibridge_core::cli_update::{apply_cli_update, prompt_parse};
+        use std::io::{BufRead, IsTerminal, Write};
+        println!("\nApplying selected CLI updates:");
+        let is_tty = std::io::stdin().is_terminal();
+        for c in &app.pending_cli_updates {
+            let Some(argv) = &c.suggested_command else {
+                continue;
+            };
+            print!(
+                "  [{tool}] run `{cmd}` ? [y/N] ",
+                tool = c.tool,
+                cmd = argv.join(" ")
+            );
+            let _ = std::io::stdout().flush();
+            let accept = if is_tty {
+                let mut line = String::new();
+                let _ = std::io::stdin().lock().read_line(&mut line);
+                prompt_parse(&line)
+            } else {
+                println!("(non-tty — declined)");
+                false
+            };
+            if !accept {
+                println!("    declined.");
+                continue;
+            }
+            match apply_cli_update(argv) {
+                Ok(0) => println!("    [{tool}] success.", tool = c.tool),
+                Ok(code) => eprintln!("    [{tool}] exited with code {code}", tool = c.tool),
+                Err(e) => eprintln!("    [{tool}] failed: {e}", tool = c.tool),
+            }
+        }
+    }
     res
 }
 
@@ -1071,6 +1210,9 @@ fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
         }
         if app.tab == Tab::Debug && app.debug_text.is_none() && app.debug_rx.is_none() {
             app.start_debug_build(); // lazy first build on first view
+        }
+        if app.tab == Tab::Update && app.cli_checks.is_empty() && app.cli_checks_rx.is_none() {
+            app.start_cli_checks(); // lazy first run on first view
         }
         // Live-refresh the (cheap) review status ~1s; heavy refresh only on `r`.
         if last_refresh.elapsed() >= Duration::from_secs(1) {
@@ -1177,10 +1319,9 @@ fn handle_key(app: &mut App, code: KeyCode) {
         }
         KeyCode::Char('c') if app.tab == Tab::Update => app.start_update_check(),
         KeyCode::Char('u') if app.tab == Tab::Update => {
-            // The actual self-replace runs after the TUI exits (clean terminal + real
-            // output), so it can't corrupt the alternate screen or the running binary.
-            app.update_on_exit = true;
-            app.quit = true;
+            // Per-row dispatch: self vs verified-pkg-manager CLI vs manual-only.
+            // Mutation (any case) defers to after-TUI-exit per Codex Stop-gate R6.
+            app.handle_update_action();
         }
         // Skills tab: sync (s) / migrate (m) MUTATE the filesystem → 2-key confirm.
         KeyCode::Char('s') if app.tab == Tab::Skills => {
@@ -1341,6 +1482,11 @@ fn handle_key(app: &mut App, code: KeyCode) {
                 app.debug_text = None;
                 app.start_debug_build();
             }
+            if app.tab == Tab::Update {
+                // Re-run the CLI-update checks (codex/claude/rtk + MCP pins).
+                app.cli_checks.clear();
+                app.start_cli_checks();
+            }
         }
         _ => {}
     }
@@ -1390,7 +1536,7 @@ fn ui(f: &mut Frame, app: &App) {
         }
         Tab::Review => "Tab/Left/Right: tabs | r: refresh | q: quit (auto-refreshes ~1s)",
         Tab::Update => {
-            "Tab/Left/Right: tabs | c: check | u: update now (exits + applies) | q: quit"
+            "↑/↓: select | c: check self | u: update selected row (exits + applies) | r: re-check CLIs | q: quit"
         }
         Tab::Debug => "Tab/Left/Right: tabs | Up/Down: scroll | r: rebuild | q: quit",
     };
@@ -1870,25 +2016,111 @@ fn render_debug(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_update(f: &mut Frame, app: &App, area: Rect) {
-    let lines = vec![
-        Line::from(format!("Installed: {}", aibridge_core::VERSION_FULL)),
-        Line::from(""),
-        Line::from(app.update_line.clone()),
-        Line::from(""),
-        Line::from(Span::styled(
-            "'c' checks the latest GitHub release (read-only). 'u' downloads + verifies + \
-             replaces this binary, then exits — restart aibridge afterwards.",
+    let mut items: Vec<ListItem> = Vec::new();
+    let sel = app.update_sel;
+
+    // Row 0: aibridge self.
+    let row0 = format!("  [aibridge]  installed {}", aibridge_core::VERSION_FULL);
+    items.push(stylize_update_row(row0, sel == 0));
+    if !app.update_line.is_empty() {
+        items.push(ListItem::new(Line::from(Span::styled(
+            format!("              {}", app.update_line),
             Style::default().fg(Color::DarkGray),
-        )),
-    ];
-    let p = Paragraph::new(lines)
-        .block(
+        ))));
+    }
+
+    // CLI checks.
+    items.push(ListItem::new(Line::from("")));
+    items.push(ListItem::new(Line::from(Span::styled(
+        "CLI updates (codex / claude / rtk)",
+        Style::default().fg(Color::DarkGray),
+    ))));
+    if app.cli_checks.is_empty() {
+        items.push(ListItem::new(Line::from(Span::styled(
+            "  (loading…)",
+            Style::default().fg(Color::DarkGray),
+        ))));
+    }
+    for (i, c) in app.cli_checks.iter().enumerate() {
+        let row_idx = 1 + i;
+        let cur = c
+            .current
+            .as_ref()
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "?".into());
+        let latest = c
+            .latest
+            .as_ref()
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "?".into());
+        let status = if c.up_to_date() {
+            format!("up-to-date  ({cur})")
+        } else {
+            format!("{cur} → {latest}")
+        };
+        let line = format!(
+            "  [{tool}]  {status}  via {src}",
+            tool = c.tool,
+            src = c.source.label()
+        );
+        items.push(stylize_update_row(line, sel == row_idx));
+        if let Some(note) = &c.manual_note {
+            if !c.up_to_date() {
+                items.push(ListItem::new(Line::from(Span::styled(
+                    format!("              {note}"),
+                    Style::default().fg(Color::DarkGray),
+                ))));
+            }
+        }
+    }
+
+    // MCP pins.
+    if !app.mcp_pins.is_empty() {
+        items.push(ListItem::new(Line::from("")));
+        items.push(ListItem::new(Line::from(Span::styled(
+            "MCP version pins (read-only)",
+            Style::default().fg(Color::DarkGray),
+        ))));
+        for (i, p) in app.mcp_pins.iter().enumerate() {
+            let row_idx = 1 + app.cli_checks.len() + i;
+            let pin = p
+                .version_pin
+                .as_deref()
+                .map(|v| format!("pinned={v}"))
+                .unwrap_or_else(|| "auto-updates".into());
+            let line = format!(
+                "  [{agent}] {srv}  pkg={pkg}  {pin}",
+                agent = p.agent,
+                srv = p.server_name,
+                pkg = p.package.as_deref().unwrap_or("?"),
+            );
+            items.push(stylize_update_row(line, sel == row_idx));
+        }
+    }
+
+    items.push(ListItem::new(Line::from("")));
+    items.push(ListItem::new(Line::from(Span::styled(
+        "↑/↓ navigate · 'c' check self · 'u' update selected row · 'r' re-check CLIs",
+        Style::default().fg(Color::DarkGray),
+    ))));
+
+    f.render_widget(
+        List::new(items).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Update  (aibridge update)"),
-        )
-        .wrap(Wrap { trim: true });
-    f.render_widget(p, area);
+                .title("Update  (aibridge update + CLI updates)"),
+        ),
+        area,
+    );
+}
+
+fn stylize_update_row(line: String, selected: bool) -> ListItem<'static> {
+    let style = if selected {
+        Style::default().add_modifier(Modifier::REVERSED)
+    } else {
+        Style::default()
+    };
+    ListItem::new(Line::from(line)).style(style)
 }
 
 #[cfg(test)]
@@ -1914,6 +2146,11 @@ mod tests {
             update_line: String::new(),
             update_rx: None,
             update_on_exit: false,
+            cli_checks: Vec::new(),
+            cli_checks_rx: None,
+            mcp_pins: Vec::new(),
+            update_sel: 0,
+            pending_cli_updates: Vec::new(),
             skills_report: None,
             skills_confirm: None,
             managed_apply_rx: None,
@@ -1976,6 +2213,105 @@ mod tests {
         assert!(a.tab == Tab::Health); // wrap forward
         a.prev_tab();
         assert!(a.tab == Tab::Debug); // wrap backward
+    }
+
+    #[test]
+    fn update_row_count_with_only_self() {
+        let a = test_app(&[]);
+        assert_eq!(a.update_row_count(), 1); // self only, no checks loaded yet
+    }
+
+    #[test]
+    fn update_clamp_keeps_sel_in_range() {
+        let mut a = test_app(&[]);
+        a.update_sel = 99;
+        a.clamp_update_sel();
+        assert_eq!(a.update_sel, 0); // only the self row exists
+    }
+
+    #[test]
+    fn update_u_on_self_row_sets_update_on_exit() {
+        let mut a = test_app(&[]);
+        a.tab = Tab::Update;
+        a.update_sel = 0;
+        a.handle_update_action();
+        assert!(a.update_on_exit);
+        assert!(a.quit);
+        assert!(a.pending_cli_updates.is_empty());
+    }
+
+    #[test]
+    fn update_u_on_cli_row_with_manual_source_does_not_mutate() {
+        use aibridge_core::cli_update::{CliCheck, InstallSource};
+        use aibridge_core::update::parse_version;
+        let mut a = test_app(&[]);
+        a.tab = Tab::Update;
+        a.cli_checks = vec![CliCheck {
+            tool: "claude",
+            current: parse_version("2.1.146"),
+            latest: parse_version("2.1.150"),
+            source: InstallSource::NativeInstaller {
+                docs_url: "https://claude.com/download".into(),
+            },
+            suggested_command: None,
+            manual_note: Some("see https://claude.com/download".into()),
+        }];
+        a.update_sel = 1; // first CLI row
+        a.handle_update_action();
+        // No mutation queued, no exit triggered.
+        assert!(a.pending_cli_updates.is_empty());
+        assert!(!a.quit);
+        // But the user gets a footer message pointing at the docs URL.
+        let m = a.message.unwrap_or_default();
+        assert!(
+            m.contains("manual update"),
+            "footer should mention manual update: {m:?}"
+        );
+    }
+
+    #[test]
+    fn update_u_on_cli_row_with_verified_source_enqueues_and_exits() {
+        use aibridge_core::cli_update::{CliCheck, InstallSource};
+        use aibridge_core::update::parse_version;
+        let mut a = test_app(&[]);
+        a.tab = Tab::Update;
+        a.cli_checks = vec![CliCheck {
+            tool: "codex",
+            current: parse_version("0.130.0"),
+            latest: parse_version("0.132.0"),
+            source: InstallSource::Brew {
+                package: "codex".into(),
+            },
+            suggested_command: Some(vec!["brew".into(), "upgrade".into(), "codex".into()]),
+            manual_note: None,
+        }];
+        a.update_sel = 1;
+        a.handle_update_action();
+        assert!(a.quit, "should exit TUI so brew runs in restored terminal");
+        assert_eq!(a.pending_cli_updates.len(), 1);
+        assert_eq!(a.pending_cli_updates[0].tool, "codex");
+    }
+
+    #[test]
+    fn update_u_on_mcp_pin_row_does_not_mutate() {
+        use aibridge_core::cli_update::McpVersionStatus;
+        let mut a = test_app(&[]);
+        a.tab = Tab::Update;
+        a.mcp_pins = vec![McpVersionStatus {
+            agent: "claude",
+            server_name: "shadcn".into(),
+            package: Some("@some/pkg".into()),
+            version_pin: Some("1.0.0".into()),
+        }];
+        a.update_sel = 1; // first MCP-pin row (cli_checks is empty here)
+        a.handle_update_action();
+        assert!(a.pending_cli_updates.is_empty());
+        assert!(!a.quit);
+        let m = a.message.unwrap_or_default();
+        assert!(
+            m.contains("read-only"),
+            "footer should mention read-only: {m:?}"
+        );
     }
 
     #[test]

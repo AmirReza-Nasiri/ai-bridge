@@ -83,6 +83,10 @@ enum Commands {
         /// Replace this binary path instead of the auto-resolved one (advanced).
         #[arg(long)]
         target: Option<String>,
+        /// Skip the AI Bridge self-update step; only check/update the dependent CLIs
+        /// (codex, claude, rtk). Useful for periodic CLI maintenance.
+        #[arg(long = "cli-only")]
+        cli_only: bool,
     },
     /// Internal hook entry points (invoked by Claude Code hooks, not by you).
     Hook {
@@ -258,7 +262,8 @@ fn main() -> Result<()> {
             yes,
             from_source,
             target,
-        } => update_cmd(check, yes, from_source, target),
+            cli_only,
+        } => update_cmd(check, yes, from_source, target, cli_only),
         Commands::Hook { action } => match action {
             HookAction::Pretooluse => hook_pretooluse(),
             HookAction::UserPromptSubmit => hook_user_prompt_submit(),
@@ -447,30 +452,120 @@ fn update_cmd(
     yes: bool,
     from_source: bool,
     target: Option<String>,
+    cli_only: bool,
 ) -> Result<()> {
+    use aibridge_core::cli_update::{
+        apply_cli_update, check_all, decide_action, effective_mode, prompt_parse, scan_mcps,
+        Action, RealCommandRunner,
+    };
+    use std::io::{BufRead, IsTerminal, Write};
     use std::time::Duration;
     println!("AI Bridge {}\n", aibridge_core::VERSION_FULL);
-    if check_only {
-        println!(
-            "{}",
-            aibridge_core::update::check_report(Duration::from_secs(15))
+
+    // Step 1: aibridge self-update (skipped under --cli-only).
+    if !cli_only {
+        if check_only {
+            println!(
+                "{}",
+                aibridge_core::update::check_report(Duration::from_secs(15))
+            );
+        } else {
+            match aibridge_core::update::apply_update(aibridge_core::update::ApplyOptions {
+                assume_yes: yes,
+                from_source,
+                target_path: target,
+            }) {
+                Ok(msg) => println!("{msg}"),
+                Err(msg) => {
+                    eprintln!("AI Bridge update: {msg}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        println!();
+    }
+
+    // Step 2: dependent-CLI checks.
+    let mode = effective_mode(check_only, yes, std::io::stdin().is_terminal());
+    println!("CLI updates (mode: {mode:?})");
+    let runner = RealCommandRunner;
+    let checks = check_all(&runner);
+    let mut pending_runs: Vec<(String /* tool */, Vec<String> /* argv */)> = Vec::new();
+    let mut prompts: Vec<(String, Vec<String>, String)> = Vec::new();
+
+    for c in &checks {
+        let action = decide_action(c, mode);
+        match action {
+            Action::Skip { reason } => println!("  [{tool}] {reason}", tool = c.tool),
+            Action::Prompt { argv, summary } => {
+                prompts.push((c.tool.to_string(), argv, summary));
+            }
+            Action::Run { argv, summary } => {
+                println!("  [{tool}] {summary}", tool = c.tool);
+                pending_runs.push((c.tool.to_string(), argv));
+            }
+        }
+    }
+
+    // Step 3: process interactive prompts (TTY only — non-TTY became Check via
+    // effective_mode and never gets here).
+    for (tool, argv, summary) in prompts {
+        print!(
+            "  [{tool}] {summary}  Run `{cmd}` ? [y/N] ",
+            cmd = argv.join(" ")
         );
-        return Ok(());
-    }
-    match aibridge_core::update::apply_update(aibridge_core::update::ApplyOptions {
-        assume_yes: yes,
-        from_source,
-        target_path: target,
-    }) {
-        Ok(msg) => {
-            println!("{msg}");
-            Ok(())
-        }
-        Err(msg) => {
-            eprintln!("AI Bridge update: {msg}");
-            std::process::exit(1);
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        let _ = std::io::stdin().lock().read_line(&mut line);
+        if prompt_parse(&line) {
+            pending_runs.push((tool, argv));
+        } else {
+            println!("    declined.");
         }
     }
+
+    // Step 4: actually run the accepted commands. Each uses inherited stdio so
+    // brew/npm progress + prompts appear in real time.
+    let mut any_failed = false;
+    for (tool, argv) in pending_runs {
+        println!("\n  [{tool}] running: {}", argv.join(" "));
+        match apply_cli_update(&argv) {
+            Ok(0) => println!("  [{tool}] success."),
+            Ok(code) => {
+                eprintln!("  [{tool}] exited with code {code}");
+                any_failed = true;
+            }
+            Err(e) => {
+                eprintln!("  [{tool}] failed to spawn: {e}");
+                any_failed = true;
+            }
+        }
+    }
+
+    // Step 5: MCP pins summary (read-only — never prompts).
+    let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+    let pins = scan_mcps(&cwd);
+    if !pins.is_empty() {
+        println!("\nMCP version pins:");
+        for p in &pins {
+            let pin = p
+                .version_pin
+                .as_deref()
+                .map(|v| format!("pinned={v}"))
+                .unwrap_or_else(|| "unpinned (auto-updates at next launch)".to_string());
+            println!(
+                "  - [{agent}] {server} package={pkg} {pin}",
+                agent = p.agent,
+                server = p.server_name,
+                pkg = p.package.as_deref().unwrap_or("?"),
+            );
+        }
+    }
+
+    if any_failed {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 fn hook_pretooluse() -> Result<()> {

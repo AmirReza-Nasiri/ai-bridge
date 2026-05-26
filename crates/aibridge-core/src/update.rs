@@ -85,18 +85,19 @@ pub enum ReleaseLookup {
     Timeout,
 }
 
-/// Run a command with a hard timeout, capturing stdout/stderr. Reader threads
-/// drain the pipes (so a chatty child can't deadlock on a full pipe), the child
-/// is polled to the deadline, and killed if it overruns. `gh` is run with prompts
-/// disabled so it can never block waiting for interactive input.
-fn run_with_timeout(
-    prog: &str,
-    args: &[&str],
+/// Run a prebuilt `Command` with a hard timeout, capturing stdout/stderr. Reader
+/// threads drain the pipes (so a chatty child can't deadlock on a full pipe), the
+/// child is polled to the deadline, and killed if it overruns. The caller is
+/// responsible for setting program/args; this helper adds null stdin, piped
+/// stdout/stderr, sane env (NO_COLOR, GH_PROMPT_DISABLED so `gh` can't prompt),
+/// and the Windows no-console flag. Used by both `update.rs` (legacy text-arg
+/// shortcut) and `cli_update.rs` (which builds Commands via the platform layer
+/// to handle Windows `.cmd` shims correctly).
+pub(crate) fn run_command_with_timeout(
+    mut builder: Command,
     timeout: Duration,
 ) -> Result<std::process::Output, std::io::Error> {
-    let mut builder = Command::new(prog);
     builder
-        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -149,6 +150,20 @@ fn run_with_timeout(
             }
         }
     }
+}
+
+/// Thin wrapper around [`run_command_with_timeout`] for the common case where the
+/// program is on PATH and there's no Windows-shim concern (e.g. `gh`, `curl`).
+/// New code that may need to invoke `.cmd`/`.bat` shims (npm, npx) should resolve
+/// via the platform layer and call `run_command_with_timeout` directly.
+fn run_with_timeout(
+    prog: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<std::process::Output, std::io::Error> {
+    let mut builder = Command::new(prog);
+    builder.args(args);
+    run_command_with_timeout(builder, timeout)
 }
 
 /// Look up the latest stable release for the configured repo via

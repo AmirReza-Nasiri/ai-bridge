@@ -6,6 +6,27 @@ versioning is semver.
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-05-26
+
+### Added — CLI-update awareness in `aibridge update` (CLI + TUI Update tab) for codex, claude, rtk + read-only MCP version-pin scan (Codex APPROVE after 6 plan rounds)
+
+- **Per-CLI detection + interactive updates.** `aibridge update` now extends the existing self-update flow with detection of three dependent CLIs:
+  - **codex** via `npm view @openai/codex version` (npm-installed) or `brew info --json=v2 codex` (brew-installed). Update via `npm i -g @openai/codex@latest` or `brew upgrade codex`.
+  - **claude** via `npm view @anthropic-ai/claude-code version` (if npm-installed); native installer (`~/.local/bin/claude`) gets a docs-URL hint to `https://claude.com/download` — no auto-update of native installer.
+  - **rtk** via `gh api repos/rtk-ai/rtk/releases/latest --jq .tag_name`. Manual-only per existing `install::rtk_install_hint` policy (AI Bridge never auto-downloads the third-party rtk binary).
+- **Detection vs mutation: separate execution paths.** `CommandRunner` trait abstracts the detection layer (captured stdout + 5s timeout + Windows `.cmd` shim handling via the platform layer). `apply_cli_update(argv)` is the SOLE mutation path: inherited stdio so brew/npm progress + prompts are visible; no timeout. TUI mutation is deferred to AFTER `ratatui::restore()` so the alt-screen never sees package-manager output (mirrors the existing aibridge self-update pattern).
+- **Source verification beyond path patterns.** Path heuristic gives a hint (`/opt/homebrew/`, `~/.cargo/bin/`, `%APPDATA%\npm\`), then a confirmation step asks the package manager directly (`brew list <pkg>`, `npm ls -g <pkg> --depth=0`). On any uncertainty → `InstallSource::Unknown` with a `manual_note`. Cargo-installed CLIs are treated as `Unknown` because `cargo search` is not an authoritative update channel.
+- **Pinned semver checks.** Reuses `update::parse_version` so `0.10.0 > 0.9.9` is correctly detected (semver, not lexicographic). `v`-prefix stripping, prerelease rejection, scoped-npm package parsing (`@scope/pkg@1.2.3`), and `latest`/`next` keyword normalization (treated as unpinned).
+- **TUI Update tab: row model + selection state.** Aibridge self row + N CLI rows + M MCP-pin rows; `↑/↓` navigates; `u` dispatches per row: aibridge self → existing `update_on_exit`; verified CLI source → enqueue + exit (mutation in restored terminal); manual-only / Unknown → footer hint, no mutation; MCP-pin row → read-only message. `r` re-runs the background CLI checks.
+- **CLI flag matrix pinned.** `--check` (read-only, never mutates), `--cli-only` (skip aibridge self-update; only CLI prompts), `--yes` (skips prompts for VERIFIED package-manager rows only; manual-only / Unknown rows are SKIPPED under `--yes`, not failed). Non-TTY without `--yes` behaves like `--check` (non-TTY safety, prevents accidental answers via piped stdin).
+- **Read-only MCP version-pin scan.** Parses both Claude (`~/.claude.json` + project `.mcp.json`) and Codex (`codex mcp list --json`) inventories for `npx -y <pkg>` patterns; reports `pinned=X.Y.Z` (manual update suggested) or `unpinned (auto-updates at next launch)`. Surfaced in `aibridge update` output, TUI Update tab, and the Debug tab. NO auto-rewrite of pins in this release.
+- **Debug tab: current-only CLI versions + MCP pins.** New `## CLI versions (curated, current-only)` and `## MCP version pins (curated)` sections in `doctor::debug_report`. Current versions only — no network calls during Debug (use `aibridge update --check` for the latest-vs-current comparison). Both pass through the hand-rolled sanitizer.
+- **53 new tests across 3 modules.**
+  - `cli_update.rs`: 46 — pure parsers (brew/npm/npx/MCP-command-pin/effective_mode/decide_action/prompt_parse), runner-mocked detection (codex/claude/rtk), source verification (brew/npm/cargo/Unknown), apply path sanity, string-compare-trap regression (`0.10.0 > 0.9.9`).
+  - `doctor.rs`: 2 — `debug_report_cli_section_excludes_latest_lookup` (no network in Debug), `debug_report_cli_section_is_sanitized`.
+  - `tui.rs`: 5 — row count + clamp + per-row `u` dispatch (self / verified / manual / mcp-pin).
+- **Internal: `update::run_with_timeout` refactored to wrap a new `pub(crate) run_command_with_timeout(Command, Duration)` so `cli_update::RealCommandRunner` can build commands via the platform layer (correct `.cmd`/`.bat` shim handling on Windows) while sharing one timeout implementation.
+
 ## [0.18.0] - 2026-05-26
 
 ### Added — `aibridge status` dashboard: Claude MCP Inspector tab + Debug tab; fix Codex MCP HTTP-transport discovery error (Codex APPROVE after 4 plan rounds + 2 Stop-hook iteration rounds)

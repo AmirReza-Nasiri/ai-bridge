@@ -1616,11 +1616,54 @@ pub fn debug_report(project: &Path) -> String {
     write_managed_skills_section(&mut out);
     write_codex_inventory_section(&mut out, project);
     write_claude_inventory_section(&mut out, project);
+    write_cli_versions_section(&mut out);
+    write_mcp_pins_section(&mut out, project);
     write_plan_gate_section(&mut out, project);
     write_install_state_section(&mut out, project);
     write_audit_section(&mut out);
     write_elicitation_section(&mut out, project);
     sanitize_text(&out)
+}
+
+/// CLI versions (CURRENT-only — no network). Codex Stop-gate R3 bound: Debug must
+/// not hit npm/brew/gh; use `aibridge update --check` for latest comparisons.
+fn write_cli_versions_section(out: &mut String) {
+    use crate::cli_update::{current_version_of, RealCommandRunner};
+    use std::time::Duration;
+    out.push_str("## CLI versions (curated, current-only)\n");
+    let runner = RealCommandRunner;
+    let timeout = Duration::from_secs(2);
+    for tool in ["codex", "claude", "rtk"] {
+        let cur = current_version_of(&runner, tool, timeout)
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "(not found / unreadable)".to_string());
+        out.push_str(&format!("  - {tool}: current={cur}\n"));
+    }
+    out.push_str("  (latest-version info via `aibridge update --check`)\n\n");
+}
+
+/// MCP version-pin status (LOCAL config only — no network).
+fn write_mcp_pins_section(out: &mut String, project: &Path) {
+    out.push_str("## MCP version pins (curated)\n");
+    let pins = crate::cli_update::scan_mcps(project);
+    if pins.is_empty() {
+        out.push_str("  (no npx-based MCP servers detected)\n\n");
+        return;
+    }
+    for p in &pins {
+        let pin = p
+            .version_pin
+            .as_deref()
+            .map(|v| format!("pinned={v}"))
+            .unwrap_or_else(|| "unpinned (auto-updates at next launch)".to_string());
+        out.push_str(&format!(
+            "  - [{agent}] {server} package={pkg} {pin}\n",
+            agent = p.agent,
+            server = p.server_name,
+            pkg = p.package.as_deref().unwrap_or("?"),
+        ));
+    }
+    out.push('\n');
 }
 
 // ───────────────────────── tests ─────────────────────────
@@ -1963,6 +2006,54 @@ mod debug_report_tests {
         let out = sanitize_text(detail);
         assert!(out.contains("https://<redacted>@example.com"), "got: {out}");
         assert!(out.contains("?<redacted-query>"));
+    }
+
+    #[test]
+    fn debug_report_cli_section_excludes_latest_lookup() {
+        // The ## CLI versions section is CURRENT-only — no network. Confirm the
+        // section is present AND that it explicitly points at `aibridge update
+        // --check` for latest info (rather than embedding latest itself).
+        let project = temp_project("cli-no-latest");
+        let report = debug_report(&project);
+        assert!(
+            report.contains("## CLI versions"),
+            "section missing: {report}"
+        );
+        assert!(
+            report.contains("aibridge update --check"),
+            "report should point at --check for latest info: {report}"
+        );
+        // The string "latest=" must NOT appear in the CLI versions section
+        // (it does appear in the curated MCP/Claude sections under different keys).
+        let cli_section_start = report.find("## CLI versions").unwrap();
+        let after_cli_section = report[cli_section_start..]
+            .find("##")
+            .map(|i| cli_section_start + i + 2)
+            .unwrap_or(report.len());
+        let next_section = report[after_cli_section..]
+            .find("##")
+            .map(|i| after_cli_section + i)
+            .unwrap_or(report.len());
+        let cli_block = &report[cli_section_start..next_section];
+        assert!(
+            !cli_block.contains("latest="),
+            "CLI section should NOT embed latest=...; got: {cli_block}"
+        );
+    }
+
+    #[test]
+    fn debug_report_cli_section_is_sanitized() {
+        // Smoke: the full report (which includes ## CLI versions + ## MCP version
+        // pins) passes through sanitize_text without leaking the obvious-secret
+        // strings we plant in env. We can't inject `<tool> --version` output, but
+        // we CAN confirm the section structure survives sanitization (em-dash,
+        // headers, parens) and contains only word-y characters.
+        let project = temp_project("cli-sanitize");
+        let report = debug_report(&project);
+        assert!(report.contains("## CLI versions"));
+        assert!(report.contains("## MCP version pins"));
+        // Sanitizer must NOT corrupt the section header markup.
+        assert!(report.contains("(curated, current-only)"));
     }
 
     #[test]

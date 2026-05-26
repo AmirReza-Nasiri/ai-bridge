@@ -5,6 +5,7 @@
 //! [`optimizer`] hook, [`install`] wiring, [`doctor`] checks, and [`update`].
 
 pub mod claude_mcp;
+pub mod cli_update;
 pub mod codex;
 pub mod doctor;
 pub mod gate;
