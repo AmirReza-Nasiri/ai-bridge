@@ -6,6 +6,36 @@ versioning is semver.
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-05-26
+
+### Added — safe self-update process cleanup + verified rtk auto-install/update (Codex APPROVE after 7 plan rounds)
+
+- **Self-update refuses to proceed when stale `aibridge` processes hold the install path.** Before any binary replace, `update::apply_update` enumerates running `aibridge` processes via `sysinfo`, filters by canonicalized install path (case-insensitive on Windows), and aborts with a clear PID list if any same-path process is still running. Excludes: the current updater PID, the parent PID (user's shell / TUI), and any process whose exe path is unreadable (permission-denied is never killed). On Windows this fixes the silent `Access is denied (os error 5)` failure mode; on macOS it prevents the old process image from continuing to serve stale code after a successful rename. (Task A — minimum-viable integration. The full plan/apply split + CLI `--close-stale` orchestration is queued for v0.20.1.)
+- **`aibridge rtk install / update / check` subcommand** (Task B — policy change). AI Bridge now provides a verified auto-install path for the third-party rtk binary (Rust Token Killer, from `rtk-ai/rtk`). Prior `never auto-downloads rtk` invariant is replaced by:
+  - **Identity verification** before AND after install (`<rtk> --version` must contain `rtk-ai` or `Rust Token Killer` — refuses the unrelated "Rust Type Kit" `rtk` and any other binary by the same name).
+  - **SHA256 verification** against the release's `checksums.txt` (must succeed BEFORE any extraction; lowercase 64-hex digest enforced).
+  - **Archive-safety validation** before extraction: rejects path traversal (`..`), absolute paths, drive prefixes (`C:\\`), UNC paths (`\\\\server`), backslash separators (Windows-zip escape), NUL bytes, symlinks, hard links, and ambiguous matches (>1 binary in archive).
+  - **Same-directory staging** + atomic rename + backup-aside (`<install>.old.<pid>.<ts>`).
+  - **Loud rollback** on post-install identity failure (backup restored if possible; if rollback ALSO fails, the error message includes the backup path with `mv` instructions to recover manually).
+  - **Supported targets**: Windows x86_64, macOS Apple Silicon, macOS Intel. Linux is **deferred by policy** in v0.20.0 (upstream rtk assets exist; AI Bridge has not certified the Linux install path yet).
+  - **Requires `gh` (GitHub CLI)** for the asset download — same dependency as `aibridge update` self-update.
+- **`CliCheck` gains `installable: bool` field + `safe_to_auto_run()` method** (Codex R7). `installable=true` means a missing-but-installable tool (e.g. rtk not on PATH) surfaces as actionable in the Update tab instead of being filtered out as "up-to-date". `safe_to_auto_run()` accepts only verified package-manager sources (brew/npm) OR the EXACT internal command shape `[current_exe, "rtk", "install"|"update", "--yes"]` — preventing a stale-PATH `aibridge` binary from being invoked instead of the running build.
+- **`cli_update::CommandRunner::run_path(exe, args, timeout)`** new default method for executing absolute-path binaries with combined stdout+stderr capture (rtk's identity check needs both).
+- **`cli_update::PathResolver` trait + `RealPathResolver`** — testable PATH lookup; tests use `FakePathResolver` to deterministically simulate installed/not-installed states.
+- **`cli_update::apply_cli_update` absolute-path bypass** — when argv[0] is an absolute existing path, skip the PATH lookup (needed for trusted internal `current_exe` invocations on Windows where the PATH might find a different `aibridge.exe`).
+- **`cli_update::gh_latest_release_tag_raw`** preserves the raw tag string (e.g. `v0.42.0`) needed by `gh release download`.
+- **TUI Update tab** `handle_update_action` switches to `safe_to_auto_run()` so the trusted internal `aibridge rtk install --yes` form is enqueued for after-exit drainage (mutation runs in the restored terminal with inherited stdio).
+- **27 new tests** across `process_cleanup` (19) and `rtk` (~30 source + asserted in tests; checksum, asset-name, identity, archive-safety, stage-swap loud-rollback). Total: **263 passing** (was 236 in v0.19.0).
+
+### Internal
+- New `sysinfo`, `zip`, `tar`, `flate2` deps in `aibridge-core` (process enumeration + archive extraction; all pure Rust, well-audited).
+- Memory file `feedback_push_by_default.md` saved (durable user preference: future release commits push to origin by default).
+
+### Deferred (will land in v0.20.1)
+- **`update.rs` plan/apply split** — currently `apply_update` does release-lookup + cleanup-check + confirmation + download + replace in one call. The full split into `plan_update` + `apply_planned_update` (with `ReleaseProvider`/`Confirmer`/`ProcessKiller` injection seams + CLI `--close-stale` flag + TUI after-exit cleanup confirmation) is queued for v0.20.1 as a separate refactor PR.
+- **`docs/install/{windows,macos}.md` updates** — manual-install-only guidance still present in those files; v0.20.1 will replace with `aibridge rtk install` recommendation.
+- **TUI after-exit cleanup confirmation prompt** — self-update via `u` on the aibridge row still triggers the new stale-process abort error (no cleanup orchestration); same UX gap that v0.20.1 will close.
+
 ## [0.19.0] - 2026-05-26
 
 ### Added — CLI-update awareness in `aibridge update` (CLI + TUI Update tab) for codex, claude, rtk + read-only MCP version-pin scan (Codex APPROVE after 6 plan rounds)

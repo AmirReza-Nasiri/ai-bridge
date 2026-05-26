@@ -812,7 +812,10 @@ impl App {
                 self.message = Some(format!("{} is up to date — nothing to do.", c.tool));
                 return;
             }
-            if c.suggested_command.is_none() || !c.source.is_verified_pkg_manager() {
+            // v0.20.0 R7 B3: use `safe_to_auto_run` so the trusted internal
+            // `aibridge rtk install/update --yes` form is also accepted (and a
+            // stale-PATH "aibridge" path is rejected).
+            if c.suggested_command.is_none() || !c.safe_to_auto_run() {
                 // Manual-only / unknown — show the hint, no mutation.
                 self.message = Some(format!(
                     "{}: manual update — {}",
@@ -2255,6 +2258,7 @@ mod tests {
             },
             suggested_command: None,
             manual_note: Some("see https://claude.com/download".into()),
+            installable: false,
         }];
         a.update_sel = 1; // first CLI row
         a.handle_update_action();
@@ -2284,6 +2288,7 @@ mod tests {
             },
             suggested_command: Some(vec!["brew".into(), "upgrade".into(), "codex".into()]),
             manual_note: None,
+            installable: false,
         }];
         a.update_sel = 1;
         a.handle_update_action();

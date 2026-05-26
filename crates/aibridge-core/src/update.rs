@@ -525,6 +525,35 @@ pub fn apply_update(opts: ApplyOptions) -> Result<String, String> {
         .parent()
         .ok_or("install path has no parent directory")?;
 
+    // v0.20.0 Task A: refuse to update when same-install-path stale aibridge
+    // processes are running. Caller (CLI / TUI) is responsible for closing them
+    // first (interactive prompt or `--close-stale` flag). On Windows the lock
+    // would cause `replace_binary` to fail mid-swap; on macOS the OLD process
+    // image keeps serving stale code even after a successful rename. Best to
+    // fail-fast with PID details.
+    let enumerator = crate::process_cleanup::RealProcessEnumerator;
+    if let Ok(stale) = crate::process_cleanup::ProcessEnumerator::list_aibridge(&enumerator) {
+        let parent = crate::process_cleanup::parent_pid();
+        let same_path = crate::process_cleanup::select_stale_processes(
+            &stale,
+            &install_path,
+            std::process::id(),
+            parent,
+        );
+        if !same_path.is_empty() {
+            let pids: Vec<u32> = same_path.iter().map(|p| p.pid).collect();
+            return Err(format!(
+                "refusing to update {}: {} stale aibridge process(es) hold the install path \
+                 (PIDs: {:?}). Close them first (e.g. quit any open `aibridge status` TUI \
+                 sessions; on Windows close MCP servers spawned by Claude Code) and re-run. \
+                 The CLI orchestration with `--close-stale` will automate this in v0.20.1.",
+                install,
+                same_path.len(),
+                pids,
+            ));
+        }
+    }
+
     // Download the asset + its checksum into a fresh temp dir (no --clobber needed).
     let tmp = make_temp_dir()?;
     let asset = asset_name();

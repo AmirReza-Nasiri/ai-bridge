@@ -109,6 +109,37 @@ enum Commands {
         #[command(subcommand)]
         action: SkillsAction,
     },
+    /// Manage the third-party rtk (Rust Token Killer) binary used by the output
+    /// optimizer hook. Auto-install/update is supported on Windows x86_64 + macOS
+    /// (Apple Silicon / Intel). Linux is manual-only in v0.20.0 (upstream assets
+    /// exist; AI Bridge has not certified the install path yet).
+    ///
+    /// Requires `gh` (GitHub CLI) for the download (same as `aibridge update`).
+    Rtk {
+        #[command(subcommand)]
+        action: RtkAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum RtkAction {
+    /// Install rtk to `~/.local/bin` (Windows: `%USERPROFILE%\.local\bin\rtk.exe`).
+    /// Verifies upstream identity + SHA256 + archive safety before staging.
+    Install {
+        /// Skip the "about to install" prompt.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Update an existing rtk install. Does nothing if rtk isn't installed —
+    /// use `aibridge rtk install` for a fresh install.
+    Update {
+        /// Skip the "about to update" prompt.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Print the detected rtk install target + the selected asset name for this
+    /// platform. Read-only.
+    Check,
 }
 
 #[derive(Subcommand, Debug)]
@@ -363,6 +394,70 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Commands::Rtk { action } => rtk_cmd(action),
+    }
+}
+
+fn rtk_cmd(action: RtkAction) -> Result<()> {
+    use aibridge_core::cli_update::{RealCommandRunner, RealPathResolver};
+    use aibridge_core::rtk::{
+        detect_target, install_or_update, rtk_asset_name, GhReleaseDownloader, InstallOpts,
+        RealFsOps,
+    };
+    let runner = RealCommandRunner;
+    let resolver = RealPathResolver;
+    match action {
+        RtkAction::Check => {
+            let target = detect_target(&runner, &resolver);
+            println!("rtk target: {target:?}");
+            let triple = aibridge_core::update::current_target();
+            match rtk_asset_name(triple) {
+                Some(a) => println!("upstream asset for this platform ({triple}): {a}"),
+                None => println!(
+                    "no upstream rtk asset for target '{triple}' \
+                     (Linux is manual-only in v0.20.0)"
+                ),
+            }
+            Ok(())
+        }
+        RtkAction::Install { yes } => match install_or_update(
+            &runner,
+            &resolver,
+            &GhReleaseDownloader,
+            &RealFsOps,
+            InstallOpts {
+                yes,
+                allow_fresh_install: true,
+            },
+        ) {
+            Ok(msg) => {
+                println!("{msg}");
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!("aibridge rtk install: {e}");
+                std::process::exit(1);
+            }
+        },
+        RtkAction::Update { yes } => match install_or_update(
+            &runner,
+            &resolver,
+            &GhReleaseDownloader,
+            &RealFsOps,
+            InstallOpts {
+                yes,
+                allow_fresh_install: false,
+            },
+        ) {
+            Ok(msg) => {
+                println!("{msg}");
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!("aibridge rtk update: {e}");
+                std::process::exit(1);
+            }
+        },
     }
 }
 

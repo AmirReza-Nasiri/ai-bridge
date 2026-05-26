@@ -476,19 +476,24 @@ fn is_aibridge_stop_group(group: &Value) -> bool {
         .unwrap_or(false)
 }
 
-/// OS-appropriate command to install the OPTIONAL rtk binary. AI Bridge never
-/// auto-downloads it (it's third-party); `doctor` and `init --rtk` print this so
-/// the user can install it themselves.
+/// OS-appropriate command to install the OPTIONAL rtk binary. v0.20.0 introduced
+/// a verified auto-install path (`aibridge rtk install`) that downloads from
+/// `rtk-ai/rtk`, verifies SHA256 against `checksums.txt`, identity-checks the
+/// extracted binary, and atomically replaces. Manual install still works.
 pub fn rtk_install_hint() -> String {
     match aibridge_platform::platform_name() {
-        "windows" => "download `rtk-x86_64-pc-windows-msvc` from \
+        "windows" => "`aibridge rtk install --yes` (recommended; auto-downloads + verifies) \
+                      OR download `rtk-x86_64-pc-windows-msvc.zip` from \
                       https://github.com/rtk-ai/rtk/releases and put rtk.exe on PATH \
                       (e.g. ~/.local/bin)"
             .to_string(),
-        "macos" => "`brew install rtk` (or `cargo install --git \
-                    https://github.com/rtk-ai/rtk rtk`)"
+        "macos" => "`aibridge rtk install --yes` (recommended; auto-downloads + verifies) \
+                    OR `brew install rtk` OR `cargo install --git \
+                    https://github.com/rtk-ai/rtk rtk`"
             .to_string(),
-        _ => "`brew install rtk` (or see https://github.com/rtk-ai/rtk)".to_string(),
+        _ => "`brew install rtk` (Linux auto-install is deferred to a future release; \
+              upstream assets exist — see https://github.com/rtk-ai/rtk)"
+            .to_string(),
     }
 }
 

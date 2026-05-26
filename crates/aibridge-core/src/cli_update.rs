@@ -88,16 +88,73 @@ pub struct CliCheck {
     /// One-line hint shown to the user when `suggested_command` is `None` or in
     /// the "would update" line for verified sources (e.g. `brew upgrade codex`).
     pub manual_note: Option<String>,
+    /// `true` when the tool is missing-but-installable (e.g. `aibridge rtk install`).
+    /// Overrides `up_to_date()` so a missing-installable surfaces as actionable.
+    /// v0.20.0 Codex Stop-gate R3 B2.
+    pub installable: bool,
 }
 
 impl CliCheck {
     pub fn up_to_date(&self) -> bool {
+        if self.installable {
+            // Missing-installable is NOT up-to-date — it needs action.
+            return false;
+        }
         match (&self.current, &self.latest) {
             (Some(c), Some(l)) => c >= l,
             // If either side is unknown, we can't claim up-to-date OR outdated;
             // render as "unknown".
             _ => true,
         }
+    }
+
+    /// `true` only when AI Bridge is willing to auto-run `suggested_command`
+    /// under `--yes`. Two safe shapes (Codex R7):
+    /// 1. Verified package-manager source (brew / npm) — `is_verified_pkg_manager`.
+    /// 2. The EXACT internal command shape `[current_exe, "rtk", "install"|"update", "--yes"]`.
+    ///    The `current_exe` requirement prevents a stale PATH `aibridge` from being
+    ///    invoked instead of THIS running build.
+    pub fn safe_to_auto_run(&self) -> bool {
+        if self.source.is_verified_pkg_manager() {
+            return true;
+        }
+        let Some(argv) = self.suggested_command.as_deref() else {
+            return false;
+        };
+        // Strict 4-token shape: [<current_exe>, "rtk", "install"|"update", "--yes"].
+        if argv.len() != 4 {
+            return false;
+        }
+        let exe_matches = current_exe_path()
+            .map(|cur| std::path::Path::new(&argv[0]) == cur.as_path())
+            .unwrap_or(false);
+        let verb_ok = argv[2] == "install" || argv[2] == "update";
+        let yes_ok = argv[3] == "--yes";
+        exe_matches && argv[1] == "rtk" && verb_ok && yes_ok
+    }
+}
+
+/// Memoized `std::env::current_exe()` for `safe_to_auto_run` comparisons.
+pub fn current_exe_path() -> Option<std::path::PathBuf> {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    CACHE.get_or_init(|| std::env::current_exe().ok()).clone()
+}
+
+// ───────────────────────── PathResolver seam ─────────────────────────
+
+/// Look up an executable on PATH. Production uses platform layer; tests inject
+/// a fake to deterministically simulate installed/not-installed states.
+pub trait PathResolver: Send + Sync {
+    fn find(&self, name: &str) -> Result<std::path::PathBuf, String>;
+}
+
+/// Platform-layer-backed resolver.
+pub struct RealPathResolver;
+
+impl PathResolver for RealPathResolver {
+    fn find(&self, name: &str) -> Result<std::path::PathBuf, String> {
+        DefaultPlatform::find_executable(name).map_err(|e| e.to_string())
     }
 }
 
@@ -145,6 +202,25 @@ pub enum Mode {
 /// [`RealCommandRunner`] (platform-layer aware) and (test-only) fake.
 pub trait CommandRunner: Send + Sync {
     fn run(&self, bin: &str, args: &[&str], timeout: Duration) -> Result<(bool, String), String>;
+    /// Execute an ABSOLUTE-PATH binary (no PATH lookup). Returns
+    /// `(success, stdout_then_stderr_combined)`. Default impl uses the platform
+    /// layer's `command_for` + the shared `run_command_with_timeout`.
+    /// rtk identity-check uses this (rtk prints its banner to stderr on some
+    /// versions). v0.20.0 R7 B2.
+    fn run_path(
+        &self,
+        exe: &std::path::Path,
+        args: &[&str],
+        timeout: Duration,
+    ) -> Result<(bool, String), String> {
+        let mut cmd = DefaultPlatform::command_for(exe);
+        cmd.args(args);
+        let out =
+            run_command_with_timeout(cmd, timeout).map_err(|e| format!("spawn failed: {e}"))?;
+        let mut combined = String::from_utf8_lossy(&out.stdout).to_string();
+        combined.push_str(&String::from_utf8_lossy(&out.stderr));
+        Ok((out.status.success(), combined))
+    }
 }
 
 /// Platform-layer-aware runner. Resolves the program via
@@ -176,8 +252,14 @@ pub fn apply_cli_update(argv: &[String]) -> Result<i32, String> {
         return Err("empty argv".to_string());
     }
     let bin = &argv[0];
-    let exe =
-        DefaultPlatform::find_executable(bin).map_err(|e| format!("{bin} not on PATH: {e}"))?;
+    // Absolute-path bypass: when argv[0] is an absolute path that exists, use it
+    // directly (don't go through PATH lookup). v0.20.0 R7 B5: rtk's trusted
+    // internal `aibridge rtk update --yes` invocation passes the current_exe path.
+    let exe = if std::path::Path::new(bin).is_absolute() && std::path::Path::new(bin).exists() {
+        std::path::PathBuf::from(bin)
+    } else {
+        DefaultPlatform::find_executable(bin).map_err(|e| format!("{bin} not on PATH: {e}"))?
+    };
     let mut cmd = DefaultPlatform::command_for(&exe);
     cmd.args(&argv[1..])
         .stdin(Stdio::inherit())
@@ -246,7 +328,10 @@ pub fn decide_action(check: &CliCheck, mode: Mode) -> Action {
             summary,
         },
         Mode::YesAuto => {
-            if check.source.is_verified_pkg_manager() {
+            // v0.20.0 R7 B3: use the strict `safe_to_auto_run` gate so the
+            // trusted internal `aibridge rtk update --yes` form is also accepted,
+            // while a stale-PATH "aibridge" is rejected.
+            if check.safe_to_auto_run() {
                 Action::Run {
                     argv: argv.clone(),
                     summary,
@@ -493,6 +578,14 @@ pub fn npm_latest_version(runner: &dyn CommandRunner, package: &str) -> Option<V
 
 /// Latest GitHub-release tag (uses `gh api`, requires `gh` on PATH and authed).
 pub fn gh_latest_release_tag(runner: &dyn CommandRunner, slug: &str) -> Option<Version> {
+    let raw = gh_latest_release_tag_raw(runner, slug)?;
+    parse_version(&raw)
+}
+
+/// Same as [`gh_latest_release_tag`] but returns the RAW tag string (e.g. `v0.42.0`).
+/// Needed by `rtk::install_or_update` because `gh release download` takes the literal
+/// tag, not a parsed `Version`. v0.20.0 R5 B4.
+pub fn gh_latest_release_tag_raw(runner: &dyn CommandRunner, slug: &str) -> Option<String> {
     let endpoint = format!("repos/{slug}/releases/latest");
     let (ok, stdout) = runner
         .run(
@@ -505,7 +598,11 @@ pub fn gh_latest_release_tag(runner: &dyn CommandRunner, slug: &str) -> Option<V
         return None;
     }
     let raw = stdout.trim();
-    parse_version(raw)
+    if raw.is_empty() {
+        None
+    } else {
+        Some(raw.to_string())
+    }
 }
 
 // ───────────────────────── per-tool checks ─────────────────────────
@@ -563,6 +660,7 @@ pub fn check_codex(runner: &dyn CommandRunner) -> CliCheck {
         source,
         suggested_command: suggested,
         manual_note: note,
+        installable: false,
     }
 }
 
@@ -632,34 +730,124 @@ pub fn check_claude(runner: &dyn CommandRunner) -> CliCheck {
         source,
         suggested_command: suggested,
         manual_note: note,
+        installable: false,
     }
 }
 
-/// Check rtk. Per existing repo policy (`install.rs::rtk_install_hint`), AI
-/// Bridge never auto-downloads the rtk binary — even brew-installed rtk is
-/// flagged with a manual hint, NOT an auto-upgrade command. This keeps the
-/// "third-party binary" policy consistent across the codebase.
+/// Check rtk. v0.20.0 (Task B): rtk gets a verified auto-install path via the
+/// trusted internal `aibridge rtk install/update --yes` subcommand. Identity +
+/// checksum + archive safety + atomic replace all run inside
+/// `rtk::install_or_update`. `suggested_command` carries the current executable
+/// path so [`CliCheck::safe_to_auto_run`] can match the exact shape.
 pub fn check_rtk(runner: &dyn CommandRunner) -> CliCheck {
+    check_rtk_with(runner, &RealPathResolver)
+}
+
+/// Resolver-injectable variant for tests. Production callers use [`check_rtk`].
+pub fn check_rtk_with(runner: &dyn CommandRunner, resolver: &dyn PathResolver) -> CliCheck {
     let current = current_version_of(runner, "rtk", DETECT_TIMEOUT);
     let latest = gh_latest_release_tag(runner, "rtk-ai/rtk");
-    let tool_path = DefaultPlatform::find_executable("rtk").ok();
-    let source = match &tool_path {
-        Some(_) => InstallSource::NativeInstaller {
-            docs_url: "https://github.com/rtk-ai/rtk/releases".to_string(),
-        },
-        None => InstallSource::Unknown {
-            path: PathBuf::from("rtk"),
-            reason: "rtk not on PATH".to_string(),
-        },
+    let target = crate::rtk::detect_target(runner, resolver);
+    let (source, suggested, note, installable) = match &target {
+        crate::rtk::RtkTarget::Brew => (
+            InstallSource::Brew {
+                package: "rtk".to_string(),
+            },
+            current_exe_path().map(|exe| {
+                vec![
+                    exe.display().to_string(),
+                    "rtk".into(),
+                    "update".into(),
+                    "--yes".into(),
+                ]
+            }),
+            Some("brew-managed rtk; auto-update via `aibridge rtk update --yes`".to_string()),
+            false,
+        ),
+        crate::rtk::RtkTarget::NativeBin {
+            path,
+            writable: true,
+        } => (
+            InstallSource::NativeInstaller {
+                docs_url: format!("auto-update target {path:?}"),
+            },
+            current_exe_path().map(|exe| {
+                vec![
+                    exe.display().to_string(),
+                    "rtk".into(),
+                    "update".into(),
+                    "--yes".into(),
+                ]
+            }),
+            Some(
+                "verified rtk install; auto-update via `aibridge rtk update --yes` \
+                 (downloads + verifies SHA256 + atomic-replaces)"
+                    .to_string(),
+            ),
+            false,
+        ),
+        crate::rtk::RtkTarget::NativeBin {
+            path,
+            writable: false,
+        } => (
+            InstallSource::Unknown {
+                path: path.clone(),
+                reason: "install path not writable; update manually".to_string(),
+            },
+            None,
+            Some(format!(
+                "rtk at {path:?} is not writable by the current user; update manually"
+            )),
+            false,
+        ),
+        crate::rtk::RtkTarget::NotInstalled { install_to } => (
+            InstallSource::Unknown {
+                path: install_to.clone(),
+                reason: "rtk not installed".to_string(),
+            },
+            current_exe_path().map(|exe| {
+                vec![
+                    exe.display().to_string(),
+                    "rtk".into(),
+                    "install".into(),
+                    "--yes".into(),
+                ]
+            }),
+            Some(format!(
+                "rtk is not installed; will install to {install_to:?} via \
+                 `aibridge rtk install --yes` (downloads + verifies + identity-checks)"
+            )),
+            true, // missing-but-installable
+        ),
+        crate::rtk::RtkTarget::Unknown { reason } => (
+            InstallSource::Unknown {
+                path: PathBuf::from("rtk"),
+                reason: reason.clone(),
+            },
+            None,
+            Some(format!("rtk auto-update unavailable: {reason}")),
+            false,
+        ),
+        crate::rtk::RtkTarget::Unsupported { reason } => (
+            InstallSource::Unknown {
+                path: PathBuf::from("rtk"),
+                reason: reason.clone(),
+            },
+            None,
+            Some(format!(
+                "rtk auto-install not supported on this platform: {reason}"
+            )),
+            false,
+        ),
     };
-    let note = Some(crate::install::rtk_install_hint());
     CliCheck {
         tool: "rtk",
         current,
         latest,
         source,
-        suggested_command: None, // policy: never auto-update rtk
+        suggested_command: suggested,
         manual_note: note,
+        installable,
     }
 }
 
@@ -933,6 +1121,7 @@ mod tests {
             },
             suggested_command: Some(vec!["brew".into(), "upgrade".into(), "codex".into()]),
             manual_note: Some("brew upgrade codex".into()),
+            installable: false,
         }
     }
     fn check_outdated_native() -> CliCheck {
@@ -945,6 +1134,7 @@ mod tests {
             },
             suggested_command: None,
             manual_note: Some("see https://claude.com/download".into()),
+            installable: false,
         }
     }
 
@@ -1007,6 +1197,7 @@ mod tests {
             },
             suggested_command: Some(vec!["brew".into()]),
             manual_note: None,
+            installable: false,
         };
         assert!(c.up_to_date(), "0.10.0 must be >= 0.9.9");
     }
@@ -1020,6 +1211,7 @@ mod tests {
             source: InstallSource::Cargo,
             suggested_command: None,
             manual_note: None,
+            installable: false,
         };
         assert!(c.up_to_date());
         assert!(matches!(
