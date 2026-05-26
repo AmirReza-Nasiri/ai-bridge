@@ -160,6 +160,29 @@ enum ManagedAction {
         /// The managed skill name.
         name: String,
     },
+    /// Quarantine a foreign same-named folder (move to ~/.ai-bridge/backups/) then install
+    /// the managed skill. The foreign content is preserved (reversible). v0.17.0.
+    MigrateAndInstall {
+        /// The managed skill name.
+        name: String,
+    },
+    /// Bring an existing personal skill (in ~/.claude/skills/<name>) under managed control:
+    /// copy it into ~/.ai-bridge/imports/<name>/, append a manifest entry, and adopt. v0.17.0.
+    Register {
+        /// The personal skill name (must exist in ~/.claude/skills/).
+        name: String,
+    },
+    /// Probe upstream (`git ls-remote <repo> <update_ref>`) for every enabled+tracked git
+    /// skill and print which have a newer commit available. v0.17.0.
+    CheckUpstream,
+    /// Stage an upstream candidate, write the new SHA into the manifest's `ref`, and apply.
+    /// The skill must have `update_ref` set in the manifest. v0.17.0.
+    Bump {
+        /// The managed skill name.
+        name: String,
+        /// The new full 40-hex commit SHA (from `check-upstream`).
+        new_sha: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -280,6 +303,52 @@ fn main() -> Result<()> {
                         ),
                         ManagedAction::Disable { name } => ms::disable(&name),
                         ManagedAction::Remove { name } => ms::remove(&name),
+                        ManagedAction::MigrateAndInstall { name } => ms::migrate_and_install(&name),
+                        ManagedAction::Register { name } => ms::register_personal(&name),
+                        ManagedAction::CheckUpstream => {
+                            let cands = ms::check_upstream();
+                            let mut s = String::from("AI Bridge managed skills — check-upstream\n");
+                            if cands.is_empty() {
+                                s.push_str(
+                                    "  no skills are tracking upstream (set `update_ref` in the manifest to enable).\n",
+                                );
+                            } else {
+                                for c in &cands {
+                                    let cur8 = &c.current_sha[..c.current_sha.len().min(8)];
+                                    let line = match &c.upstream_sha {
+                                        Some(up) if c.update_available() => format!(
+                                            "  ↑ {:<22} {:<8} → {:<8}  (probed {})\n",
+                                            c.name,
+                                            cur8,
+                                            &up[..up.len().min(8)],
+                                            c.probed_ref
+                                        ),
+                                        Some(_) => format!(
+                                            "    {:<22} {:<8}  up to date  (probed {})\n",
+                                            c.name, cur8, c.probed_ref
+                                        ),
+                                        None => format!(
+                                            "  ! {:<22} {:<8}  upstream probe FAILED  (probed {})\n",
+                                            c.name, cur8, c.probed_ref
+                                        ),
+                                    };
+                                    s.push_str(&line);
+                                }
+                            }
+                            ms::OpResult {
+                                message: s,
+                                ok: true,
+                            }
+                        }
+                        ManagedAction::Bump { name, new_sha } => {
+                            match ms::bump_prepare(&name, &new_sha) {
+                                Ok(preview) => ms::bump_commit(preview),
+                                Err(e) => ms::OpResult {
+                                    message: format!("AI Bridge managed skills: {e}"),
+                                    ok: false,
+                                },
+                            }
+                        }
                     };
                     println!("{}", res.message);
                     if !res.ok {

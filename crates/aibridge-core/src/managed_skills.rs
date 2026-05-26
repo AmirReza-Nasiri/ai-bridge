@@ -61,6 +61,52 @@ fn source_dir() -> Option<PathBuf> {
     Some(ai_bridge_home()?.join("skills"))
 }
 
+/// Where `migrate-and-install` quarantines a foreign folder it had to move OUT of a CLI
+/// dir to make room for a managed install. NEVER inside `~/.claude/skills` or
+/// `~/.agents/skills` (Codex finding: a `.old.<ts>` under the skill root is still
+/// agent-visible as a skill); always under the Bridge's own home.
+fn backups_dir() -> Option<PathBuf> {
+    Some(ai_bridge_home()?.join("backups"))
+}
+
+/// Where `register` (R) copies a previously-personal skill that the user wants to bring
+/// under Bridge management. Each registered skill gets its own `<name>/content/` subdir
+/// (so future versions could store metadata next to `content/`).
+fn imports_dir() -> Option<PathBuf> {
+    Some(ai_bridge_home()?.join("imports"))
+}
+
+fn audit_path() -> Option<PathBuf> {
+    Some(ai_bridge_home()?.join("managed-skills.audit.jsonl"))
+}
+
+/// Append one structured audit entry per managed-skills mutation (apply / disable / remove
+/// / migrate / register / bump). Best-effort: a failure to write the audit line MUST NEVER
+/// fail the operation itself, because the user's data shouldn't depend on the log.
+fn audit(event: &str, name: &str, ok: bool, detail: &str) {
+    let Some(p) = audit_path() else { return };
+    let line = json!({
+        "ts_ms": now_ms(),
+        "event": event,
+        "name": name,
+        "ok": ok,
+        "detail": detail,
+    })
+    .to_string();
+    let _ = (|| -> std::io::Result<()> {
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&p)?;
+        use std::io::Write;
+        writeln!(f, "{line}")?;
+        Ok(())
+    })();
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -139,6 +185,11 @@ struct SkillSpec {
     enabled: bool,
     subdir: String,
     source: Source,
+    /// Per-skill opt-in for upstream-update probing/bumping. When `Some("HEAD")` or
+    /// `Some("refs/heads/main")` (etc.), `check_upstream` / `bump_and_apply` resolve that
+    /// ref via `git ls-remote`. When `None`, those operations refuse for this skill —
+    /// matching Codex's "do not hardcode HEAD as the update source" requirement.
+    update_ref: Option<String>,
 }
 
 #[derive(Debug)]
@@ -241,12 +292,18 @@ fn parse_manifest(text: &str) -> Result<Manifest, Vec<String>> {
                     continue;
                 }
             };
+            let update_ref = e
+                .get("update_ref")
+                .and_then(toml::Value::as_str)
+                .map(str::to_string)
+                .filter(|s| !s.is_empty());
             seen.push(name_lc);
             skills.push(SkillSpec {
                 name: name.to_string(),
                 enabled,
                 subdir,
                 source,
+                update_ref,
             });
         }
     }
@@ -1206,6 +1263,22 @@ enum Outcome {
 /// foreign folder. Holds a process lock so concurrent applies can't race. `ok` is false if
 /// any enabled skill hit a hard error or couldn't persist its lock.
 pub fn apply(target: Target, repair: bool, adopt: bool) -> OpResult {
+    let _guard = match ProcessLock::acquire() {
+        Ok(g) => g,
+        Err(e) => {
+            return OpResult {
+                message: format!("AI Bridge managed skills: {e}"),
+                ok: false,
+            }
+        }
+    };
+    apply_inner(target, repair, adopt)
+}
+
+/// `apply` without acquiring the process lock — callable by other operations that already
+/// hold the lock (`migrate_and_install`, `register_personal`, `bump_and_apply`). The
+/// PUBLIC entry point is [`apply`]; this is private intentionally.
+fn apply_inner(target: Target, repair: bool, adopt: bool) -> OpResult {
     let manifest = match read_manifest() {
         Ok(m) => m,
         Err(e) => {
@@ -1228,15 +1301,6 @@ pub fn apply(target: Target, repair: bool, adopt: bool) -> OpResult {
         };
         return OpResult { message, ok: false };
     }
-    let _guard = match ProcessLock::acquire() {
-        Ok(g) => g,
-        Err(e) => {
-            return OpResult {
-                message: format!("AI Bridge managed skills: {e}"),
-                ok: false,
-            }
-        }
-    };
     let mut lock = read_lock();
     let mut out = String::from("AI Bridge managed skills — apply\n");
     let mut ok = true;
@@ -1255,10 +1319,17 @@ pub fn apply(target: Target, repair: bool, adopt: bool) -> OpResult {
                 match write_lock(&lock) {
                     Ok(()) => {
                         journal_remove(&spec.name);
+                        audit("apply", &spec.name, true, &msg);
                         out.push_str(&format!("  - {} : {msg}\n", spec.name));
                     }
                     Err(e) => {
                         ok = false;
+                        audit(
+                            "apply",
+                            &spec.name,
+                            false,
+                            &format!("installed but lockfile write failed: {e}"),
+                        );
                         out.push_str(&format!(
                             "  - {} : ! installed but FAILED to write lockfile: {e} (re-run apply)\n",
                             spec.name
@@ -1267,10 +1338,12 @@ pub fn apply(target: Target, repair: bool, adopt: bool) -> OpResult {
                 }
             }
             Ok(Outcome::Skipped(msg)) => {
+                audit("apply", &spec.name, true, &format!("skipped: {msg}"));
                 out.push_str(&format!("  - {} : skipped — {msg}\n", spec.name))
             }
             Err(msg) => {
                 ok = false;
+                audit("apply", &spec.name, false, &msg);
                 out.push_str(&format!("  - {} : ! {msg}\n", spec.name));
             }
         }
@@ -1488,6 +1561,16 @@ pub fn disable(name: &str) -> OpResult {
         ));
     }
     out.push_str("  Reload Claude Code / Codex.");
+    audit(
+        "disable",
+        name,
+        ok,
+        &if kept.is_empty() {
+            "fully disabled".into()
+        } else {
+            format!("partial — kept in {}", kept.join("+"))
+        },
+    );
     OpResult { message: out, ok }
 }
 
@@ -1545,6 +1628,16 @@ pub fn remove(name: &str) -> OpResult {
         ));
     }
     out.push_str("  Reload Claude Code / Codex.");
+    audit(
+        "remove",
+        name,
+        ok,
+        &if kept.is_empty() {
+            "fully removed".into()
+        } else {
+            format!("partial — kept in {}", kept.join("+"))
+        },
+    );
     OpResult { message: out, ok }
 }
 
@@ -1586,6 +1679,753 @@ fn remove_owned_mirror(root: Root, name: &str, entry: &LockEntry) -> (Removal, S
                 root_short(root)
             ),
         ),
+    }
+}
+
+/// `managed migrate-and-install` (TUI key `M`) — when an enabled managed skill is BLOCKED
+/// by a same-named foreign folder in either CLI dir, this safely makes room: each foreign
+/// folder is COPIED into `~/.ai-bridge/backups/<root>/<name>/<ts>/content/`, the backup
+/// digest is verified against the original, the original is REMOVED, and then the regular
+/// apply runs. On any failure before the apply, every backup is restored (rollback).
+/// Backups are KEPT (never auto-deleted) so the user can restore them later if needed.
+pub fn migrate_and_install(name: &str) -> OpResult {
+    let _guard = match ProcessLock::acquire() {
+        Ok(g) => g,
+        Err(e) => {
+            return OpResult {
+                message: format!("AI Bridge managed skills: {e}"),
+                ok: false,
+            }
+        }
+    };
+    let manifest = match read_manifest() {
+        Ok(m) => m,
+        Err(e) => {
+            return OpResult {
+                message: format!("AI Bridge managed skills: {e}"),
+                ok: false,
+            }
+        }
+    };
+    let Some(spec) = manifest.skills.iter().find(|s| s.name == name).cloned() else {
+        return OpResult {
+            message: format!("AI Bridge managed skills: no skill named {name:?} in the manifest."),
+            ok: false,
+        };
+    };
+    if !spec.enabled {
+        return OpResult {
+            message: format!(
+                "AI Bridge managed skills: {name:?} is disabled in the manifest — enable it first."
+            ),
+            ok: false,
+        };
+    }
+    let Some(bdir) = backups_dir() else {
+        return OpResult {
+            message: "AI Bridge managed skills: no home directory.".into(),
+            ok: false,
+        };
+    };
+    let mut out = format!("AI Bridge managed skills — migrate-and-install {name}\n");
+    let recorded = read_lock().get(name).cloned();
+    let ts = now_ms();
+    let mut moved: Vec<(Root, PathBuf, PathBuf)> = Vec::new();
+    let mut quarantine_ok = true;
+    for root in [Root::Claude, Root::Agents] {
+        let Some(parent) = root.path() else {
+            quarantine_ok = false;
+            out.push_str("  ! no home directory\n");
+            break;
+        };
+        let foreign = parent.join(name);
+        if !foreign.is_dir() {
+            continue;
+        }
+        // Skip folders we already own (the regular apply --repair handles those).
+        let cur = mirror_digest(root, name);
+        let rec = recorded
+            .as_ref()
+            .and_then(|e| e.mirror(root))
+            .map(str::to_string);
+        if rec.is_some() && cur.as_deref() == rec.as_deref() {
+            out.push_str(&format!(
+                "  {} mirror already Bridge-owned (in-sync) — leaving in place\n",
+                root_short(root)
+            ));
+            continue;
+        }
+        // Copy to ~/.ai-bridge/backups/<root>/<name>/<ts>/content/
+        let backup = bdir.join(root_short(root)).join(name).join(ts.to_string());
+        let backup_content = backup.join("content");
+        if let Err(e) = std::fs::create_dir_all(&backup) {
+            quarantine_ok = false;
+            out.push_str(&format!(
+                "  ! failed to create backup dir for {} mirror: {e}\n",
+                root_short(root)
+            ));
+            break;
+        }
+        if let Err(e) = skills::copy_dir_all(&foreign, &backup_content) {
+            quarantine_ok = false;
+            out.push_str(&format!(
+                "  ! failed to back up {} mirror: {e}\n",
+                root_short(root)
+            ));
+            let _ = std::fs::remove_dir_all(&backup);
+            break;
+        }
+        // Verify backup digest matches original BEFORE removing the original.
+        let orig_digest = skills::dir_digest(&foreign);
+        let bk_digest = skills::dir_digest(&backup_content);
+        if orig_digest != bk_digest {
+            quarantine_ok = false;
+            out.push_str(&format!(
+                "  ! backup verification FAILED for {} mirror (digest mismatch) — aborting\n",
+                root_short(root)
+            ));
+            let _ = std::fs::remove_dir_all(&backup);
+            break;
+        }
+        // Remove the original from the skill root.
+        if let Err(e) = std::fs::remove_dir_all(&foreign) {
+            quarantine_ok = false;
+            out.push_str(&format!(
+                "  ! failed to remove original {} mirror after backup: {e}\n",
+                root_short(root)
+            ));
+            break;
+        }
+        moved.push((root, foreign.clone(), backup.clone()));
+        out.push_str(&format!(
+            "  quarantined {} mirror → ~/.ai-bridge/backups/{}/{}/{}/content/\n",
+            root_short(root),
+            root_short(root),
+            name,
+            ts
+        ));
+    }
+    if !quarantine_ok {
+        // Rollback every successful backup so the user's data is restored to where it was.
+        for (_root, original, backup) in moved.into_iter().rev() {
+            let backup_content = backup.join("content");
+            let _ = std::fs::remove_dir_all(&original);
+            let _ = skills::copy_dir_all(&backup_content, &original);
+            let _ = std::fs::remove_dir_all(&backup);
+            out.push_str(&format!("  rolled back: restored {}\n", original.display()));
+        }
+        out.push_str("  ✗ migrate-and-install aborted; mirrors restored.\n");
+        audit(
+            "migrate_and_install",
+            name,
+            false,
+            "quarantine failed; rolled back",
+        );
+        return OpResult {
+            message: out,
+            ok: false,
+        };
+    }
+    // Quarantine succeeded — proceed to apply (lock is already held; use the inner path).
+    let apply_result = apply_inner(Target::One(name.to_string()), false, false);
+    out.push_str(&format!("\n{}\n", apply_result.message.trim()));
+    if !apply_result.ok && !moved.is_empty() {
+        // CRITICAL (Codex finding): the foreign skill the user could see in their CLI is
+        // now gone — without rollback, this op left the visible state strictly WORSE than
+        // before. Restore each quarantined original; backups stay in place so the user can
+        // still recover manually if a restore itself fails.
+        let mut restored = Vec::new();
+        let mut restore_errs = Vec::new();
+        for (root, original, backup) in moved.iter().rev() {
+            let backup_content = backup.join("content");
+            let _ = std::fs::remove_dir_all(original);
+            match skills::copy_dir_all(&backup_content, original) {
+                Ok(()) => restored.push(root_short(*root)),
+                Err(e) => restore_errs.push((root_short(*root), e.to_string())),
+            }
+        }
+        if !restored.is_empty() {
+            out.push_str(&format!(
+                "  ↩ apply failed — restored original mirror(s) in: {}\n",
+                restored.join(", ")
+            ));
+        }
+        for (r, e) in &restore_errs {
+            out.push_str(&format!(
+                "  ! restore FAILED for {r} mirror: {e} — backup at ~/.ai-bridge/backups/{r}/{name}/{ts}/content/\n"
+            ));
+        }
+    }
+    if apply_result.ok && !moved.is_empty() {
+        out.push_str(
+            "  Backups retained under ~/.ai-bridge/backups/ — delete manually when no longer needed.\n",
+        );
+    }
+    let final_ok = apply_result.ok;
+    let detail = if final_ok {
+        "quarantined + installed".to_string()
+    } else if !moved.is_empty() {
+        format!(
+            "quarantined but apply failed — originals restored from backups (still under ~/.ai-bridge/backups/{name}/{ts}/)"
+        )
+    } else {
+        "apply failed (nothing was quarantined)".to_string()
+    };
+    audit("migrate_and_install", name, final_ok, &detail);
+    OpResult {
+        message: out,
+        ok: final_ok,
+    }
+}
+
+/// `managed register` (TUI key `R`) — bring an EXISTING personal skill under managed
+/// control. Copies `~/.claude/skills/<name>` into `~/.ai-bridge/imports/<name>/content/`,
+/// appends a `[[skill]]` entry to the manifest with `source = "local"`, then runs apply
+/// with `--adopt` so the byte-identical personal mirror is recognized as owned.
+/// Refuses when: the name is unsafe, the skill isn't in `~/.claude/skills`, it's already
+/// in the manifest, or `~/.agents/skills/<name>` exists with DIFFERENT content (the user
+/// should resolve that divergence first — `M` covers the foreign-collision case).
+pub fn register_personal(name: &str) -> OpResult {
+    let _guard = match ProcessLock::acquire() {
+        Ok(g) => g,
+        Err(e) => {
+            return OpResult {
+                message: format!("AI Bridge managed skills: {e}"),
+                ok: false,
+            }
+        }
+    };
+    if !safe_skill_name(name) {
+        return OpResult {
+            message: format!("AI Bridge managed skills: invalid skill name {name:?}"),
+            ok: false,
+        };
+    }
+    let Some(claude_path) = Root::Claude.path().map(|p| p.join(name)) else {
+        return OpResult {
+            message: "AI Bridge managed skills: no home directory.".into(),
+            ok: false,
+        };
+    };
+    if !claude_path.is_dir() || !claude_path.join("SKILL.md").exists() {
+        return OpResult {
+            message: format!(
+                "AI Bridge managed skills: no personal skill at ~/.claude/skills/{name} (or missing SKILL.md)."
+            ),
+            ok: false,
+        };
+    }
+    // Refuse if already in the manifest (even disabled) — registration is one-shot.
+    if let Ok(manifest) = read_manifest() {
+        if manifest.skills.iter().any(|s| s.name == name) {
+            return OpResult {
+                message: format!(
+                    "AI Bridge managed skills: {name:?} is already in the manifest — edit it instead."
+                ),
+                ok: false,
+            };
+        }
+    }
+    let claude_digest = skills::dir_digest(&claude_path);
+    if let Some(agents_path) = Root::Agents.path().map(|p| p.join(name)) {
+        if agents_path.is_dir() {
+            let agents_digest = skills::dir_digest(&agents_path);
+            if agents_digest != claude_digest {
+                return OpResult {
+                    message: format!(
+                        "AI Bridge managed skills: ~/.agents/skills/{name} exists with DIFFERENT \
+                         content than ~/.claude/skills/{name} — resolve that divergence first \
+                         (or use M = migrate-and-install)."
+                    ),
+                    ok: false,
+                };
+            }
+        }
+    }
+    // Copy the personal skill into the Bridge's import storage.
+    let Some(imp_root) = imports_dir().map(|d| d.join(name)) else {
+        return OpResult {
+            message: "AI Bridge managed skills: no home directory.".into(),
+            ok: false,
+        };
+    };
+    let imp_content = imp_root.join("content");
+    let _ = std::fs::remove_dir_all(&imp_root); // clean any prior aborted import
+    if let Err(e) = std::fs::create_dir_all(&imp_root) {
+        return OpResult {
+            message: format!("AI Bridge managed skills: failed to create import dir: {e}"),
+            ok: false,
+        };
+    }
+    if let Err(e) = skills::copy_dir_all(&claude_path, &imp_content) {
+        let _ = std::fs::remove_dir_all(&imp_root);
+        return OpResult {
+            message: format!("AI Bridge managed skills: failed to copy into import dir: {e}"),
+            ok: false,
+        };
+    }
+    let imp_digest = skills::dir_digest(&imp_content);
+    if imp_digest != claude_digest {
+        let _ = std::fs::remove_dir_all(&imp_root);
+        return OpResult {
+            message: "AI Bridge managed skills: import digest verification failed (the copy \
+                      doesn't match the source — refusing to register)."
+                .into(),
+            ok: false,
+        };
+    }
+    // Append a manifest entry. The `from` path uses forward slashes (TOML-friendly + cross-
+    // platform). We do NOT mutate any earlier comment lines.
+    let Some(manifest_p) = manifest_path() else {
+        let _ = std::fs::remove_dir_all(&imp_root);
+        return OpResult {
+            message: "AI Bridge managed skills: no home directory.".into(),
+            ok: false,
+        };
+    };
+    let from_str = imp_root
+        .to_string_lossy()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_string();
+    let ts_sec = now_ms() / 1000;
+    let entry = format!(
+        "\n# --- registered ts={ts_sec}: imported from ~/.claude/skills/{name} ---\n\
+         [[skill]]\nname = \"{name}\"\nsource = \"local\"\n\
+         from = \"{from_str}\"\nsubdir = \"content\"\nenabled = true\n"
+    );
+    let existing = std::fs::read_to_string(&manifest_p).unwrap_or_default();
+    let updated = format!("{existing}{entry}");
+    if let Err(e) = write_atomic(&manifest_p, updated.as_bytes()) {
+        let _ = std::fs::remove_dir_all(&imp_root);
+        return OpResult {
+            message: format!("AI Bridge managed skills: failed to update manifest: {e}"),
+            ok: false,
+        };
+    }
+    let mut out = format!("AI Bridge managed skills — register {name}\n");
+    out.push_str(&format!(
+        "  imported ~/.claude/skills/{name} → {from_str}/content\n"
+    ));
+    out.push_str("  appended a [[skill]] entry (source=\"local\") to the manifest\n");
+    // Apply with adopt=true so the byte-identical personal mirror is taken over (the import
+    // has the same digest as the personal copy, so the foreign mirror = ForeignIdentical).
+    let apply_result = apply_inner(Target::One(name.to_string()), false, true);
+    out.push_str(&format!("\n{}\n", apply_result.message.trim()));
+    let final_ok = apply_result.ok;
+    audit(
+        "register",
+        name,
+        final_ok,
+        if final_ok {
+            "imported + adopted"
+        } else {
+            "imported but apply failed"
+        },
+    );
+    OpResult {
+        message: out,
+        ok: final_ok,
+    }
+}
+
+// ───────────────────────── upstream check / bump ─────────────────────────
+
+/// One row in the `check_upstream` report.
+#[derive(Clone, Debug)]
+pub struct UpstreamCandidate {
+    pub name: String,
+    pub current_sha: String,
+    pub probed_ref: String,
+    /// `Some(sha)` ⇒ upstream resolved to this SHA; `None` ⇒ probe failed (network/auth/etc).
+    pub upstream_sha: Option<String>,
+}
+
+impl UpstreamCandidate {
+    pub fn update_available(&self) -> bool {
+        match &self.upstream_sha {
+            Some(s) => s != &self.current_sha,
+            None => false,
+        }
+    }
+}
+
+/// Resolve a remote ref to a full commit SHA via `git ls-remote <repo> <ref>` (timed out
+/// by [`git_run`], auth prompts disabled). Returns `None` on any failure — the caller
+/// surfaces that as an upstream probe failure, NEVER as "no update available".
+fn probe_upstream(repo: &str, git_ref: &str) -> Option<String> {
+    let cwd = std::env::temp_dir();
+    // First try with `--refs` (works for `refs/heads/main` / `refs/tags/x`); fall back to
+    // the plain query (which works for the `HEAD` pseudo-ref).
+    let attempt = |args: &[&str]| -> Option<String> {
+        let (ok, out) = git_run(&cwd, args);
+        if !ok {
+            return None;
+        }
+        out.lines()
+            .next()
+            .and_then(|l| l.split_whitespace().next())
+            .map(str::to_string)
+    };
+    attempt(&["ls-remote", "--refs", repo, git_ref])
+        .or_else(|| attempt(&["ls-remote", repo, git_ref]))
+        .filter(|s| is_full_sha(s))
+}
+
+/// `managed check-upstream` (TUI key `U`) — for every ENABLED git skill that has
+/// `update_ref` set, probe the upstream ref. Network-only, explicit. Skills with no
+/// `update_ref` are simply omitted from the report (opt-in tracking).
+pub fn check_upstream() -> Vec<UpstreamCandidate> {
+    let manifest = match read_manifest() {
+        Ok(m) => m,
+        Err(_) => return Vec::new(),
+    };
+    let lock = read_lock();
+    let mut out = Vec::new();
+    for spec in &manifest.skills {
+        if !spec.enabled {
+            continue;
+        }
+        let (repo, current_sha) = match &spec.source {
+            Source::Git { repo, sha } => (
+                repo.clone(),
+                lock.get(&spec.name)
+                    .map(|e| e.resolved_commit.clone())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| sha.clone()),
+            ),
+            _ => continue,
+        };
+        let Some(git_ref) = spec.update_ref.clone() else {
+            continue;
+        };
+        let upstream_sha = probe_upstream(&repo, &git_ref);
+        out.push(UpstreamCandidate {
+            name: spec.name.clone(),
+            current_sha,
+            probed_ref: git_ref,
+            upstream_sha,
+        });
+    }
+    out
+}
+
+/// A staged upstream candidate held between `bump_prepare` (preview) and `bump_commit`
+/// (write manifest + apply). The staged content lives in a Bridge-owned temp; Drop
+/// removes it if the preview is dropped without committing.
+pub struct BumpPreview {
+    pub name: String,
+    pub old_sha: String,
+    pub new_sha: String,
+    pub old_digest: String,
+    pub new_digest: String,
+    pub added_files: usize,
+    pub removed_files: usize,
+    pub modified_files: usize,
+    /// Internal: the staged temp dir holding the new content. Dropped to clean up.
+    staged_temp: Option<PathBuf>,
+}
+
+impl Drop for BumpPreview {
+    fn drop(&mut self) {
+        if let Some(p) = &self.staged_temp {
+            let _ = std::fs::remove_dir_all(p);
+        }
+    }
+}
+
+impl BumpPreview {
+    pub fn summary(&self) -> String {
+        format!(
+            "{} : {} → {} (+{} ~{} -{} files)",
+            self.name,
+            &self.old_sha[..self.old_sha.len().min(8)],
+            &self.new_sha[..self.new_sha.len().min(8)],
+            self.added_files,
+            self.modified_files,
+            self.removed_files,
+        )
+    }
+}
+
+/// `managed bump prepare` (TUI key `B` first press) — fetch + stage the new SHA into a
+/// temp, compute the digest + file-set diff vs the currently-installed third folder, and
+/// return a [`BumpPreview`]. NO mutation of the manifest, lock, or any user-visible state.
+/// The caller MUST hold the preview only briefly (Drop releases the staged temp).
+pub fn bump_prepare(name: &str, new_sha: &str) -> Result<BumpPreview, String> {
+    let _guard = ProcessLock::acquire()?;
+    if !is_full_sha(new_sha) {
+        return Err("upstream SHA is not a full 40-hex".into());
+    }
+    let manifest = read_manifest()?;
+    let spec = manifest
+        .skills
+        .iter()
+        .find(|s| s.name == name)
+        .ok_or_else(|| format!("no skill named {name:?} in the manifest"))?;
+    let (repo, old_sha) = match &spec.source {
+        Source::Git { repo, sha } => (repo.clone(), sha.clone()),
+        _ => return Err("bump is only supported for git sources".into()),
+    };
+    if spec.update_ref.is_none() {
+        return Err(
+            "this skill has no `update_ref` in the manifest — set it (e.g. \"HEAD\") first".into(),
+        );
+    }
+    if new_sha == old_sha {
+        return Err("already at this SHA — nothing to bump".into());
+    }
+    // Stage the candidate exactly like apply would.
+    let staged = stage_git(&repo, new_sha, &spec.subdir)?;
+    let new_digest = skills::dir_digest(&staged.content);
+    // Compute file-set diff vs the currently-installed third folder (the "old" content).
+    let (added, removed, modified) = if let Some(third) = source_dir().map(|d| d.join(name)) {
+        diff_file_sets(&third, &staged.content)
+    } else {
+        (0, 0, 0)
+    };
+    let lock = read_lock();
+    let old_digest = lock
+        .get(name)
+        .map(|e| e.content_sha256.clone())
+        .unwrap_or_default();
+    // Move the staged content to a STABLE temp location we own (rather than keep stage_git's
+    // throwaway). We use a sibling of source_dir so a later commit-time rename stays on
+    // the same volume.
+    let stable_temp = ai_bridge_home()
+        .ok_or("no home directory")?
+        .join(format!(".bump.{name}.{}", now_ms()));
+    let _ = std::fs::remove_dir_all(&stable_temp);
+    std::fs::create_dir_all(&stable_temp).map_err(|e| format!("create stable temp: {e}"))?;
+    skills::copy_dir_all(&staged.content, &stable_temp.join("content"))
+        .map_err(|e| format!("stage to stable temp: {e}"))?;
+    staged.cleanup();
+    Ok(BumpPreview {
+        name: name.to_string(),
+        old_sha,
+        new_sha: new_sha.to_string(),
+        old_digest,
+        new_digest,
+        added_files: added,
+        removed_files: removed,
+        modified_files: modified,
+        staged_temp: Some(stable_temp),
+    })
+}
+
+/// Compare two directories' file sets and return `(added, removed, modified)` counts.
+/// Ignores the same paths the digest does (`.git`, `.DS_Store`).
+fn diff_file_sets(old_dir: &Path, new_dir: &Path) -> (usize, usize, usize) {
+    fn walk(base: &Path, dir: &Path, out: &mut std::collections::BTreeMap<String, Vec<u8>>) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for ent in rd.flatten() {
+            let name = ent.file_name();
+            let n = name.to_string_lossy().to_string();
+            if n == ".git" || n == ".DS_Store" {
+                continue;
+            }
+            let p = ent.path();
+            if p.is_dir() {
+                walk(base, &p, out);
+            } else if p.is_file() {
+                if let Ok(rel) = p.strip_prefix(base) {
+                    let key = rel.to_string_lossy().replace('\\', "/");
+                    let bytes = std::fs::read(&p).unwrap_or_default();
+                    out.insert(key, bytes);
+                }
+            }
+        }
+    }
+    let mut old_map = std::collections::BTreeMap::new();
+    let mut new_map = std::collections::BTreeMap::new();
+    walk(old_dir, old_dir, &mut old_map);
+    walk(new_dir, new_dir, &mut new_map);
+    let mut added = 0;
+    let mut removed = 0;
+    let mut modified = 0;
+    for k in new_map.keys() {
+        match old_map.get(k) {
+            None => added += 1,
+            Some(v) if new_map.get(k) != Some(v) => modified += 1,
+            _ => {}
+        }
+    }
+    for k in old_map.keys() {
+        if !new_map.contains_key(k) {
+            removed += 1;
+        }
+    }
+    (added, removed, modified)
+}
+
+/// `managed bump commit` (TUI key `B` second press, after preview) — write the new SHA
+/// into the manifest's `ref` field for this skill, then run a normal apply for that skill.
+/// Consumes the preview so its staged temp can no longer be reused.
+pub fn bump_commit(preview: BumpPreview) -> OpResult {
+    let _guard = match ProcessLock::acquire() {
+        Ok(g) => g,
+        Err(e) => {
+            return OpResult {
+                message: format!("AI Bridge managed skills: {e}"),
+                ok: false,
+            }
+        }
+    };
+    let name = preview.name.clone();
+    let new_sha = preview.new_sha.clone();
+    let Some(manifest_p) = manifest_path() else {
+        return OpResult {
+            message: "AI Bridge managed skills: no home directory.".into(),
+            ok: false,
+        };
+    };
+    let existing = match std::fs::read_to_string(&manifest_p) {
+        Ok(t) => t,
+        Err(e) => {
+            return OpResult {
+                message: format!("AI Bridge managed skills: failed to read manifest: {e}"),
+                ok: false,
+            }
+        }
+    };
+    let Some(updated) = replace_skill_ref(&existing, &name, &new_sha) else {
+        return OpResult {
+            message: format!(
+                "AI Bridge managed skills: couldn't locate the [[skill]] block for {name:?} \
+                 in the manifest (or it had no `ref =` line)."
+            ),
+            ok: false,
+        };
+    };
+    if let Err(e) = write_atomic(&manifest_p, updated.as_bytes()) {
+        return OpResult {
+            message: format!("AI Bridge managed skills: failed to write manifest: {e}"),
+            ok: false,
+        };
+    }
+    let summary = preview.summary();
+    // Drop the preview here so its staged temp is cleaned. (apply_inner re-fetches via the
+    // normal stage path — the preview's staging was for the diff display only.)
+    drop(preview);
+    let apply_result = apply_inner(Target::One(name.clone()), false, false);
+    let mut out = format!("AI Bridge managed skills — bump {summary}\n");
+    out.push_str(&format!("{}\n", apply_result.message.trim()));
+    audit(
+        "bump",
+        &name,
+        apply_result.ok,
+        &format!("bumped to {new_sha}"),
+    );
+    OpResult {
+        message: out,
+        ok: apply_result.ok,
+    }
+}
+
+/// Replace the `ref = "..."` line of the `[[skill]]` block whose `name = "<n>"` is
+/// `target`. Pure (no IO) for unit testing. Returns `None` if the block isn't found or
+/// has no `ref =` line. Preserves all other content (including the rest of the block,
+/// comments, blank lines, and the line indentation of the `ref =` line itself).
+pub(crate) fn replace_skill_ref(text: &str, target: &str, new_sha: &str) -> Option<String> {
+    // Find the [[skill]] block whose `name = "<target>"` matches, then within that block
+    // find the FIRST `ref = "..."` line and rewrite it.
+    let mut out = String::new();
+    let mut buf: Vec<String> = Vec::new(); // current block lines (excluding the [[skill]] header itself)
+    let mut current_is_target = false;
+    let mut replaced = false;
+    let mut in_block = false;
+    let flush_block = |out: &mut String,
+                       buf: &mut Vec<String>,
+                       is_target: bool,
+                       new_sha: &str,
+                       replaced: &mut bool| {
+        if is_target && !*replaced {
+            for line in buf.iter() {
+                let t = line.trim_start();
+                if t.starts_with("ref =") || t.starts_with("ref=") {
+                    let lead = &line[..line.len() - t.len()];
+                    out.push_str(&format!("{lead}ref = \"{new_sha}\"\n"));
+                    *replaced = true;
+                } else {
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+        } else {
+            for line in buf.iter() {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        buf.clear();
+    };
+    for raw in text.lines() {
+        if raw.trim_start().starts_with("[[skill]]") {
+            if in_block {
+                flush_block(
+                    &mut out,
+                    &mut buf,
+                    current_is_target,
+                    new_sha,
+                    &mut replaced,
+                );
+            }
+            out.push_str(raw);
+            out.push('\n');
+            in_block = true;
+            current_is_target = false;
+            continue;
+        }
+        if in_block && raw.trim_start().starts_with('[') {
+            // A top-level table starts — close the current block.
+            flush_block(
+                &mut out,
+                &mut buf,
+                current_is_target,
+                new_sha,
+                &mut replaced,
+            );
+            in_block = false;
+            current_is_target = false;
+            out.push_str(raw);
+            out.push('\n');
+            continue;
+        }
+        if in_block {
+            // Detect `name = "<x>"` to mark this block as the target.
+            let t = raw.trim_start();
+            if t.starts_with("name =") || t.starts_with("name=") {
+                let rhs = t.split_once('=').map(|(_, r)| r.trim()).unwrap_or("");
+                let quoted = rhs
+                    .trim()
+                    .trim_start_matches('"')
+                    .trim_end_matches('"')
+                    .to_string();
+                if quoted == target {
+                    current_is_target = true;
+                }
+            }
+            buf.push(raw.to_string());
+        } else {
+            out.push_str(raw);
+            out.push('\n');
+        }
+    }
+    if in_block {
+        flush_block(
+            &mut out,
+            &mut buf,
+            current_is_target,
+            new_sha,
+            &mut replaced,
+        );
+    }
+    if replaced {
+        Some(out)
+    } else {
+        None
     }
 }
 
@@ -1823,6 +2663,71 @@ mod tests {
         let errs = parse_manifest(bad).unwrap_err();
         assert_eq!(errs.len(), 1, "errors: {errs:?}");
         assert!(errs[0].contains("duplicate"));
+    }
+
+    #[test]
+    fn replace_skill_ref_targets_only_the_named_block() {
+        // The function must (1) rewrite ONLY the `ref =` line in the target [[skill]]
+        // block, (2) leave every other line — comments, whitespace, other entries — alone,
+        // and (3) return None when the target name or `ref =` isn't found.
+        let m = "\
+version = 1
+
+# top comment
+[[skill]]
+name = \"alpha\"
+source = \"git\"
+repo = \"https://example.com/a.git\"
+ref = \"0000000000000000000000000000000000000000\"
+subdir = \"skills/alpha\"
+enabled = true
+
+# between blocks
+[[skill]]
+name = \"beta\"
+source = \"git\"
+repo = \"https://example.com/b.git\"
+ref = \"1111111111111111111111111111111111111111\"
+enabled = false
+";
+        let new = "2222222222222222222222222222222222222222";
+        let updated = replace_skill_ref(m, "beta", new).expect("found");
+        // beta's ref bumped, alpha unchanged.
+        assert!(updated.contains(&format!("ref = \"{new}\"")));
+        assert!(updated.contains("ref = \"0000000000000000000000000000000000000000\""));
+        // The comments and other lines are preserved.
+        assert!(updated.contains("# top comment"));
+        assert!(updated.contains("# between blocks"));
+        assert!(updated.contains("name = \"alpha\""));
+        assert!(updated.contains("name = \"beta\""));
+        assert!(updated.contains("enabled = false"));
+        // Returns None for an unknown name or for a block with no ref =.
+        assert!(replace_skill_ref(m, "missing", new).is_none());
+        let m_no_ref = "[[skill]]\nname = \"x\"\nsource = \"local\"\nfrom = \"/x\"\n";
+        assert!(replace_skill_ref(m_no_ref, "x", new).is_none());
+    }
+
+    #[test]
+    fn parse_manifest_reads_update_ref() {
+        let m = r#"
+            version = 1
+            [[skill]]
+            name = "with-track"
+            source = "git"
+            repo = "https://example.com/x.git"
+            ref = "0123456789abcdef0123456789abcdef01234567"
+            update_ref = "HEAD"
+            enabled = true
+            [[skill]]
+            name = "without-track"
+            source = "git"
+            repo = "https://example.com/y.git"
+            ref = "0123456789abcdef0123456789abcdef01234568"
+        "#;
+        let parsed = parse_manifest(m).unwrap();
+        assert_eq!(parsed.skills.len(), 2);
+        assert_eq!(parsed.skills[0].update_ref.as_deref(), Some("HEAD"));
+        assert_eq!(parsed.skills[1].update_ref, None);
     }
 
     #[test]

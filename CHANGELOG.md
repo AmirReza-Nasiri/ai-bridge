@@ -6,6 +6,28 @@ versioning is semver.
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-05-25
+
+### Added — managed-skills v2: complete the TUI loop (no more "scattered skills") (Codex APPROVE after 3 rounds)
+
+This release closes the gap between v0.16.0's per-skill TUI actions and a workflow where **every** managed-skills operation lives behind a keypress, plus brings existing personal skills under one consolidated managed umbrella. Built around 4 new TUI actions, each gated by the same 2-key confirm + apply-in-flight guard the earlier ops use.
+
+- **TUI Skills tab is now FULL-SCREEN managed.** The bottom "Personal skills doctor" panel is removed; the mirror/sync status it surfaced is already in the Health tab's `review feed (skills)` check (cleaner UX, more room for the managed list). The `s`/`m` keys (sync hub→agents, migrate legacy→hub) stay on the Skills tab and are documented in the footer. The verbose per-root listing is still available via `aibridge skills doctor`.
+- **`M` = migrate-and-install** (TUI key + `skills managed migrate-and-install <name>` CLI). When an enabled managed skill is BLOCKED by a same-named foreign folder, M atomically copies each foreign folder into `~/.ai-bridge/backups/<root>/<name>/<ts>/content/` (NEVER inside a skill root, per Codex finding — a `.old.<ts>` under `~/.claude/skills` would still be discovered as a skill), verifies the backup digest BEFORE removing the original, then runs apply. **On apply-failure-after-quarantine the originals are RESTORED from the backups** (Codex blocking finding fix); a restore failure is reported loudly with the backup path so manual recovery is still possible. Backups are never auto-deleted.
+- **`R` = register existing personal skill** (TUI key + `skills managed register <name>` CLI). Brings a hand-installed/marketplace skill under managed control: copies `~/.claude/skills/<name>` → `~/.ai-bridge/imports/<name>/content/`, verifies the digest, appends a `[[skill]]` entry (source="local") to the manifest, and applies with `--adopt` so the byte-identical personal mirror is taken over (rather than collided with). Refuses when: name unsafe, missing personal skill, already in manifest, OR `~/.agents/skills/<name>` exists with DIFFERENT content (the user should resolve that divergence via M first).
+- **`U` = check upstream** (TUI key + `skills managed check-upstream` CLI). For every enabled+tracked git skill, runs `git ls-remote [--refs] <repo> <update_ref>` (same hardening as the rest of git: GIT_TERMINAL_PROMPT=0, GIT_ASKPASS=echo, 120s timeout, kill on expiry). Background-threaded so the TUI stays responsive. Tracking is OPT-IN per skill via the new optional `update_ref` manifest field (e.g. `update_ref = "HEAD"` or `update_ref = "refs/heads/main"`) — Codex requirement: "do not hardcode HEAD as the update source unless the manifest explicitly says so."
+- **`B` = bump-and-apply** (TUI key + `skills managed bump <name> <new-sha>` CLI). Two-phase in the TUI: first `B` press stages the upstream candidate via `bump_prepare` on a background thread (computes new digest, added/removed/modified file counts) and shows a one-line PREVIEW in the footer (e.g. `sk : 148ccfdf → 1523604f (+0 ~1 -0 files) — press B AGAIN to commit`); any other keypress cancels (preview dropped, staged temp cleaned via `Drop`). Second `B` press calls `bump_commit`, which writes the new SHA into the manifest via the pure, unit-tested `replace_skill_ref()` (rewrites ONLY the target block's `ref =` line, preserves comments/whitespace/other entries, returns `None` on miss), then runs apply with the immutable pin. CLI `bump` combines prepare+commit in one call (the argv-with-explicit-SHA is the user's confirmation, per Codex).
+- **Audit log** at `~/.ai-bridge/managed-skills.audit.jsonl` — one JSON line per mutation (`event`/`name`/`ok`/`detail`/`ts_ms`). Best-effort: a log write failure NEVER fails the operation.
+- **`apply_inner` refactor**: the public `apply` acquires the `ProcessLock` then calls private `apply_inner`; M, R, B all hold the lock themselves and call `apply_inner` (no double-acquire deadlock).
+- 121 core tests (incl. new `replace_skill_ref_targets_only_the_named_block` + `parse_manifest_reads_update_ref`) + 7 TUI tests, fmt+clippy(all-targets) clean. End-to-end smoke verified M/R/U/B + audit log on a local-git-repo sandbox.
+
+### Deferred (Codex, not blocking)
+
+- State-aware Skills footer (only show keys applicable to the selected row's state) — v0.18 polish.
+- Type-level lock token on `apply_inner` (prevent accidental future unsafe calls).
+- Direct unit test for M's apply-failure-restore path (smoke-tested manually; symmetric code).
+- react-review as a managed-skill example — Codex requested separate vetting (wrapper skill with extra surface area).
+
 ## [0.16.0] - 2026-05-25
 
 ### Added — every `managed-skills` action is now in `aibridge status` (no CLI required)

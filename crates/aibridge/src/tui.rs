@@ -92,6 +92,16 @@ enum McpView {
 /// A finished background discovery: (server name, discovered tools or error).
 type DiscoverResult = (String, Result<Vec<String>, String>);
 
+/// What a background `bump_prepare` or `bump_commit` produced.
+enum BumpFlowMsg {
+    /// Staging completed → here's the preview; show it and wait for the SECOND `B`.
+    Prepared(aibridge_core::managed_skills::BumpPreview),
+    /// Either preparing or committing failed → display this error in the footer.
+    Failed(String),
+    /// Committing completed → display this result and refresh.
+    Committed(aibridge_core::managed_skills::OpResult),
+}
+
 /// Dashboard state: data snapshots + selection. Rendering and IO live in free
 /// functions / refresh methods so the navigation logic stays pure + testable.
 struct App {
@@ -122,10 +132,9 @@ struct App {
     update_line: String,
     update_rx: Option<std::sync::mpsc::Receiver<String>>,
     update_on_exit: bool,
-    /// Skills tab: the (lazily-computed) `skills::doctor()` report + its scroll. `None`
-    /// until first viewed so startup stays snappy (the digest reads many skill files).
+    /// Skills tab: the (lazily-computed) personal-skills `skills::doctor()` text. Kept
+    /// for backward-compat with the Health rendering; managed-skills now own the tab UI.
     skills_report: Option<String>,
-    skills_scroll: u16,
     /// Pending 2-key confirm for a MUTATING Skills action — letters (`s`/`m`/`i`/`n`/`d`/
     /// `x`/`p`/`o`) and a sentinel `\n` for Enter (the per-skill install). The action only
     /// runs on the SECOND matching press; any other key cancels it.
@@ -139,6 +148,19 @@ struct App {
     managed_sel: usize,
     /// `Some(err)` ⇒ the manifest is missing/invalid (the list shows the hint to `n` init).
     managed_error: Option<String>,
+    /// `U` check-upstream: in-flight network probe (background thread → channel) + the
+    /// last-fetched candidates by skill name (so the UI can annotate rows + `B` can use them).
+    upstream_rx:
+        Option<std::sync::mpsc::Receiver<Vec<aibridge_core::managed_skills::UpstreamCandidate>>>,
+    upstream_candidates:
+        std::collections::HashMap<String, aibridge_core::managed_skills::UpstreamCandidate>,
+    /// `B` two-phase: the staged preview from `bump_prepare`. First `B` press stages and
+    /// puts the preview here; second `B` press commits (writes manifest + applies). Drop
+    /// (on cancel or successful commit) cleans the staged temp.
+    pending_bump: Option<aibridge_core::managed_skills::BumpPreview>,
+    /// `B`/`U` in-flight on a background thread (lock would freeze the UI if held in the
+    /// event loop).
+    bump_rx: Option<std::sync::mpsc::Receiver<BumpFlowMsg>>,
     message: Option<String>,
     quit: bool,
 }
@@ -166,12 +188,15 @@ impl App {
             update_rx: None,
             update_on_exit: false,
             skills_report: None,
-            skills_scroll: 0,
             skills_confirm: None,
             managed_apply_rx: None,
             managed_rows: Vec::new(),
             managed_sel: 0,
             managed_error: None,
+            upstream_rx: None,
+            upstream_candidates: std::collections::HashMap::new(),
+            pending_bump: None,
+            bump_rx: None,
             message: None,
             quit: false,
         };
@@ -272,6 +297,158 @@ impl App {
         self.managed_rows
             .get(self.managed_sel)
             .map(|s| s.name.clone())
+    }
+
+    /// `M` in TUI → migrate-and-install the selected skill: quarantine the foreign mirror(s)
+    /// into ~/.ai-bridge/backups/ (reversible) and apply. Runs on a background thread
+    /// because the apply phase fetches the pinned source.
+    fn start_managed_migrate(&mut self) {
+        let Some(name) = self.selected_managed() else {
+            return;
+        };
+        if self.managed_apply_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.managed_apply_rx = Some(rx);
+        self.message = Some(format!(
+            "Migrate-and-install {name} — quarantining foreign + fetching pinned source..."
+        ));
+        std::thread::spawn(move || {
+            let r = aibridge_core::managed_skills::migrate_and_install(&name);
+            let _ = tx.send(r.message);
+        });
+    }
+
+    /// `U` in TUI → probe upstream for every enabled+tracked git skill. Network on a
+    /// background thread; results fold into `upstream_candidates` so rows can annotate.
+    fn start_check_upstream(&mut self) {
+        if self.upstream_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.upstream_rx = Some(rx);
+        self.message = Some("Probing upstream for every tracked managed skill...".into());
+        std::thread::spawn(move || {
+            let cands = aibridge_core::managed_skills::check_upstream();
+            let _ = tx.send(cands);
+        });
+    }
+
+    fn poll_check_upstream(&mut self) {
+        if let Some(rx) = &self.upstream_rx {
+            if let Ok(cands) = rx.try_recv() {
+                self.upstream_rx = None;
+                let probed = cands.len();
+                let mut updates = 0;
+                self.upstream_candidates.clear();
+                for c in cands {
+                    if c.update_available() {
+                        updates += 1;
+                    }
+                    self.upstream_candidates.insert(c.name.clone(), c);
+                }
+                self.message = Some(format!(
+                    "Upstream probe: {probed} tracked, {updates} update(s) available. \
+                     Press B (twice) on a row to bump it."
+                ));
+            }
+        }
+    }
+
+    /// `B` first press in TUI → stage the upstream candidate on a background thread; on
+    /// completion, store the preview and surface its summary in the footer. A second `B`
+    /// then commits (writes manifest + applies).
+    fn start_bump_prepare(&mut self) {
+        let Some(name) = self.selected_managed() else {
+            return;
+        };
+        let Some(cand) = self.upstream_candidates.get(&name).cloned() else {
+            self.message = Some(format!(
+                "No upstream candidate for {name}. Press U first to probe (the skill needs `update_ref` in the manifest)."
+            ));
+            return;
+        };
+        let Some(new_sha) = cand.upstream_sha else {
+            self.message = Some(format!(
+                "Upstream probe for {name} failed earlier (network/auth?) — press U again."
+            ));
+            return;
+        };
+        if new_sha == cand.current_sha {
+            self.message = Some(format!("{name} is already at upstream — nothing to bump."));
+            return;
+        }
+        if self.bump_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.bump_rx = Some(rx);
+        self.message = Some(format!(
+            "Staging upstream {} for {name}...",
+            &new_sha[..new_sha.len().min(8)]
+        ));
+        std::thread::spawn(move || {
+            let msg = match aibridge_core::managed_skills::bump_prepare(&name, &new_sha) {
+                Ok(p) => BumpFlowMsg::Prepared(p),
+                Err(e) => BumpFlowMsg::Failed(e),
+            };
+            let _ = tx.send(msg);
+        });
+    }
+
+    /// `B` second press → commit the held preview (writes manifest ref + apply).
+    fn start_bump_commit(&mut self) {
+        let Some(preview) = self.pending_bump.take() else {
+            return;
+        };
+        if self.bump_rx.is_some() {
+            self.pending_bump = Some(preview);
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.bump_rx = Some(rx);
+        let label = preview.summary();
+        self.message = Some(format!(
+            "Committing bump {label} — writing manifest + applying..."
+        ));
+        std::thread::spawn(move || {
+            let r = aibridge_core::managed_skills::bump_commit(preview);
+            let _ = tx.send(BumpFlowMsg::Committed(r));
+        });
+    }
+
+    fn poll_bump(&mut self) {
+        if let Some(rx) = &self.bump_rx {
+            if let Ok(msg) = rx.try_recv() {
+                self.bump_rx = None;
+                match msg {
+                    BumpFlowMsg::Prepared(preview) => {
+                        let summary = preview.summary();
+                        self.pending_bump = Some(preview);
+                        self.message = Some(format!(
+                            "Bump preview: {summary} — press B AGAIN to commit, any other key cancels."
+                        ));
+                    }
+                    BumpFlowMsg::Failed(e) => {
+                        self.pending_bump = None;
+                        self.message = Some(format!("bump failed: {e}"));
+                    }
+                    BumpFlowMsg::Committed(r) => {
+                        self.refresh_skills();
+                        self.message = Some(format_managed_message("bump", &r));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Drop any held bump preview (e.g. when the user navigates away).
+    fn clear_pending_bump(&mut self) {
+        if self.pending_bump.is_some() {
+            self.pending_bump = None;
+            self.message = Some("Bump preview cancelled.".into());
+        }
     }
 
     /// Poll the in-flight managed apply; on completion refresh the report + surface a line.
@@ -653,6 +830,8 @@ fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
         app.poll_update(); // fold in a finished background update-check
         app.poll_discover(); // fold in a finished background tool-discovery
         app.poll_managed_apply(); // fold in a finished background managed-skills apply
+        app.poll_check_upstream(); // fold in the upstream probe result
+        app.poll_bump(); // fold in a finished bump prepare/commit
         if app.tab == Tab::Skills && app.skills_report.is_none() {
             app.refresh_skills(); // lazy first compute (folder digests) on first view
         }
@@ -679,7 +858,15 @@ fn handle_key(app: &mut App, code: KeyCode) {
                 | KeyCode::Char('x')
                 | KeyCode::Char('p')
                 | KeyCode::Char('o')
+                | KeyCode::Char('M')
+                | KeyCode::Char('U')
+                | KeyCode::Char('B')
         ) || matches!(code, KeyCode::Enter));
+    // Pressing any Skills key that ISN'T a continuation of the held bump preview cancels it
+    // (so navigation/quit-key/etc. doesn't accidentally commit a preview).
+    if app.tab == Tab::Skills && app.pending_bump.is_some() && !matches!(code, KeyCode::Char('B')) {
+        app.clear_pending_bump();
+    }
     if !is_skills_mutate {
         app.skills_confirm = None;
     }
@@ -847,12 +1034,34 @@ fn handle_key(app: &mut App, code: KeyCode) {
                 ));
             }
         }
-        // Skills tab: PgUp/PgDn scroll the personal-skills doctor (bottom panel).
-        KeyCode::PageDown if app.tab == Tab::Skills => {
-            app.skills_scroll = app.skills_scroll.saturating_add(4);
+        // `M` = migrate-and-install the selected skill (quarantine foreign → ~/.ai-bridge/
+        // backups/ then apply). Background thread; 2-key confirm.
+        KeyCode::Char('M') if app.tab == Tab::Skills => {
+            if app.selected_managed().is_none() {
+                app.skills_confirm = None;
+            } else if app.skills_confirm_press('M') {
+                app.start_managed_migrate();
+            } else if let Some(n) = app.selected_managed() {
+                app.message = Some(format!(
+                    "Press M again to MIGRATE-AND-INSTALL {n} (foreign mirror is moved to ~/.ai-bridge/backups/ then apply runs); any other key cancels"
+                ));
+            }
         }
-        KeyCode::PageUp if app.tab == Tab::Skills => {
-            app.skills_scroll = app.skills_scroll.saturating_sub(4);
+        // `U` = check upstream for every tracked skill (network on a background thread).
+        // Not state-changing → no 2-key confirm needed; single press is enough.
+        KeyCode::Char('U') if app.tab == Tab::Skills => {
+            app.skills_confirm = None;
+            app.start_check_upstream();
+        }
+        // `B` = bump-and-apply: FIRST press stages the upstream candidate (preview); SECOND
+        // press commits (writes manifest + applies). Preview drops if any other key is
+        // pressed (handled near the top of `handle_key`).
+        KeyCode::Char('B') if app.tab == Tab::Skills => {
+            if app.pending_bump.is_some() {
+                app.start_bump_commit();
+            } else {
+                app.start_bump_prepare();
+            }
         }
         KeyCode::Char('r') => {
             app.refresh_all();
@@ -896,7 +1105,7 @@ fn ui(f: &mut Frame, app: &App) {
         }
         Tab::Health => "Tab/Left/Right: tabs | Up/Down: scroll | r: refresh | q: quit",
         Tab::Skills => {
-            "Up/Dn: select | Enter: install | p: repair | o: adopt | d: disable | x: remove | i: apply all | n: init | s/m: sync/migrate | PgUp/Dn: scroll | r: refresh | q: quit"
+            "Up/Dn: select | Enter: install | M: migrate-and-install | U: check upstream | B: bump (preview→commit) | p: repair | o: adopt | d: disable | x: remove | i: apply all | n: init | s/m: personal sync/migrate | r: refresh | q: quit"
         }
         Tab::Review => "Tab/Left/Right: tabs | r: refresh | q: quit (auto-refreshes ~1s)",
         Tab::Update => {
@@ -911,10 +1120,8 @@ fn ui(f: &mut Frame, app: &App) {
 }
 
 fn render_skills(f: &mut Frame, app: &App, area: Rect) {
-    // TOP: interactive managed-skills list. BOTTOM: read-only personal-skills doctor.
-    let rows =
-        Layout::vertical([Constraint::Percentage(55), Constraint::Percentage(45)]).split(area);
-
+    // Full-screen managed-skills list. The personal-skills doctor moved to the Health tab
+    // (see `review feed (skills)`) — it was passive display, not actionable here.
     let manifest_hint = "manifest: ~/.ai-bridge/skills-managed.toml — edit externally, then 'r'";
     let items: Vec<ListItem> = if let Some(err) = &app.managed_error {
         vec![ListItem::new(format!(
@@ -922,7 +1129,7 @@ fn render_skills(f: &mut Frame, app: &App, area: Rect) {
         ))]
     } else if app.managed_rows.is_empty() {
         vec![ListItem::new(
-            "(no managed skills declared yet. Press 'n' to init a starter manifest.)",
+            "(no managed skills declared yet. Press 'n' to init a starter manifest, then edit it.)",
         )]
     } else {
         app.managed_rows
@@ -932,16 +1139,29 @@ fn render_skills(f: &mut Frame, app: &App, area: Rect) {
                 let mark = if s.attention { "!" } else { " " };
                 let en = if s.enabled { "on " } else { "off" };
                 let prefix = if i == app.managed_sel { ">" } else { " " };
+                // Annotate the state with an upstream candidate when one is known.
+                let upstream = app
+                    .upstream_candidates
+                    .get(&s.name)
+                    .and_then(|c| match (&c.upstream_sha, c.update_available()) {
+                        (Some(new), true) => Some(format!(
+                            "  ↑ upstream {} available",
+                            &new[..new.len().min(8)]
+                        )),
+                        (None, _) => Some("  (upstream probe failed — press U)".into()),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
                 let line = format!(
-                    "{prefix} {mark} {:<22} [{en}] {:<10} {}",
-                    s.name, s.pin, s.state
+                    "{prefix} {mark} {:<22} [{en}] {:<10} {}{}",
+                    s.name, s.pin, s.state, upstream
                 );
                 let style = if i == app.managed_sel {
                     Style::default()
                         .fg(Color::Black)
                         .bg(Color::Cyan)
                         .add_modifier(Modifier::BOLD)
-                } else if s.attention {
+                } else if s.attention || upstream.contains("upstream") {
                     Style::default().fg(Color::Yellow)
                 } else {
                     Style::default()
@@ -955,19 +1175,7 @@ fn render_skills(f: &mut Frame, app: &App, area: Rect) {
             .borders(Borders::ALL)
             .title(format!("Managed skills  ({manifest_hint})")),
     );
-    f.render_widget(list, rows[0]);
-
-    let body = app
-        .skills_report
-        .as_deref()
-        .unwrap_or("Loading personal-skills report (digesting skill folders)...");
-    let p = Paragraph::new(body)
-        .block(Block::default().borders(Borders::ALL).title(
-            "Personal skills — Claude Code + Codex  (s: sync hub→agents; m: migrate legacy)",
-        ))
-        .wrap(Wrap { trim: false })
-        .scroll((app.skills_scroll, 0));
-    f.render_widget(p, rows[1]);
+    f.render_widget(list, area);
 }
 
 fn render_health(f: &mut Frame, app: &App, area: Rect) {
@@ -1193,12 +1401,15 @@ mod tests {
             update_rx: None,
             update_on_exit: false,
             skills_report: None,
-            skills_scroll: 0,
             skills_confirm: None,
             managed_apply_rx: None,
             managed_rows: Vec::new(),
             managed_sel: 0,
             managed_error: None,
+            upstream_rx: None,
+            upstream_candidates: std::collections::HashMap::new(),
+            pending_bump: None,
+            bump_rx: None,
             mcp: Some(
                 names
                     .iter()
