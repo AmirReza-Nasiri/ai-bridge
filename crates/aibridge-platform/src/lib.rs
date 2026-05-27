@@ -85,6 +85,8 @@ impl SpawnPlan {
     }
 }
 
+mod clipboard_helper;
+
 #[cfg(unix)]
 mod unix;
 #[cfg(windows)]
@@ -94,6 +96,72 @@ mod windows;
 pub use unix::UnixPlatform as DefaultPlatform;
 #[cfg(windows)]
 pub use windows::WindowsPlatform as DefaultPlatform;
+
+// ───────────────────────── ClipboardWriter ─────────────────────────
+
+/// Copy plain text to the OS clipboard. Injectable so the TUI can mock it in
+/// unit tests (no real clipboard mutation in `cargo test`). Implementations
+/// MUST be bounded — never block the caller longer than a few seconds.
+pub trait ClipboardWriter: Send + Sync {
+    /// Returns bytes-written count on success; descriptive `Err(reason)` otherwise.
+    fn copy(&self, text: &str) -> Result<usize, String>;
+}
+
+/// Production [`ClipboardWriter`] using the platform's standard clipboard tool:
+/// - Windows: `clip.exe` (built-in).
+/// - macOS: `pbcopy`.
+/// - Linux: tries `xclip -selection clipboard`, then `wl-copy`. Returns a clear
+///   "no clipboard tool found" error if neither is installed.
+pub struct RealClipboardWriter;
+
+impl ClipboardWriter for RealClipboardWriter {
+    fn copy(&self, text: &str) -> Result<usize, String> {
+        use std::process::Command;
+        use std::time::Duration;
+        let bytes = text.as_bytes();
+        let timeout = Duration::from_secs(2);
+        #[cfg(windows)]
+        {
+            let cmd = Command::new("clip.exe");
+            clipboard_helper::spawn_stdin_write_bounded(cmd, bytes, timeout)
+                .map_err(|e| format!("clip.exe: {e}"))
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let cmd = Command::new("pbcopy");
+            clipboard_helper::spawn_stdin_write_bounded(cmd, bytes, timeout)
+                .map_err(|e| format!("pbcopy: {e}"))
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            let mut errs: Vec<String> = Vec::new();
+            for (prog, args) in &[
+                ("xclip", vec!["-selection", "clipboard"]),
+                ("wl-copy", vec![]),
+            ] {
+                let mut cmd = Command::new(prog);
+                for a in args {
+                    cmd.arg(a);
+                }
+                match clipboard_helper::spawn_stdin_write_bounded(cmd, bytes, timeout) {
+                    Ok(n) => return Ok(n),
+                    Err(e) => errs.push(format!("{prog}: {e}")),
+                }
+            }
+            Err(format!(
+                "no clipboard tool found (tried: {})",
+                errs.join("; ")
+            ))
+        }
+    }
+}
+
+/// Factory: returns a heap-allocated production [`ClipboardWriter`]. Used by the
+/// TUI's `App::new` constructor. Tests construct their own `App::new_for_test`
+/// with a mock.
+pub fn real_clipboard() -> Box<dyn ClipboardWriter> {
+    Box::new(RealClipboardWriter)
+}
 
 /// Human-readable name of the current platform.
 pub fn platform_name() -> &'static str {

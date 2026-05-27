@@ -387,14 +387,37 @@ fn confirm(prompt: &str) -> bool {
     }
 }
 
-fn make_temp_dir() -> Result<PathBuf, String> {
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let dir = std::env::temp_dir().join(format!("aibridge-update-{}-{}", std::process::id(), ts));
-    std::fs::create_dir_all(&dir).map_err(|e| format!("can't make temp dir: {e}"))?;
-    Ok(dir)
+/// RAII guard for a temp directory: the path is created on `new()` and removed
+/// by `Drop` unless explicitly `disarm`-ed. This replaces the v0.20.0 pattern of
+/// scattered `let _ = std::fs::remove_dir_all(&tmp)` lines across every error
+/// path — a maintenance hazard (reviewer F2). The guard cleans up on panic too.
+pub(crate) struct TempDirGuard {
+    path: Option<PathBuf>,
+}
+
+impl TempDirGuard {
+    pub fn new(label: &str) -> Result<Self, String> {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir =
+            std::env::temp_dir().join(format!("aibridge-{}-{}-{}", label, std::process::id(), ts));
+        std::fs::create_dir_all(&dir).map_err(|e| format!("can't make temp dir: {e}"))?;
+        Ok(Self { path: Some(dir) })
+    }
+
+    pub fn path(&self) -> &Path {
+        self.path.as_ref().expect("path before disarm")
+    }
+}
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        if let Some(p) = self.path.take() {
+            let _ = std::fs::remove_dir_all(&p);
+        }
+    }
 }
 
 /// Replace the installed binary with the verified `staged` file.
@@ -752,6 +775,16 @@ pub fn plan_update(opts: &ApplyOptions) -> Result<UpdateDecision, String> {
 /// between cleanup and apply (or a direct call bypassing the orchestrator)
 /// could leave one alive. The guard never kills — just aborts cleanly.
 pub fn apply_planned_update(planned: PlannedUpdate) -> Result<String, String> {
+    apply_planned_update_with_enumerator(planned, &crate::process_cleanup::RealProcessEnumerator)
+}
+
+/// Variant of [`apply_planned_update`] with an injectable `ProcessEnumerator`.
+/// Tests use a `FakeEnumerator` to assert fail-closed semantics; production
+/// goes through the wrapper above. v0.20.1 Codex Stop-gate R3 B4.
+pub fn apply_planned_update_with_enumerator(
+    planned: PlannedUpdate,
+    enumerator: &dyn crate::process_cleanup::ProcessEnumerator,
+) -> Result<String, String> {
     let install_path = planned.install_path.clone();
     let tag = planned.tag.clone();
     let latest = planned.to;
@@ -764,29 +797,38 @@ pub fn apply_planned_update(planned: PlannedUpdate) -> Result<String, String> {
         .parent()
         .ok_or("install path has no parent directory")?;
 
-    // Safety net: refuse if same-path stale processes remain.
-    let enum_ = crate::process_cleanup::RealProcessEnumerator;
-    if let Ok(stale) = crate::process_cleanup::ProcessEnumerator::list_aibridge(&enum_) {
-        let target = crate::process_cleanup::select_stale_processes(
-            &stale,
-            &install_path,
-            std::process::id(),
-            crate::process_cleanup::parent_pid(),
-        );
-        if !target.is_empty() {
-            let pids: Vec<u32> = target.iter().map(|p| p.pid).collect();
-            return Err(format!(
-                "race detected: {} stale aibridge process(es) at {} (PIDs {:?}); \
-                 close them and re-run",
-                target.len(),
-                install_path.display(),
-                pids
-            ));
-        }
+    // Safety net: refuse if same-path stale processes remain. v0.20.1 R3 (reviewer
+    // F7): fail CLOSED on enumeration error — the prior `if let Ok(stale) = ...`
+    // silently allowed the update through on sysinfo errors.
+    let stale =
+        crate::process_cleanup::ProcessEnumerator::list_aibridge(enumerator).map_err(|e| {
+            format!(
+                "can't verify stale aibridge processes ({e}); \
+                 refusing to update — re-run after the process table is readable"
+            )
+        })?;
+    let target = crate::process_cleanup::select_stale_processes(
+        &stale,
+        &install_path,
+        std::process::id(),
+        crate::process_cleanup::parent_pid(),
+    );
+    if !target.is_empty() {
+        let pids: Vec<u32> = target.iter().map(|p| p.pid).collect();
+        return Err(format!(
+            "race detected: {} stale aibridge process(es) at {} (PIDs {:?}); \
+             close them and re-run",
+            target.len(),
+            install_path.display(),
+            pids
+        ));
     }
 
-    // Download the asset + its checksum into a fresh temp dir (no --clobber needed).
-    let tmp = make_temp_dir()?;
+    // Download the asset + its checksum into a fresh temp dir. v0.20.1 reviewer F2:
+    // RAII guard removes the dir on any error path INCLUDING panics — no more
+    // scattered `let _ = std::fs::remove_dir_all(&tmp)` lines.
+    let tmp_guard = TempDirGuard::new("update")?;
+    let tmp = tmp_guard.path().to_path_buf();
     let asset = asset_name();
     let sha_asset = format!("{asset}.sha256");
     let slug = repo_slug();
@@ -810,7 +852,6 @@ pub fn apply_planned_update(planned: PlannedUpdate) -> Result<String, String> {
     match dl {
         Ok(o) if o.status.success() => {}
         Ok(o) => {
-            let _ = std::fs::remove_dir_all(&tmp);
             let why = String::from_utf8_lossy(&o.stderr);
             let why = why
                 .lines()
@@ -824,11 +865,9 @@ pub fn apply_planned_update(planned: PlannedUpdate) -> Result<String, String> {
             ));
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let _ = std::fs::remove_dir_all(&tmp);
             return Err("update needs the GitHub CLI (`gh`).".to_string());
         }
         Err(e) => {
-            let _ = std::fs::remove_dir_all(&tmp);
             return Err(format!("download failed: {e}"));
         }
     }
@@ -836,20 +875,17 @@ pub fn apply_planned_update(planned: PlannedUpdate) -> Result<String, String> {
     let dl_bin = tmp.join(&asset);
     let dl_sha = tmp.join(&sha_asset);
     if !dl_bin.exists() || !dl_sha.exists() {
-        let _ = std::fs::remove_dir_all(&tmp);
         return Err(format!(
             "download incomplete (missing {asset} or its .sha256)"
         ));
     }
     if let Err(e) = verify_sha256(&dl_bin, &dl_sha) {
-        let _ = std::fs::remove_dir_all(&tmp);
         return Err(format!("refusing to install — {e}"));
     }
 
     // Stage in the install DIR (same filesystem as the target) so the swap is atomic.
     let staged = install_dir.join(format!("{}.new", asset_filename(&install_path)));
     if let Err(e) = std::fs::copy(&dl_bin, &staged) {
-        let _ = std::fs::remove_dir_all(&tmp);
         return Err(format!("couldn't stage the new binary: {e}"));
     }
     #[cfg(unix)]
@@ -858,14 +894,8 @@ pub fn apply_planned_update(planned: PlannedUpdate) -> Result<String, String> {
         let _ = std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755));
     }
 
-    let note = match replace_binary(&install_path, &staged) {
-        Ok(n) => n,
-        Err(e) => {
-            let _ = std::fs::remove_dir_all(&tmp);
-            return Err(e);
-        }
-    };
-    let _ = std::fs::remove_dir_all(&tmp);
+    let note = replace_binary(&install_path, &staged)?;
+    // tmp_guard drops here and removes the temp dir.
 
     // Record the now-installed version (the tag we just placed), not the old one.
     let install_str = install_path.display().to_string();
@@ -1311,6 +1341,47 @@ mod tests {
         )
         .unwrap();
         assert!(r.contains("applied-after-cleanup"));
+    }
+
+    // ─── v0.20.1 TempDirGuard + apply_planned_update_with_enumerator ───
+    #[test]
+    fn tempdir_guard_removes_on_drop() {
+        let path = {
+            let g = TempDirGuard::new("test-guard").expect("guard");
+            let p = g.path().to_path_buf();
+            assert!(p.exists(), "guard path must exist while held");
+            p
+        }; // guard dropped here
+        assert!(!path.exists(), "guard must remove dir on drop");
+    }
+
+    struct FailingEnumerator {
+        msg: &'static str,
+    }
+    impl crate::process_cleanup::ProcessEnumerator for FailingEnumerator {
+        fn list_aibridge(&self) -> Result<Vec<crate::process_cleanup::StaleProcess>, String> {
+            Err(self.msg.to_string())
+        }
+    }
+
+    #[test]
+    fn apply_planned_update_with_enumerator_aborts_on_enumeration_error() {
+        let p = PlannedUpdate {
+            install_path: PathBuf::from("/tmp/aibridge-test-target"),
+            tag: "v99.0.0".into(),
+            from: parse_version("0.20.1"),
+            to: parse_version("99.0.0").unwrap(),
+        };
+        let enumer = FailingEnumerator {
+            msg: "simulated permission denied",
+        };
+        let r = apply_planned_update_with_enumerator(p, &enumer);
+        assert!(r.is_err());
+        let err = r.unwrap_err();
+        assert!(
+            err.contains("refusing to update") && err.contains("simulated permission denied"),
+            "expected fail-closed error message, got: {err}"
+        );
     }
 
     #[test]

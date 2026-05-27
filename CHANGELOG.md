@@ -6,6 +6,30 @@ versioning is semver.
 
 ## [Unreleased]
 
+## [0.20.1] - 2026-05-27
+
+### Fixed
+- **TUI Update tab: pressing `u` while already on the latest release no longer exits the dashboard.** v0.20.0 unconditionally set `update_on_exit = true; quit = true` for the aibridge self row, dumping the user to a shell with a "Already on the latest release" message instead of just showing it in-place. v0.20.1 replaces the heuristic `update_line` string-matching with a typed `SelfUpdateState` enum (`Unprobed` / `Checking` / `UpToDate` / `Newer` / `Error`). Only `Newer` triggers the TUI exit + apply path; every other state shows a footer message and stays in the dashboard. The `c` key explicitly re-probes (with an in-flight guard so concurrent `c` presses don't fire two probes); the first Update-tab entry kicks off one auto-probe via a one-shot guard.
+
+### Added
+- **`y` key copies the current report to the clipboard** on Debug and Health tabs. Cross-platform via a new `aibridge_platform::ClipboardWriter` trait: Windows uses `clip.exe`, macOS uses `pbcopy`, Linux tries `xclip -selection clipboard` then falls back to `wl-copy`. All shell-outs are bounded to a 2-second deadline via a new `clipboard_helper::spawn_stdin_write_bounded` helper that pipes stdin, drops it for EOF, polls `try_wait` to the deadline, and force-kills on timeout. Windows path sets `CREATE_NO_WINDOW` so no console flashes. Refuses to copy a still-building Debug report (`debug_rx.is_some()`); shows a "press `r`" hint when the report is empty. Footer message reports `copied N bytes` or the failure reason.
+- **Injectable `Planner` (Arc'd closure) on `App`** so the TUI's self-update probe is hermetic in tests — production wraps `aibridge_core::update::plan_update`; tests pass a synthetic `UpdateDecision` closure. `cargo test` no longer touches GitHub or `gh`.
+
+### Internal — reviewer-flagged stability fixes
+- **`update::TempDirGuard` RAII** (reviewer F2): replaces the scattered `let _ = std::fs::remove_dir_all(&tmp)` pattern in `apply_planned_update` with a guard that removes the directory on Drop — including the panic path.
+- **`apply_planned_update_with_enumerator(planned, &dyn ProcessEnumerator)` seam** (reviewer F7 + Codex R3 B4): the prior `if let Ok(stale) = ...` silently allowed updates through when sysinfo enumeration failed. v0.20.1 fails closed with an actionable message. Tests inject `FailingEnumerator` to assert the new behavior.
+- **`rtk::sanitize_snippet` + `truncate_chars`** (reviewer F6 + Codex R3 B5): the previous `&combined[..200]` truncation in `rtk_identity_check` would panic on multi-byte input (Persian, emoji, etc.). The new helper collapses control characters (newlines, NUL, etc.) to spaces, collapses runs of whitespace to one, and truncates safely at character boundaries. The truncation limit is reduced from 200 to 100 chars to further limit accidental log noise.
+
+### Tests
+- **+15 new unit tests across `tui`, `update`, `rtk`**. Total: ~319 passing (up from 304 in v0.20.0).
+  - `tui::tests`: 5 typed-state dispatch tests for `handle_update_action`, 2 in-flight-guard tests for the `c` key, 5 clipboard UX tests (Debug-with-text / Debug-while-building / Debug-no-text / Health-with-checks / Health-empty), 1 clipboard-failure test. All hermetic via `MockClipboard` + injected planner — no real clipboard or network in `cargo test`.
+  - `update::tests`: `tempdir_guard_removes_on_drop`, `apply_planned_update_with_enumerator_aborts_on_enumeration_error`.
+  - `rtk::tests`: `sanitize_snippet_handles_multibyte_safely`, `sanitize_snippet_truncates_at_char_boundary`, `truncate_chars_safe_on_multibyte`.
+
+### Deferred to v0.20.2
+- Reviewer findings F3 (kill-loop deadline), F4 (TOCTOU probe), F5 (staged-file panic leak), F8 (alloc), F10 (re-render every tick), F11 (dedup pending_cli_updates), F12 (cleanup-decline returns Ok), F13 (tar early-bail on ambiguity), F14 (prompts to stdout vs stderr).
+- `docs/install/{windows,macos}.md` rtk-policy text update (still says manual-only).
+
 ## [0.20.0] - 2026-05-26
 
 ### Added — safe self-update process cleanup + verified rtk auto-install/update (Codex APPROVE after 7 plan rounds)

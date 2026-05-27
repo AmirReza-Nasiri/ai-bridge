@@ -364,7 +364,7 @@ pub fn rtk_identity_check(runner: &dyn CommandRunner, exe: &Path) -> Result<(), 
     if !ok {
         return Err(format!(
             "{exe:?} --version exited non-zero (output: {})",
-            truncate(&combined, 200)
+            sanitize_snippet(&combined, 100)
         ));
     }
     if combined.contains("rtk-ai") || combined.contains("Rust Token Killer") {
@@ -373,16 +373,35 @@ pub fn rtk_identity_check(runner: &dyn CommandRunner, exe: &Path) -> Result<(), 
     Err(format!(
         "{exe:?} identity not confirmed (version banner missing 'rtk-ai' / 'Rust Token Killer' marker; \
          got: {})",
-        truncate(&combined, 200)
+        sanitize_snippet(&combined, 100)
     ))
 }
 
-fn truncate(s: &str, n: usize) -> String {
-    if s.len() <= n {
+/// UTF-8-safe character-count truncation. The prior `&s[..n]` form panicked on
+/// multi-byte input (Persian, emoji, etc.) — reviewer F6 + plan_gate R3 B5.
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
         s.to_string()
     } else {
-        format!("{}…", &s[..n])
+        let cut = s.char_indices().nth(max).map(|(i, _)| i).unwrap_or(s.len());
+        format!("{}…", &s[..cut])
     }
+}
+
+/// Sanitize a subprocess output snippet for embedding in a user-visible error.
+/// Collapses control chars (newlines, NUL, etc.) to single spaces, collapses
+/// runs of whitespace, then UTF-8-safe truncates to `max` chars. Prevents
+/// secrets in stderr from being formatted into a multi-line error string
+/// (reviewer F6).
+fn sanitize_snippet(raw: &str, max: usize) -> String {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    truncate_chars(&cleaned, max)
 }
 
 // ───────────────────────── target detection ─────────────────────────
@@ -849,7 +868,41 @@ fn collect_set(s: &[String]) -> HashSet<String> {
 mod tests {
     use super::*;
 
-    // ─── rtk_asset_name ───
+    // ─── v0.20.1 sanitize_snippet (multibyte safe, control chars stripped) ───
+    #[test]
+    fn sanitize_snippet_handles_multibyte_safely() {
+        let input = "rtk نسخه ۰.۴۰.۰\n\t\x00secret-token\r🦀more";
+        // Must not panic on the multi-byte input.
+        let out = sanitize_snippet(input, 100);
+        // No control chars (newline, tab, NUL, CR) survive.
+        assert!(!out.contains('\n'));
+        assert!(!out.contains('\t'));
+        assert!(!out.contains('\0'));
+        assert!(!out.contains('\r'));
+        // Persian + emoji preserved.
+        assert!(out.contains("نسخه"));
+        assert!(out.contains("🦀"));
+    }
+
+    #[test]
+    fn sanitize_snippet_truncates_at_char_boundary() {
+        // 200 Persian chars = 400 bytes (each char is 2 bytes in UTF-8).
+        let long = "ع".repeat(200);
+        let out = sanitize_snippet(&long, 50);
+        // Must not panic; output should be ≤ 50 chars (+ ellipsis).
+        assert!(out.chars().count() <= 51);
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn truncate_chars_safe_on_multibyte() {
+        let s = "abcعصلام";
+        // count is 7 chars
+        assert_eq!(truncate_chars(s, 10), s);
+        let cut = truncate_chars(s, 4);
+        assert_eq!(cut, "abcع…");
+    }
+
     #[test]
     fn rtk_asset_name_windows_x86_64() {
         assert_eq!(

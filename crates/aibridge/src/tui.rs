@@ -107,6 +107,36 @@ enum McpView {
 /// A finished background discovery: (server name, discovered tools or error).
 type DiscoverResult = (String, Result<Vec<String>, String>);
 
+/// Outcome of a self-update probe (Codex R3 B1+B6 typed-state replacement for
+/// the v0.20.0 string-matching `update_line` heuristic).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SelfUpdateState {
+    /// Initial state — no probe has run yet for this TUI session.
+    Unprobed,
+    /// A background probe is in flight (`update_rx` is `Some`).
+    Checking,
+    /// Probe returned `Skip { reason }` — already on latest, no release published, etc.
+    UpToDate { reason: String },
+    /// Probe returned `Apply(PlannedUpdate)` — newer release is available + valid.
+    Newer {
+        from: String,
+        to: String,
+        summary: String,
+    },
+    /// Probe failed (network, gh auth, missing asset, version parse). NOT updatable.
+    Error { detail: String },
+}
+
+/// Typed result sent from the probe worker back to the UI thread.
+type SelfUpdateProbeResult = Result<aibridge_core::update::UpdateDecision, String>;
+
+/// Injectable self-update planner. Production uses `aibridge_core::update::plan_update`;
+/// tests pass a closure that returns a synthetic `UpdateDecision` so no network
+/// call happens during `cargo test`. (Codex R3 B3.)
+type Planner = std::sync::Arc<
+    dyn Fn(&aibridge_core::update::ApplyOptions) -> SelfUpdateProbeResult + Send + Sync,
+>;
+
 /// A finished Claude-side discovery: (server name, tools or error). Same shape as the
 /// codex `DiscoverResult` but kept separate so a late codex-tab message can't poison
 /// the Claude inspector's per-tool view (and vice versa).
@@ -150,8 +180,23 @@ struct App {
     /// in-flight check (background thread → channel). The actual self-replace runs
     /// AFTER the TUI exits (clean terminal + real output), gated by `update_on_exit`.
     update_line: String,
-    update_rx: Option<std::sync::mpsc::Receiver<String>>,
+    update_rx: Option<std::sync::mpsc::Receiver<SelfUpdateProbeResult>>,
     update_on_exit: bool,
+    /// v0.20.1 (Codex R3 B1+B6): typed self-update state machine driving the
+    /// `u` keypress on row 0. Only `Newer` lets the TUI exit + apply; every
+    /// other state shows a footer message without quitting (fixes the UX where
+    /// pressing `u` while on the latest release dumped the user to the shell).
+    self_update_state: SelfUpdateState,
+    /// One-shot guard so the lazy auto-probe fires exactly once on first Update
+    /// tab entry. Manual `c` reruns are independent of this.
+    update_check_kicked: bool,
+    /// Clipboard writer for the Debug + Health tab `y` key. Injectable so tests
+    /// don't mutate the real system clipboard.
+    clipboard: Box<dyn aibridge_platform::ClipboardWriter>,
+    /// Injectable self-update planner. Production reads real GitHub releases via
+    /// `plan_update`; tests inject a closure returning a synthetic `UpdateDecision`
+    /// so the `c` key + first-view auto-trigger never touch the network in tests.
+    planner: Planner,
     /// CLI-update rows (codex / claude / rtk). Loaded on a background thread the
     /// first time the Update tab is entered and on `r`. Each row drives `u` in
     /// concert with `update_sel`. Codex Stop-gate R6: mutation runs AFTER TUI
@@ -246,6 +291,10 @@ impl App {
             update_line: "Press 'c' to check for a newer release.".to_string(),
             update_rx: None,
             update_on_exit: false,
+            self_update_state: SelfUpdateState::Unprobed,
+            update_check_kicked: false,
+            clipboard: aibridge_platform::real_clipboard(),
+            planner: std::sync::Arc::new(aibridge_core::update::plan_update),
             cli_checks: Vec::new(),
             cli_checks_rx: None,
             mcp_pins: Vec::new(),
@@ -730,25 +779,56 @@ impl App {
         self.message = Some(format!("{what}: {key}"));
     }
 
-    /// Start a background update CHECK (read-only, networked) so the event loop never
-    /// blocks. Idempotent while one is in flight.
-    fn start_update_check(&mut self) {
+    /// v0.20.1 Codex R3 B1: start a typed self-update probe on a worker thread.
+    /// The result populates `self_update_state` so `handle_update_action` row-0
+    /// dispatches on a typed enum (not a fragile string match). Idempotent while
+    /// one is in flight.
+    fn start_self_update_probe(&mut self) {
         if self.update_rx.is_some() {
             return;
         }
         let (tx, rx) = std::sync::mpsc::channel();
         self.update_rx = Some(rx);
+        self.self_update_state = SelfUpdateState::Checking;
         self.update_line = "Checking for a newer release...".to_string();
+        let planner = self.planner.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(aibridge_core::update::check_report(Duration::from_secs(15)));
+            let opts = aibridge_core::update::ApplyOptions {
+                assume_yes: true,
+                from_source: false,
+                target_path: None,
+            };
+            let _ = tx.send(planner(&opts));
         });
     }
 
     /// Poll the in-flight check; fold its result into the display line when ready.
     fn poll_update(&mut self) {
         if let Some(rx) = &self.update_rx {
-            if let Ok(msg) = rx.try_recv() {
-                self.update_line = msg;
+            if let Ok(result) = rx.try_recv() {
+                // Map the typed UpdateDecision into the typed SelfUpdateState.
+                use aibridge_core::update::UpdateDecision;
+                self.self_update_state = match result {
+                    Ok(UpdateDecision::Skip { reason }) => {
+                        self.update_line = reason.clone();
+                        SelfUpdateState::UpToDate { reason }
+                    }
+                    Ok(UpdateDecision::Apply(p)) => {
+                        let from = p
+                            .from
+                            .as_ref()
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|| "?".into());
+                        let to = p.to.to_string();
+                        let summary = format!("Newer release available: {from} → {to}");
+                        self.update_line = summary.clone();
+                        SelfUpdateState::Newer { from, to, summary }
+                    }
+                    Err(detail) => {
+                        self.update_line = format!("Self-update check failed: {detail}");
+                        SelfUpdateState::Error { detail }
+                    }
+                };
                 self.update_rx = None;
             }
         }
@@ -791,18 +871,90 @@ impl App {
         }
     }
 
-    /// Handle `u` on the Update tab. Routes by which row is selected:
-    /// - Row 0 (aibridge self) → existing `update_on_exit = true; quit = true`.
-    /// - CLI row with `suggested_command.is_some()` and verified pkg-manager
-    ///   source → enqueue into `pending_cli_updates` and exit the TUI.
-    /// - CLI row that's manual-only / unknown → show `manual_note`, no mutation.
-    /// - MCP pin row → never mutates; print a hint.
+    /// v0.20.1: copy the Debug report to clipboard. Per plan_gate R3 B4, refuses
+    /// to copy a still-building placeholder. Footer message reports outcome.
+    fn copy_debug_report_to_clipboard(&mut self) {
+        if self.debug_rx.is_some() {
+            self.message = Some("Debug report still building; try `y` again in a moment".into());
+            return;
+        }
+        let Some(text) = self.debug_text.as_deref() else {
+            self.message = Some("no Debug report yet — press `r` to build one".into());
+            return;
+        };
+        match self.clipboard.copy(text) {
+            Ok(n) => self.message = Some(format!("copied {n} bytes to clipboard")),
+            Err(e) => self.message = Some(format!("clipboard write failed: {e}")),
+        }
+    }
+
+    /// v0.20.1: render the cached Health-tab doctor checks to a plain-text
+    /// snapshot and copy to clipboard. Uses `app.checks` only (no network).
+    fn copy_health_report_to_clipboard(&mut self) {
+        if self.checks.is_empty() {
+            self.message = Some("no Health checks loaded yet — press `r` to refresh".into());
+            return;
+        }
+        let mut out = String::new();
+        out.push_str(&format!("AI Bridge {}\n", aibridge_core::VERSION_FULL));
+        out.push_str(&format!(
+            "Platform: {}\n\n",
+            aibridge_platform::platform_name()
+        ));
+        for c in &self.checks {
+            let tag = match c.status {
+                aibridge_core::doctor::Status::Pass => "[ok  ]",
+                aibridge_core::doctor::Status::Warn => "[warn]",
+                aibridge_core::doctor::Status::Fail => "[fail]",
+            };
+            let detail = if c.detail.is_empty() {
+                String::new()
+            } else {
+                format!(" — {}", c.detail)
+            };
+            out.push_str(&format!("{tag} {}{detail}\n", c.name));
+        }
+        match self.clipboard.copy(&out) {
+            Ok(n) => self.message = Some(format!("copied {n} bytes to clipboard")),
+            Err(e) => self.message = Some(format!("clipboard write failed: {e}")),
+        }
+    }
+
     fn handle_update_action(&mut self) {
         let idx = self.update_sel;
         if idx == 0 {
-            // SelfAibridge: defer mutation to after TUI exit (existing path).
-            self.update_on_exit = true;
-            self.quit = true;
+            // v0.20.1 R3 B1: dispatch on the TYPED self-update state. Only Newer
+            // exits the TUI; every other state shows a footer message and stays
+            // in the dashboard. Fixes the v0.20.0 bug where pressing `u` while
+            // already on the latest release dumped the user to the shell.
+            match &self.self_update_state {
+                SelfUpdateState::Newer { from, to, .. } => {
+                    self.update_line = format!("Applying update: {from} → {to}...");
+                    self.update_on_exit = true;
+                    self.quit = true;
+                }
+                SelfUpdateState::UpToDate { reason } => {
+                    self.message = Some(format!("aibridge is up to date — {reason}"));
+                }
+                SelfUpdateState::Checking => {
+                    self.message = Some(
+                        "still checking GitHub for a newer release — try `u` again when complete"
+                            .into(),
+                    );
+                }
+                SelfUpdateState::Unprobed => {
+                    // Kick a probe NOW and tell the user to retry.
+                    self.start_self_update_probe();
+                    self.message = Some(
+                        "probing GitHub for a newer release — try `u` again when complete".into(),
+                    );
+                }
+                SelfUpdateState::Error { detail } => {
+                    self.message = Some(format!(
+                        "self-update check failed: {detail} — press `c` to retry"
+                    ));
+                }
+            }
             return;
         }
         let cli_idx = idx - 1;
@@ -1244,6 +1396,12 @@ fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
         if app.tab == Tab::Update && app.cli_checks.is_empty() && app.cli_checks_rx.is_none() {
             app.start_cli_checks(); // lazy first run on first view
         }
+        if app.tab == Tab::Update && !app.update_check_kicked && app.update_rx.is_none() {
+            // v0.20.1 R3 B3: explicit one-shot guard so the lazy probe fires
+            // exactly once per TUI session. Subsequent refreshes use `c`.
+            app.update_check_kicked = true;
+            app.start_self_update_probe();
+        }
         // Live-refresh the (cheap) review status ~1s; heavy refresh only on `r`.
         if last_refresh.elapsed() >= Duration::from_secs(1) {
             app.refresh_review();
@@ -1347,7 +1505,16 @@ fn handle_key(app: &mut App, code: KeyCode) {
         {
             app.start_claude_discover()
         }
-        KeyCode::Char('c') if app.tab == Tab::Update => app.start_update_check(),
+        KeyCode::Char('c') if app.tab == Tab::Update => {
+            // v0.20.1 R3 B6: manual `c` reruns the probe UNLESS one is in flight.
+            // Lazy auto-trigger is one-shot via `update_check_kicked`; `c` lets
+            // the user explicitly refresh after an UpToDate/Error result.
+            if app.update_rx.is_some() {
+                app.message = Some("already checking; please wait".into());
+            } else {
+                app.start_self_update_probe();
+            }
+        }
         KeyCode::Char('u') if app.tab == Tab::Update => {
             // Per-row dispatch: self vs verified-pkg-manager CLI vs manual-only.
             // Mutation (any case) defers to after-TUI-exit per Codex Stop-gate R6.
@@ -1517,6 +1684,14 @@ fn handle_key(app: &mut App, code: KeyCode) {
                 app.cli_checks.clear();
                 app.start_cli_checks();
             }
+        }
+        // v0.20.1: `y` copies the current tab's report to the clipboard.
+        // Debug + Health are supported.
+        KeyCode::Char('y') if app.tab == Tab::Debug => {
+            app.copy_debug_report_to_clipboard();
+        }
+        KeyCode::Char('y') if app.tab == Tab::Health => {
+            app.copy_health_report_to_clipboard();
         }
         _ => {}
     }
@@ -2176,6 +2351,10 @@ mod tests {
             update_line: String::new(),
             update_rx: None,
             update_on_exit: false,
+            self_update_state: SelfUpdateState::Unprobed,
+            update_check_kicked: false,
+            clipboard: aibridge_platform::real_clipboard(),
+            planner: std::sync::Arc::new(aibridge_core::update::plan_update),
             cli_checks: Vec::new(),
             cli_checks_rx: None,
             mcp_pins: Vec::new(),
@@ -2260,14 +2439,227 @@ mod tests {
     }
 
     #[test]
-    fn update_u_on_self_row_sets_update_on_exit() {
+    fn update_u_on_self_row_with_newer_state_sets_update_on_exit() {
+        // v0.20.1 R3 B5: Updated for the typed-state behavior. Only `Newer` quits;
+        // `Unprobed` (the old default) now shows a footer message and stays in TUI.
         let mut a = test_app(&[]);
         a.tab = Tab::Update;
         a.update_sel = 0;
+        a.self_update_state = SelfUpdateState::Newer {
+            from: "0.20.0".into(),
+            to: "0.21.0".into(),
+            summary: "test".into(),
+        };
         a.handle_update_action();
         assert!(a.update_on_exit);
         assert!(a.quit);
         assert!(a.pending_cli_updates.is_empty());
+    }
+
+    // ─── v0.20.1 typed SelfUpdateState dispatch tests ───
+    #[test]
+    fn update_u_on_self_with_uptodate_does_not_quit() {
+        let mut a = test_app(&[]);
+        a.tab = Tab::Update;
+        a.update_sel = 0;
+        a.self_update_state = SelfUpdateState::UpToDate {
+            reason: "Already on the latest release (0.20.1).".into(),
+        };
+        a.handle_update_action();
+        assert!(!a.quit, "must NOT exit TUI when already on latest");
+        assert!(!a.update_on_exit);
+        let msg = a.message.unwrap_or_default();
+        assert!(
+            msg.contains("up to date"),
+            "footer should mention 'up to date': {msg:?}"
+        );
+    }
+
+    #[test]
+    fn update_u_on_self_during_checking_does_not_quit() {
+        let mut a = test_app(&[]);
+        a.tab = Tab::Update;
+        a.update_sel = 0;
+        a.self_update_state = SelfUpdateState::Checking;
+        a.handle_update_action();
+        assert!(!a.quit);
+        let msg = a.message.unwrap_or_default();
+        assert!(msg.contains("checking"));
+    }
+
+    #[test]
+    fn update_u_on_self_when_unprobed_kicks_probe_and_does_not_quit() {
+        // Inject a fast fake planner so the spawned thread doesn't hit the network.
+        let mut a = test_app(&[]);
+        a.planner = std::sync::Arc::new(|_| {
+            Ok(aibridge_core::update::UpdateDecision::Skip {
+                reason: "test-fake".into(),
+            })
+        });
+        a.tab = Tab::Update;
+        a.update_sel = 0;
+        a.self_update_state = SelfUpdateState::Unprobed;
+        a.handle_update_action();
+        assert!(!a.quit);
+        assert!(a.update_rx.is_some(), "Unprobed `u` must START a probe");
+        let msg = a.message.unwrap_or_default();
+        assert!(msg.contains("probing") || msg.contains("try `u` again"));
+    }
+
+    #[test]
+    fn update_u_on_self_with_error_does_not_quit() {
+        let mut a = test_app(&[]);
+        a.tab = Tab::Update;
+        a.update_sel = 0;
+        a.self_update_state = SelfUpdateState::Error {
+            detail: "gh not on PATH".into(),
+        };
+        a.handle_update_action();
+        assert!(!a.quit);
+        let msg = a.message.unwrap_or_default();
+        assert!(msg.contains("failed") && msg.contains("press `c`"));
+    }
+
+    // ─── v0.20.1 manual `c` key in-flight guard ───
+    #[test]
+    fn c_key_starts_fresh_probe_when_not_in_flight() {
+        let mut a = test_app(&[]);
+        a.planner = std::sync::Arc::new(|_| {
+            Ok(aibridge_core::update::UpdateDecision::Skip {
+                reason: "test".into(),
+            })
+        });
+        a.tab = Tab::Update;
+        assert!(a.update_rx.is_none());
+        super::handle_key(&mut a, ratatui::crossterm::event::KeyCode::Char('c'));
+        assert!(a.update_rx.is_some(), "c-key must start a probe");
+        assert_eq!(a.self_update_state, SelfUpdateState::Checking);
+    }
+
+    #[test]
+    fn c_key_refuses_when_probe_in_flight() {
+        let mut a = test_app(&[]);
+        a.tab = Tab::Update;
+        // Plant a dummy in-flight receiver.
+        let (_tx, rx) = std::sync::mpsc::channel();
+        a.update_rx = Some(rx);
+        let was_state = a.self_update_state.clone();
+        super::handle_key(&mut a, ratatui::crossterm::event::KeyCode::Char('c'));
+        // State unchanged, message set.
+        assert_eq!(a.self_update_state, was_state);
+        let msg = a.message.unwrap_or_default();
+        assert!(msg.contains("already checking"));
+    }
+
+    // ─── v0.20.1 clipboard tests ───
+    #[derive(Clone)]
+    struct MockClipboard {
+        captured: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        fail: bool,
+    }
+    impl aibridge_platform::ClipboardWriter for MockClipboard {
+        fn copy(&self, text: &str) -> Result<usize, String> {
+            if self.fail {
+                return Err("mock failure".into());
+            }
+            self.captured.lock().unwrap().push(text.to_string());
+            Ok(text.len())
+        }
+    }
+
+    fn make_app_with_mock_clipboard() -> (App, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut a = test_app(&[]);
+        a.clipboard = Box::new(MockClipboard {
+            captured: captured.clone(),
+            fail: false,
+        });
+        (a, captured)
+    }
+
+    #[test]
+    fn debug_y_with_text_copies_via_mock_clipboard() {
+        let (mut a, captured) = make_app_with_mock_clipboard();
+        a.tab = Tab::Debug;
+        a.debug_text = Some("hello-report".into());
+        a.copy_debug_report_to_clipboard();
+        let cap = captured.lock().unwrap();
+        assert_eq!(cap.as_slice(), &["hello-report".to_string()]);
+        let msg = a.message.unwrap_or_default();
+        assert!(msg.contains("copied 12 bytes"));
+    }
+
+    #[test]
+    fn debug_y_while_building_does_not_copy() {
+        let (mut a, captured) = make_app_with_mock_clipboard();
+        a.tab = Tab::Debug;
+        a.debug_text = Some("placeholder".into());
+        let (_tx, rx) = std::sync::mpsc::channel();
+        a.debug_rx = Some(rx); // still building
+        a.copy_debug_report_to_clipboard();
+        assert!(
+            captured.lock().unwrap().is_empty(),
+            "must not copy while building"
+        );
+        let msg = a.message.unwrap_or_default();
+        assert!(msg.contains("still building"));
+    }
+
+    #[test]
+    fn debug_y_with_no_text_shows_hint() {
+        let (mut a, captured) = make_app_with_mock_clipboard();
+        a.tab = Tab::Debug;
+        a.debug_text = None;
+        a.copy_debug_report_to_clipboard();
+        assert!(captured.lock().unwrap().is_empty());
+        let msg = a.message.unwrap_or_default();
+        assert!(msg.contains("press `r`"));
+    }
+
+    #[test]
+    fn health_y_with_no_checks_shows_hint() {
+        let (mut a, captured) = make_app_with_mock_clipboard();
+        a.tab = Tab::Health;
+        a.checks = Vec::new();
+        a.copy_health_report_to_clipboard();
+        assert!(captured.lock().unwrap().is_empty());
+        let msg = a.message.unwrap_or_default();
+        assert!(msg.contains("press `r`"));
+    }
+
+    #[test]
+    fn health_y_with_checks_copies_plain_text() {
+        let (mut a, captured) = make_app_with_mock_clipboard();
+        a.tab = Tab::Health;
+        a.checks = vec![aibridge_core::doctor::Check {
+            name: "git".into(),
+            status: aibridge_core::doctor::Status::Pass,
+            detail: "available".into(),
+        }];
+        a.copy_health_report_to_clipboard();
+        let cap = captured.lock().unwrap();
+        assert_eq!(cap.len(), 1);
+        let body = &cap[0];
+        assert!(body.contains("AI Bridge"));
+        assert!(body.contains("[ok  ] git"));
+        assert!(body.contains("available"));
+    }
+
+    #[test]
+    fn clipboard_failure_surfaces_in_footer() {
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut a = test_app(&[]);
+        a.clipboard = Box::new(MockClipboard {
+            captured: captured.clone(),
+            fail: true,
+        });
+        a.tab = Tab::Debug;
+        a.debug_text = Some("anything".into());
+        a.copy_debug_report_to_clipboard();
+        assert!(captured.lock().unwrap().is_empty());
+        let msg = a.message.unwrap_or_default();
+        assert!(msg.contains("clipboard write failed"));
+        assert!(msg.contains("mock failure"));
     }
 
     #[test]
