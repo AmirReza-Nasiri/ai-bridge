@@ -6,6 +6,25 @@ versioning is semver.
 
 ## [Unreleased]
 
+## [0.20.2] - 2026-05-27
+
+### Fixed
+- **rtk auto-update now works for legitimate rtk-ai/rtk binaries that ship without the explicit marker.** v0.20.0 required `<rtk> --version` to contain `rtk-ai` or `Rust Token Killer`; rtk-ai actually ships banners as plain `rtk 0.40.0` / `rtk v0.4.2`, so legitimate installs were rejected as "unknown" and the auto-update path was hidden behind a manual-only fallback. v0.20.2 adds a second accept path that requires BOTH a clean banner shape (`rtk [v]X.Y.Z` with no trailing tokens) AND the rtk-ai-specific `gain --help` subcommand exiting 0. The unrelated "Rust Type Kit" tool (also named `rtk`) is still rejected because its banner shape fails the strict semver check.
+
+### Internal
+- New pure `rtk::banner_looks_like_rtk` helper — exact trimmed first-line match for `rtk [v]X.Y.Z`. Strict 3-digit-component check; rejects trailing tokens, dash suffixes, extra components, uppercase prefix, substring matches.
+- `rtk::rtk_identity_check` refactored into a two-path machine: marker-short-circuit (Path A) and banner-shape-plus-gain-probe (Path B). Path A never probes `gain`, so unrelated tools with `--version` banners that don't look like rtk-ai don't waste a process spawn. Path B's `gain --help` probe fires ONLY for plausible-shape banners.
+- Module-level docs updated to reflect the new identity contract.
+
+### Tests
+- **+23 new unit tests** across `crates/aibridge-core/src/rtk.rs` (8 identity-check + 15 banner-helper). Total: **346 passing** (was 323 in v0.20.1).
+  - Identity: marker-short-circuits-without-gain (×2), plausible-banner-and-gain (×2 incl. `v` prefix), plausible-banner-when-gain-fails, unrelated-banner-even-with-gain, rust-type-kit-with-gain-subcommand, implausible-banner-without-probing-gain.
+  - Banner helper: accepts plain semver, accepts `v` prefix, accepts trailing whitespace, accepts leading whitespace; rejects trailing garbage, trailing Rust Type Kit, prerelease (`-beta`), malformed dash (`-` and `-%%%`), extra component, two components, non-digit, uppercase prefix, no space after `rtk`, substring match, empty.
+
+### Deferred to v0.20.3
+- Reviewer findings F3 (kill-loop deadline), F4 (TOCTOU probe), F5 (staged-file panic leak), F8 (alloc), F10 (re-render every tick), F11 (dedup pending_cli_updates), F12 (cleanup-decline returns Ok), F13 (tar early-bail on ambiguity), F14 (prompts to stdout vs stderr).
+- `docs/install/{windows,macos}.md` rtk-policy text update.
+
 ## [0.20.1] - 2026-05-27
 
 ### Fixed

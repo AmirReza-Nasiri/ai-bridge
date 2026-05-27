@@ -14,7 +14,13 @@
 //!
 //! 1. Detect target via [`detect_target`] (Brew / NativeBin{writable} / NotInstalled / Unknown).
 //! 2. Identity-check the EXISTING binary (if any) via [`rtk_identity_check`] — refuse
-//!    to update anything whose `--version` banner doesn't claim `rtk-ai` / `Rust Token Killer`.
+//!    to update anything that doesn't pass EITHER (a) `--version` banner contains the
+//!    explicit `rtk-ai` / `Rust Token Killer` marker, OR (b) v0.20.2 fallback: banner
+//!    matches the literal shape `rtk [v]X.Y.Z` (with NO trailing tokens) AND
+//!    `gain --help` exits 0 — `gain` is rtk-ai/rtk's signature subcommand for the
+//!    token-savings summary, not present in unrelated tools also named `rtk` (e.g.
+//!    Rust Type Kit). Both halves required for fallback to fire — banner shape alone
+//!    or `gain` alone is insufficient.
 //! 3. Download asset + `checksums.txt` via [`ReleaseDownloader`].
 //! 4. [`lookup_checksum`] → [`verify_sha256`] BEFORE any extraction.
 //! 5. [`extract_rtk_binary`] with strict archive-entry validation (path traversal,
@@ -348,14 +354,45 @@ fn dirs_home() -> Option<PathBuf> {
 
 // ───────────────────────── identity check ─────────────────────────
 
+/// Tight banner-shape predicate for the v0.20.2 fallback identity path. Only the
+/// literal upstream rtk-ai banner shape passes — the trimmed first line must be
+/// EXACTLY `rtk X.Y.Z` or `rtk vX.Y.Z` (optional `v` prefix because rtk-ai ships
+/// both forms in the wild). No trailing tokens, no prerelease/build suffix, no
+/// extra version components. Case-sensitive on the `rtk ` prefix.
+///
+/// Returning `true` is necessary BUT NOT sufficient for identity — `rtk_identity_check`
+/// also requires `gain --help` to exit 0, since the `gain` subcommand is
+/// rtk-ai-specific (Rust Type Kit has no such subcommand).
+fn banner_looks_like_rtk(s: &str) -> bool {
+    let first = s.lines().next().unwrap_or("").trim();
+    let Some(rest) = first.strip_prefix("rtk ") else {
+        return false;
+    };
+    // STRICT exact: the entire remainder of the trimmed first line must be the
+    // version token alone. `split_whitespace().next()` would have let
+    // `rtk 1.2.3 garbage` pass — rejected by Codex review.
+    let core = rest.strip_prefix('v').unwrap_or(rest);
+    let parts: Vec<&str> = core.split('.').collect();
+    if parts.len() != 3 {
+        return false;
+    }
+    parts
+        .iter()
+        .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+}
+
 /// Run `<exe> --version` and confirm the banner identifies this as rtk-ai's rtk
 /// (NOT Rust Type Kit or any other tool that also uses the `rtk` name).
 ///
-/// Accepts the banner if its combined stdout+stderr contains EITHER:
-/// - `rtk-ai`  (project identifier)
-/// - `Rust Token Killer`  (full product name)
+/// Two accept paths (Codex R5 design):
+/// - **Path A (marker, short-circuit)**: stdout+stderr contains either `rtk-ai` or
+///   `Rust Token Killer`. Returns `Ok(())` immediately without probing further.
+/// - **Path B (banner shape + `gain --help`)** [v0.20.2 fallback]: trimmed first
+///   line matches EXACTLY `rtk [v]X.Y.Z` (via [`banner_looks_like_rtk`]) AND
+///   `<exe> gain --help` exits 0. Required when upstream rtk-ai ships a banner
+///   without the explicit marker (the 0.40.0 case the user reported).
 ///
-/// Anything else → refuse. Caller is responsible for what to do with the error
+/// Anything else → refuse. Caller decides what to do with the error
 /// (manual-only fallback for `check_rtk`; abort for `install_or_update`).
 pub fn rtk_identity_check(runner: &dyn CommandRunner, exe: &Path) -> Result<(), String> {
     let (ok, combined) = runner
@@ -367,12 +404,22 @@ pub fn rtk_identity_check(runner: &dyn CommandRunner, exe: &Path) -> Result<(), 
             sanitize_snippet(&combined, 100)
         ));
     }
+    // Path A: explicit marker — short-circuit, never probe gain.
     if combined.contains("rtk-ai") || combined.contains("Rust Token Killer") {
         return Ok(());
     }
+    // Path B: plausible banner shape + gain --help success. `gain` is probed ONLY
+    // when banner already looks plausible, so unrelated tools don't get an extra
+    // spawn for no reason.
+    if banner_looks_like_rtk(&combined) {
+        if let Ok((true, _)) = runner.run_path(exe, &["gain", "--help"], Duration::from_secs(3)) {
+            return Ok(());
+        }
+    }
     Err(format!(
-        "{exe:?} identity not confirmed (version banner missing 'rtk-ai' / 'Rust Token Killer' marker; \
-         got: {})",
+        "{exe:?} identity not confirmed (banner missing 'rtk-ai' / 'Rust Token Killer' marker \
+         AND either banner doesn't match clean 'rtk [v]X.Y.Z' shape OR `gain --help` failed; \
+         got --version: {})",
         sanitize_snippet(&combined, 100)
     ))
 }
@@ -1116,6 +1163,188 @@ mod tests {
         let mut r = FakeRunner::new();
         r.set_path(&path, &["--version"], false, "");
         assert!(rtk_identity_check(&r, &path).is_err());
+    }
+
+    // ─── v0.20.2: marker path A short-circuits (no `gain` fixture needed) ───
+    #[test]
+    fn identity_check_accepts_marker_without_gain() {
+        // Marker present → short-circuit. Test deliberately provides NO `gain --help`
+        // fixture: if the implementation accidentally probes `gain`, FakeRunner would
+        // error and rtk_identity_check would fail.
+        let path = PathBuf::from("/usr/local/bin/rtk");
+        let mut r = FakeRunner::new();
+        r.set_path(&path, &["--version"], true, "rtk-ai/rtk 0.42.0\n");
+        // NOTE: no `gain --help` fixture — must not be called.
+        assert!(rtk_identity_check(&r, &path).is_ok());
+    }
+
+    #[test]
+    fn identity_check_accepts_full_product_name_without_gain() {
+        let path = PathBuf::from("/opt/homebrew/bin/rtk");
+        let mut r = FakeRunner::new();
+        r.set_path(&path, &["--version"], true, "Rust Token Killer v0.42.0\n");
+        // NOTE: no `gain --help` fixture.
+        assert!(rtk_identity_check(&r, &path).is_ok());
+    }
+
+    // ─── v0.20.2: fallback path B (banner shape + `gain --help` exit 0) ───
+    #[test]
+    fn identity_check_accepts_plausible_banner_and_gain() {
+        let path = PathBuf::from("/usr/local/bin/rtk");
+        let mut r = FakeRunner::new();
+        r.set_path(&path, &["--version"], true, "rtk 0.40.0\n");
+        r.set_path(&path, &["gain", "--help"], true, "Show token savings\n");
+        assert!(rtk_identity_check(&r, &path).is_ok());
+    }
+
+    #[test]
+    fn identity_check_accepts_v_prefix_banner_and_gain() {
+        // rtk-ai also ships `rtk v0.4.2`-style banners (per existing cli_update test).
+        let path = PathBuf::from("/usr/local/bin/rtk");
+        let mut r = FakeRunner::new();
+        r.set_path(&path, &["--version"], true, "rtk v0.4.2\n");
+        r.set_path(&path, &["gain", "--help"], true, "Show token savings\n");
+        assert!(rtk_identity_check(&r, &path).is_ok());
+    }
+
+    #[test]
+    fn identity_check_rejects_plausible_banner_when_gain_fails() {
+        let path = PathBuf::from("/usr/local/bin/rtk");
+        let mut r = FakeRunner::new();
+        r.set_path(&path, &["--version"], true, "rtk 0.40.0\n");
+        r.set_path(&path, &["gain", "--help"], false, "unrecognized subcommand");
+        let err = rtk_identity_check(&r, &path).unwrap_err();
+        assert!(err.contains("identity not confirmed"), "got: {err}");
+    }
+
+    #[test]
+    fn identity_check_rejects_unrelated_banner_even_with_gain() {
+        // Banner shape fails → `gain` not probed even though we provide it.
+        let path = PathBuf::from("/usr/local/bin/rtk");
+        let mut r = FakeRunner::new();
+        r.set_path(&path, &["--version"], true, "Rust Type Kit 1.0\n");
+        r.set_path(&path, &["gain", "--help"], true, "fake gain output");
+        let err = rtk_identity_check(&r, &path).unwrap_err();
+        assert!(err.contains("identity not confirmed"), "got: {err}");
+    }
+
+    #[test]
+    fn identity_check_rejects_rust_type_kit_with_gain_subcommand() {
+        // The specific collision case Codex flagged: an unrelated `rtk`-named tool
+        // (Rust Type Kit) that happens to have a `gain` subcommand. Banner-shape
+        // check rejects because "- Rust Type Kit 1.0" is not `X.Y.Z`-shaped.
+        let path = PathBuf::from("/usr/local/bin/rtk");
+        let mut r = FakeRunner::new();
+        r.set_path(&path, &["--version"], true, "rtk - Rust Type Kit 1.0\n");
+        r.set_path(&path, &["gain", "--help"], true, "fake gain subcommand");
+        let err = rtk_identity_check(&r, &path).unwrap_err();
+        assert!(err.contains("identity not confirmed"), "got: {err}");
+    }
+
+    #[test]
+    fn identity_check_rejects_implausible_banner_without_probing_gain() {
+        // Banner doesn't match `rtk [v]X.Y.Z`. `gain --help` MUST NOT be probed —
+        // proved by NOT providing a fixture: if the helper called it, FakeRunner
+        // would return an Err that bubbles back as a different error string. We
+        // assert the error is the regular identity-not-confirmed one (which means
+        // gain was never called; otherwise the error would be the missing-fixture form).
+        let path = PathBuf::from("/usr/local/bin/rtk");
+        let mut r = FakeRunner::new();
+        r.set_path(
+            &path,
+            &["--version"],
+            true,
+            "completely-different-tool 1.0\n",
+        );
+        // NOTE: no `gain --help` fixture.
+        let err = rtk_identity_check(&r, &path).unwrap_err();
+        assert!(
+            err.contains("identity not confirmed") && !err.contains("no path-fixture"),
+            "expected identity-not-confirmed (gain unprobed), got: {err}"
+        );
+    }
+
+    // ─── v0.20.2: banner_looks_like_rtk helper ───
+    #[test]
+    fn banner_looks_like_rtk_accepts_plain_semver() {
+        assert!(banner_looks_like_rtk("rtk 0.40.0"));
+        assert!(banner_looks_like_rtk("rtk 99.99.99"));
+        assert!(banner_looks_like_rtk("rtk 1.2.3\n"));
+    }
+
+    #[test]
+    fn banner_looks_like_rtk_accepts_v_prefix() {
+        assert!(banner_looks_like_rtk("rtk v0.4.2"));
+        assert!(banner_looks_like_rtk("rtk v1.0.0"));
+    }
+
+    #[test]
+    fn banner_looks_like_rtk_accepts_trailing_whitespace() {
+        // Helper trims the first line — surrounding whitespace is harmless.
+        assert!(banner_looks_like_rtk("rtk 0.40.0 "));
+    }
+
+    #[test]
+    fn banner_looks_like_rtk_accepts_leading_whitespace_on_first_line() {
+        assert!(banner_looks_like_rtk("  rtk 0.40.0\n"));
+    }
+
+    #[test]
+    fn banner_looks_like_rtk_rejects_trailing_garbage() {
+        assert!(!banner_looks_like_rtk("rtk 1.2.3 garbage"));
+    }
+
+    #[test]
+    fn banner_looks_like_rtk_rejects_trailing_rust_type_kit() {
+        assert!(!banner_looks_like_rtk("rtk 1.2.3 - Rust Type Kit"));
+    }
+
+    #[test]
+    fn banner_looks_like_rtk_rejects_prerelease() {
+        assert!(!banner_looks_like_rtk("rtk 1.2.3-beta"));
+    }
+
+    #[test]
+    fn banner_looks_like_rtk_rejects_malformed_dash() {
+        assert!(!banner_looks_like_rtk("rtk 1.2.3-"));
+        assert!(!banner_looks_like_rtk("rtk 1.2.3-%%%"));
+    }
+
+    #[test]
+    fn banner_looks_like_rtk_rejects_extra_component() {
+        assert!(!banner_looks_like_rtk("rtk 1.2.3.4"));
+    }
+
+    #[test]
+    fn banner_looks_like_rtk_rejects_two_components() {
+        assert!(!banner_looks_like_rtk("rtk 1.2"));
+    }
+
+    #[test]
+    fn banner_looks_like_rtk_rejects_non_digit() {
+        assert!(!banner_looks_like_rtk("rtk x.y.z"));
+    }
+
+    #[test]
+    fn banner_looks_like_rtk_rejects_uppercase() {
+        // Case-sensitive on the prefix — real banner is lowercase `rtk `.
+        assert!(!banner_looks_like_rtk("RTK 0.40.0"));
+    }
+
+    #[test]
+    fn banner_looks_like_rtk_rejects_no_space_after_rtk() {
+        assert!(!banner_looks_like_rtk("rtkXYZ 0.40.0"));
+    }
+
+    #[test]
+    fn banner_looks_like_rtk_rejects_substring_match() {
+        // Must START with `rtk ` (after trim) — embedded `rtk X.Y.Z` doesn't count.
+        assert!(!banner_looks_like_rtk("some random rtk 0.40.0"));
+    }
+
+    #[test]
+    fn banner_looks_like_rtk_rejects_empty() {
+        assert!(!banner_looks_like_rtk(""));
     }
 
     // ─── make_backup_path ───
