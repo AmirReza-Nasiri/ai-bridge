@@ -1679,6 +1679,9 @@ mod tests {
     // because it shells out to `gh` and mutates a real install location.
 
     /// PathResolver that says rtk is at a brew-shaped path (triggers Brew detection).
+    /// Used only by non-Linux tests (`cfg(not(target_os = "linux"))`); silence the
+    /// dead-code lint on Linux where no test references this struct.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     struct BrewLikePathResolver;
     impl PathResolver for BrewLikePathResolver {
         fn find(&self, name: &str) -> Result<PathBuf, String> {
