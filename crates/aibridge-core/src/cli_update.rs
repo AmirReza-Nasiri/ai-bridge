@@ -55,11 +55,30 @@ pub enum InstallSource {
     /// Path heuristic was ambiguous or verification failed. Caller renders
     /// `manual_note`.
     Unknown { path: PathBuf, reason: String },
+    /// v0.21.0: tool isn't installed and we'd like to install it fresh. The inner
+    /// [`FreshInstallMethod`] describes which package manager to use and the
+    /// exact package name. `safe_to_auto_run` requires the suggested_command
+    /// argv to match this method's EXPECTED shape (no extra flags) so a tampered
+    /// `--yes` invocation can't slip an unrelated install through.
+    FreshInstall { method: FreshInstallMethod },
+}
+
+/// Which package manager (and exact package name) to use for a fresh install
+/// when a CLI tool isn't on PATH. Distinct from [`InstallSource::Brew`]/[`Npm`]
+/// which mean "tool is INSTALLED via this package manager". v0.21.0.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FreshInstallMethod {
+    /// `brew install <package>` (formula) or `brew install --cask <package>` (cask).
+    Brew { package: String, is_cask: bool },
+    /// `npm install -g <package>`.
+    Npm { package: String },
 }
 
 impl InstallSource {
     /// `true` only for sources we're confident about and would auto-run a
     /// well-known update command for. `--yes` SKIPS rows that return false.
+    /// `FreshInstall` is NOT considered verified here — [`CliCheck::safe_to_auto_run`]
+    /// has its own explicit whitelist for fresh-install argv shapes (R2 B3).
     pub fn is_verified_pkg_manager(&self) -> bool {
         matches!(self, InstallSource::Brew { .. } | InstallSource::Npm { .. })
     }
@@ -71,6 +90,10 @@ impl InstallSource {
             InstallSource::Cargo => "cargo",
             InstallSource::NativeInstaller { .. } => "native-installer",
             InstallSource::Unknown { .. } => "unknown",
+            InstallSource::FreshInstall { method } => match method {
+                FreshInstallMethod::Brew { .. } => "fresh-install (brew)",
+                FreshInstallMethod::Npm { .. } => "fresh-install (npm)",
+            },
         }
     }
 }
@@ -109,14 +132,29 @@ impl CliCheck {
     }
 
     /// `true` only when AI Bridge is willing to auto-run `suggested_command`
-    /// under `--yes`. Two safe shapes (Codex R7):
-    /// 1. Verified package-manager source (brew / npm) — `is_verified_pkg_manager`.
+    /// under `--yes`. Three safe shapes (Codex R7 + v0.21.0 R2 B3):
+    /// 1. Verified package-manager source (brew / npm) for existing installs —
+    ///    `is_verified_pkg_manager`. This carries the standard `brew upgrade` /
+    ///    `npm i -g <pkg>@latest` shapes built by `check_codex_with`/`check_claude_with`.
     /// 2. The EXACT internal command shape `[current_exe, "rtk", "install"|"update", "--yes"]`.
     ///    The `current_exe` requirement prevents a stale PATH `aibridge` from being
     ///    invoked instead of THIS running build.
+    /// 3. Fresh-install argv whitelist: when `source == FreshInstall { method }`, the
+    ///    suggested_command MUST exactly match the canonical install argv for that
+    ///    method ([`matches_fresh_install_argv`]). Tampered argv (extra flags etc.)
+    ///    are rejected.
     pub fn safe_to_auto_run(&self) -> bool {
         if self.source.is_verified_pkg_manager() {
             return true;
+        }
+        // v0.21.0 path 3: fresh-install argv whitelist (must come BEFORE the rtk
+        // path so a FreshInstall source isn't fall-through-rejected by the rtk
+        // shape check).
+        if let InstallSource::FreshInstall { method } = &self.source {
+            if let Some(argv) = self.suggested_command.as_deref() {
+                return matches_fresh_install_argv(argv, method);
+            }
+            return false;
         }
         let Some(argv) = self.suggested_command.as_deref() else {
             return false;
@@ -131,6 +169,36 @@ impl CliCheck {
         let verb_ok = argv[2] == "install" || argv[2] == "update";
         let yes_ok = argv[3] == "--yes";
         exe_matches && argv[1] == "rtk" && verb_ok && yes_ok
+    }
+}
+
+/// v0.21.0: explicit argv-shape whitelist for fresh-install commands. EXACT match
+/// required — extra flags, reordered args, or wrong package names all reject.
+/// Prevents `--yes` mode from running an unrelated install if `suggested_command`
+/// were ever tampered with.
+pub fn matches_fresh_install_argv(argv: &[String], method: &FreshInstallMethod) -> bool {
+    match method {
+        FreshInstallMethod::Brew {
+            package,
+            is_cask: true,
+        } => {
+            argv.len() == 4
+                && argv[0] == "brew"
+                && argv[1] == "install"
+                && argv[2] == "--cask"
+                && argv[3] == *package
+        }
+        FreshInstallMethod::Brew {
+            package,
+            is_cask: false,
+        } => argv.len() == 3 && argv[0] == "brew" && argv[1] == "install" && argv[2] == *package,
+        FreshInstallMethod::Npm { package } => {
+            argv.len() == 4
+                && argv[0] == "npm"
+                && argv[1] == "install"
+                && argv[2] == "-g"
+                && argv[3] == *package
+        }
     }
 }
 
@@ -366,6 +434,20 @@ pub fn parse_brew_info_v2_stable_version(json_str: &str) -> Option<String> {
     Some(stable)
 }
 
+/// v0.21.0: parse the version of a CASK from `brew info --json=v2 <cask>`. Casks
+/// store the version at `casks[0].version` (string), not `formulae[0].versions.stable`.
+/// Used as a fallback after the formula path returns None (e.g. for `codex`, which
+/// is a cask, and `claude-code`, also a cask).
+pub fn parse_brew_info_v2_cask_version(json_str: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(json_str).ok()?;
+    v.get("casks")?
+        .as_array()?
+        .first()?
+        .get("version")?
+        .as_str()
+        .map(String::from)
+}
+
 /// Parse `npm view <pkg> version` stdout → version string. npm may emit
 /// `npm warn …` lines before the version; we skip those and return the first
 /// non-warning, non-empty trimmed line.
@@ -485,9 +567,18 @@ pub fn current_version_of(
 }
 
 /// Verify a brew install by asking brew. Returns `true` only on exit 0.
+/// v0.21.0: cask-aware. Tries `brew list <pkg>` (formula path) first, then
+/// `brew list --cask <pkg>`. Either matching means the package is brew-managed.
 fn brew_list_confirms(runner: &dyn CommandRunner, package: &str) -> bool {
-    runner
+    if runner
         .run("brew", &["list", package], DETECT_TIMEOUT)
+        .map(|(ok, _)| ok)
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    runner
+        .run("brew", &["list", "--cask", package], DETECT_TIMEOUT)
         .map(|(ok, _)| ok)
         .unwrap_or(false)
 }
@@ -503,13 +594,18 @@ fn npm_global_confirms(runner: &dyn CommandRunner, package: &str) -> bool {
 /// Two-stage install-source detection: a path heuristic followed by a
 /// package-manager confirmation. If the confirmation fails or paths are
 /// ambiguous, returns [`InstallSource::Unknown`] so we never auto-run a wrong
-/// command. `npm_package` / `brew_package` carry the expected package names per
-/// tool (e.g. `@openai/codex` vs the brew formula `codex`).
+/// command. `npm_package` is the expected npm package name (e.g.
+/// `@openai/codex`); `brew_package_candidates` is an ORDERED list of brew
+/// package names to try — the FIRST that confirms wins, and that exact name
+/// flows into `InstallSource::Brew { package }`. v0.21.0 R4 (Codex code-gate):
+/// claude on Homebrew may be installed via either the `claude-code` cask OR the
+/// versioned `claude-code@latest` cask; we need to honor whichever the user
+/// actually installed so `brew upgrade <package>` produces the correct command.
 pub fn detect_install_source_with_verification(
     runner: &dyn CommandRunner,
     tool_path: &Path,
     npm_package: &str,
-    brew_package: &str,
+    brew_package_candidates: &[&str],
 ) -> InstallSource {
     let path_str = tool_path.to_string_lossy().to_ascii_lowercase();
     // Brew prefixes (mac, linuxbrew). Cellar paths still indicate brew.
@@ -528,10 +624,14 @@ pub fn detect_install_source_with_verification(
     if looks_cargo {
         return InstallSource::Cargo;
     }
-    if looks_brew && brew_list_confirms(runner, brew_package) {
-        return InstallSource::Brew {
-            package: brew_package.to_string(),
-        };
+    if looks_brew {
+        for candidate in brew_package_candidates {
+            if brew_list_confirms(runner, candidate) {
+                return InstallSource::Brew {
+                    package: (*candidate).to_string(),
+                };
+            }
+        }
     }
     if looks_npm && npm_global_confirms(runner, npm_package) {
         return InstallSource::Npm {
@@ -540,7 +640,9 @@ pub fn detect_install_source_with_verification(
     }
     // Path heuristic was ambiguous OR verification failed — refuse to guess.
     let reason = if looks_brew {
-        "path looks like brew but `brew list` did not confirm".to_string()
+        format!(
+            "path looks like brew but none of {brew_package_candidates:?} confirmed via `brew list`"
+        )
     } else if looks_npm {
         "path looks like npm but `npm ls -g` did not confirm".to_string()
     } else {
@@ -552,7 +654,9 @@ pub fn detect_install_source_with_verification(
     }
 }
 
-/// Latest brew formula `stable` version. Returns `None` on any failure.
+/// Latest brew version. v0.21.0: tries formula path first (`formulae[0].versions.stable`)
+/// then falls back to cask path (`casks[0].version`) — `brew info --json=v2 <pkg>`
+/// returns both arrays, populated based on which the package is.
 pub fn brew_latest_version(runner: &dyn CommandRunner, package: &str) -> Option<Version> {
     let (ok, stdout) = runner
         .run("brew", &["info", "--json=v2", package], DETECT_TIMEOUT)
@@ -560,8 +664,59 @@ pub fn brew_latest_version(runner: &dyn CommandRunner, package: &str) -> Option<
     if !ok {
         return None;
     }
-    let raw = parse_brew_info_v2_stable_version(&stdout)?;
-    parse_version(&raw)
+    if let Some(raw) = parse_brew_info_v2_stable_version(&stdout) {
+        return parse_version(&raw);
+    }
+    if let Some(raw) = parse_brew_info_v2_cask_version(&stdout) {
+        return parse_version(&raw);
+    }
+    None
+}
+
+/// v0.21.0: when a CLI tool isn't on PATH (`tool_path = None`), choose a fresh
+/// install method based on what package manager is available. Order: brew on
+/// macOS first (matches existing user setups), then npm everywhere. Returns
+/// `(InstallSource::FreshInstall { method }, argv)` for the chosen method, or
+/// `None` if neither is available → caller falls back to manual hint.
+pub fn select_fresh_install_source(
+    runner: &dyn CommandRunner,
+    npm_package: &str,
+    brew_package: &str,
+    brew_is_cask: bool,
+) -> Option<(InstallSource, Vec<String>)> {
+    // macOS: prefer brew.
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok((true, _)) = runner.run("brew", &["--version"], DETECT_TIMEOUT) {
+            let method = FreshInstallMethod::Brew {
+                package: brew_package.to_string(),
+                is_cask: brew_is_cask,
+            };
+            let mut argv = vec!["brew".to_string(), "install".to_string()];
+            if brew_is_cask {
+                argv.push("--cask".to_string());
+            }
+            argv.push(brew_package.to_string());
+            return Some((InstallSource::FreshInstall { method }, argv));
+        }
+    }
+    // npm fallback (all platforms).
+    if let Ok((true, _)) = runner.run("npm", &["--version"], DETECT_TIMEOUT) {
+        let method = FreshInstallMethod::Npm {
+            package: npm_package.to_string(),
+        };
+        let argv = vec![
+            "npm".to_string(),
+            "install".to_string(),
+            "-g".to_string(),
+            npm_package.to_string(),
+        ];
+        return Some((InstallSource::FreshInstall { method }, argv));
+    }
+    // Silence unused-param warnings on non-macOS builds.
+    let _ = brew_package;
+    let _ = brew_is_cask;
+    None
 }
 
 /// Latest npm version. Returns `None` on any failure.
@@ -607,23 +762,44 @@ pub fn gh_latest_release_tag_raw(runner: &dyn CommandRunner, slug: &str) -> Opti
 
 // ───────────────────────── per-tool checks ─────────────────────────
 
-/// Check the codex CLI. Resolves source (brew or npm), queries that source's
-/// channel for latest. Cargo / Unknown sources don't get a latest claim.
+/// Check the codex CLI. v0.21.0: when codex isn't installed AND brew/npm are
+/// available, suggests a fresh-install command (via `FreshInstall` source). When
+/// installed, suggests update via the existing brew/npm channel.
 pub fn check_codex(runner: &dyn CommandRunner) -> CliCheck {
+    check_codex_with(runner, &RealPathResolver)
+}
+
+/// Resolver-injectable variant of [`check_codex`] for hermetic tests. v0.21.0.
+pub fn check_codex_with(runner: &dyn CommandRunner, resolver: &dyn PathResolver) -> CliCheck {
     let current = current_version_of(runner, "codex", DETECT_TIMEOUT);
-    let tool_path = DefaultPlatform::find_executable("codex").ok();
+    let tool_path = resolver.find("codex").ok();
     let source = match &tool_path {
-        Some(p) => detect_install_source_with_verification(runner, p, "@openai/codex", "codex"),
-        None => InstallSource::Unknown {
-            path: PathBuf::from("codex"),
-            reason: "codex not on PATH".to_string(),
-        },
+        Some(p) => detect_install_source_with_verification(runner, p, "@openai/codex", &["codex"]),
+        None => {
+            // v0.21.0: not on PATH — try fresh install via brew (macOS) / npm.
+            // codex is a Homebrew CASK, not a formula (Codex R2 B1).
+            if let Some((src, _argv)) =
+                select_fresh_install_source(runner, "@openai/codex", "codex", true)
+            {
+                src
+            } else {
+                InstallSource::Unknown {
+                    path: PathBuf::from("codex"),
+                    reason: "codex not on PATH and no package manager (brew/npm) available".into(),
+                }
+            }
+        }
     };
-    let (latest, suggested, note) = match &source {
+    let (latest, suggested, note, installable) = match &source {
         InstallSource::Brew { package } => {
             let l = brew_latest_version(runner, package);
             let argv = vec!["brew".into(), "upgrade".into(), package.clone()];
-            (l, Some(argv), Some(format!("brew upgrade {package}")))
+            (
+                l,
+                Some(argv),
+                Some(format!("brew upgrade {package}")),
+                false,
+            )
         }
         InstallSource::Npm { package } => {
             let l = npm_latest_version(runner, package);
@@ -633,7 +809,12 @@ pub fn check_codex(runner: &dyn CommandRunner) -> CliCheck {
                 "-g".into(),
                 format!("{package}@latest"),
             ];
-            (l, Some(argv), Some(format!("npm i -g {package}@latest")))
+            (
+                l,
+                Some(argv),
+                Some(format!("npm i -g {package}@latest")),
+                false,
+            )
         }
         InstallSource::Cargo => (
             None,
@@ -643,15 +824,49 @@ pub fn check_codex(runner: &dyn CommandRunner) -> CliCheck {
                  cargo crates. Use the upstream install instructions."
                     .to_string(),
             ),
+            false,
         ),
         InstallSource::NativeInstaller { docs_url } => {
-            (None, None, Some(format!("see {docs_url}")))
+            (None, None, Some(format!("see {docs_url}")), false)
         }
         InstallSource::Unknown { reason, .. } => (
             None,
             None,
             Some(format!("unknown source ({reason}); update manually")),
+            false,
         ),
+        InstallSource::FreshInstall { method } => {
+            // v0.21.0: compute argv from method (must MATCH matches_fresh_install_argv).
+            let argv = match method {
+                FreshInstallMethod::Brew { package, is_cask } => {
+                    let mut v = vec!["brew".into(), "install".into()];
+                    if *is_cask {
+                        v.push("--cask".into());
+                    }
+                    v.push(package.clone());
+                    v
+                }
+                FreshInstallMethod::Npm { package } => {
+                    vec!["npm".into(), "install".into(), "-g".into(), package.clone()]
+                }
+            };
+            let note = match method {
+                FreshInstallMethod::Brew {
+                    package,
+                    is_cask: true,
+                } => {
+                    format!("codex not installed; will install via `brew install --cask {package}`")
+                }
+                FreshInstallMethod::Brew {
+                    package,
+                    is_cask: false,
+                } => format!("codex not installed; will install via `brew install {package}`"),
+                FreshInstallMethod::Npm { package } => {
+                    format!("codex not installed; will install via `npm install -g {package}`")
+                }
+            };
+            (None, Some(argv), Some(note), true)
+        }
     };
     CliCheck {
         tool: "codex",
@@ -660,15 +875,21 @@ pub fn check_codex(runner: &dyn CommandRunner) -> CliCheck {
         source,
         suggested_command: suggested,
         manual_note: note,
-        installable: false,
+        installable,
     }
 }
 
-/// Check the claude CLI. Native installer is the most common path (no `claude
-/// update`); npm install is also possible (`@anthropic-ai/claude-code`).
+/// Check the claude CLI. v0.21.0: when claude isn't installed AND brew/npm are
+/// available, suggests fresh install. claude's Homebrew cask is `claude-code`
+/// (NOT `claude` — that's the desktop app); npm package is `@anthropic-ai/claude-code`.
 pub fn check_claude(runner: &dyn CommandRunner) -> CliCheck {
+    check_claude_with(runner, &RealPathResolver)
+}
+
+/// Resolver-injectable variant of [`check_claude`] for hermetic tests. v0.21.0.
+pub fn check_claude_with(runner: &dyn CommandRunner, resolver: &dyn PathResolver) -> CliCheck {
     let current = current_version_of(runner, "claude", DETECT_TIMEOUT);
-    let tool_path = DefaultPlatform::find_executable("claude").ok();
+    let tool_path = resolver.find("claude").ok();
     let path_str = tool_path
         .as_ref()
         .map(|p| p.to_string_lossy().to_ascii_lowercase())
@@ -682,14 +903,31 @@ pub fn check_claude(runner: &dyn CommandRunner) -> CliCheck {
             docs_url: "https://claude.com/download".to_string(),
         }
     } else if let Some(p) = &tool_path {
-        detect_install_source_with_verification(runner, p, "@anthropic-ai/claude-code", "claude")
+        // v0.21.0 R3/R4: brew CASK is `claude-code`, not `claude` (which is the
+        // desktop-app cask). R4 (Codex code-gate): users may install either
+        // `claude-code` or the versioned `claude-code@latest` cask — try BOTH
+        // in order so `InstallSource::Brew { package }` carries the EXACT name
+        // the user installed; `brew upgrade <package>` then matches.
+        detect_install_source_with_verification(
+            runner,
+            p,
+            "@anthropic-ai/claude-code",
+            &["claude-code@latest", "claude-code"],
+        )
     } else {
-        InstallSource::Unknown {
-            path: PathBuf::from("claude"),
-            reason: "claude not on PATH".to_string(),
+        // v0.21.0: not on PATH — try fresh install. claude-code is a brew CASK.
+        if let Some((src, _argv)) =
+            select_fresh_install_source(runner, "@anthropic-ai/claude-code", "claude-code", true)
+        {
+            src
+        } else {
+            InstallSource::Unknown {
+                path: PathBuf::from("claude"),
+                reason: "claude not on PATH and no package manager (brew/npm) available".into(),
+            }
         }
     };
-    let (latest, suggested, note) = match &source {
+    let (latest, suggested, note, installable) = match &source {
         InstallSource::Npm { package } => {
             let l = npm_latest_version(runner, package);
             let argv = vec![
@@ -698,12 +936,22 @@ pub fn check_claude(runner: &dyn CommandRunner) -> CliCheck {
                 "-g".into(),
                 format!("{package}@latest"),
             ];
-            (l, Some(argv), Some(format!("npm i -g {package}@latest")))
+            (
+                l,
+                Some(argv),
+                Some(format!("npm i -g {package}@latest")),
+                false,
+            )
         }
         InstallSource::Brew { package } => {
             let l = brew_latest_version(runner, package);
             let argv = vec!["brew".into(), "upgrade".into(), package.clone()];
-            (l, Some(argv), Some(format!("brew upgrade {package}")))
+            (
+                l,
+                Some(argv),
+                Some(format!("brew upgrade {package}")),
+                false,
+            )
         }
         InstallSource::NativeInstaller { docs_url } => (
             None,
@@ -711,17 +959,51 @@ pub fn check_claude(runner: &dyn CommandRunner) -> CliCheck {
             Some(format!(
                 "claude CLI is a native installer; download the latest from {docs_url}"
             )),
+            false,
         ),
         InstallSource::Cargo => (
             None,
             None,
             Some("claude appears cargo-installed; update manually".into()),
+            false,
         ),
         InstallSource::Unknown { reason, .. } => (
             None,
             None,
             Some(format!("unknown source ({reason}); update manually")),
+            false,
         ),
+        InstallSource::FreshInstall { method } => {
+            let argv = match method {
+                FreshInstallMethod::Brew { package, is_cask } => {
+                    let mut v = vec!["brew".into(), "install".into()];
+                    if *is_cask {
+                        v.push("--cask".into());
+                    }
+                    v.push(package.clone());
+                    v
+                }
+                FreshInstallMethod::Npm { package } => {
+                    vec!["npm".into(), "install".into(), "-g".into(), package.clone()]
+                }
+            };
+            let note = match method {
+                FreshInstallMethod::Brew {
+                    package,
+                    is_cask: true,
+                } => format!(
+                    "claude not installed; will install via `brew install --cask {package}`"
+                ),
+                FreshInstallMethod::Brew {
+                    package,
+                    is_cask: false,
+                } => format!("claude not installed; will install via `brew install {package}`"),
+                FreshInstallMethod::Npm { package } => {
+                    format!("claude not installed; will install via `npm install -g {package}`")
+                }
+            };
+            (None, Some(argv), Some(note), true)
+        }
     };
     CliCheck {
         tool: "claude",
@@ -730,7 +1012,7 @@ pub fn check_claude(runner: &dyn CommandRunner) -> CliCheck {
         source,
         suggested_command: suggested,
         manual_note: note,
-        installable: false,
+        installable,
     }
 }
 
@@ -1307,7 +1589,7 @@ mod tests {
         let r = FakeCommandRunner::new();
         r.set("brew", &["list", "codex"], true, "");
         let p = Path::new("/opt/homebrew/bin/codex");
-        let s = detect_install_source_with_verification(&r, p, "@openai/codex", "codex");
+        let s = detect_install_source_with_verification(&r, p, "@openai/codex", &["codex"]);
         assert!(matches!(s, InstallSource::Brew { .. }));
     }
     #[test]
@@ -1315,7 +1597,7 @@ mod tests {
         let r = FakeCommandRunner::new();
         // No brew fixture → run returns Err → unverified.
         let p = Path::new("/opt/homebrew/bin/codex");
-        let s = detect_install_source_with_verification(&r, p, "@openai/codex", "codex");
+        let s = detect_install_source_with_verification(&r, p, "@openai/codex", &["codex"]);
         assert!(matches!(s, InstallSource::Unknown { .. }));
     }
     #[test]
@@ -1323,21 +1605,21 @@ mod tests {
         let r = FakeCommandRunner::new();
         r.set("npm", &["ls", "-g", "@openai/codex", "--depth=0"], true, "");
         let p = Path::new(r"C:\Users\X\AppData\Roaming\npm\codex.cmd");
-        let s = detect_install_source_with_verification(&r, p, "@openai/codex", "codex");
+        let s = detect_install_source_with_verification(&r, p, "@openai/codex", &["codex"]);
         assert!(matches!(s, InstallSource::Npm { .. }));
     }
     #[test]
     fn detect_install_source_cargo_treated_distinctly() {
         let r = FakeCommandRunner::new();
         let p = Path::new("/Users/x/.cargo/bin/codex");
-        let s = detect_install_source_with_verification(&r, p, "@openai/codex", "codex");
+        let s = detect_install_source_with_verification(&r, p, "@openai/codex", &["codex"]);
         assert!(matches!(s, InstallSource::Cargo));
     }
     #[test]
     fn detect_install_source_unrecognized_path_is_unknown() {
         let r = FakeCommandRunner::new();
         let p = Path::new("/random/place/codex");
-        let s = detect_install_source_with_verification(&r, p, "@openai/codex", "codex");
+        let s = detect_install_source_with_verification(&r, p, "@openai/codex", &["codex"]);
         match s {
             InstallSource::Unknown { reason, .. } => {
                 assert!(reason.contains("no recognized"));
@@ -1362,5 +1644,530 @@ mod tests {
                 || msg.contains("definitely_not_a_real_binary_xyz123"),
             "error should mention the missing binary or PATH: {msg}"
         );
+    }
+
+    // ───────────────────── v0.21.0 fresh-install path ─────────────────────
+
+    /// Test-only PathResolver. v0.21.0.
+    pub struct FakePathResolver {
+        finds: Mutex<HashMap<String, std::path::PathBuf>>,
+    }
+    impl FakePathResolver {
+        pub fn new() -> Self {
+            Self {
+                finds: Mutex::new(HashMap::new()),
+            }
+        }
+        pub fn set(&self, name: &str, path: &str) {
+            self.finds
+                .lock()
+                .unwrap()
+                .insert(name.to_string(), std::path::PathBuf::from(path));
+        }
+    }
+    impl PathResolver for FakePathResolver {
+        fn find(&self, name: &str) -> Result<std::path::PathBuf, String> {
+            self.finds
+                .lock()
+                .unwrap()
+                .get(name)
+                .cloned()
+                .ok_or_else(|| format!("FakePathResolver: not found: {name}"))
+        }
+    }
+
+    // ─── parse_brew_info_v2_cask_version ───
+    #[test]
+    fn parse_brew_info_v2_cask_version_picks_cask_version() {
+        let json = r#"{"formulae":[],"casks":[{"token":"codex","version":"0.132.0"}]}"#;
+        assert_eq!(
+            parse_brew_info_v2_cask_version(json),
+            Some("0.132.0".to_string())
+        );
+    }
+    #[test]
+    fn parse_brew_info_v2_cask_version_missing_returns_none() {
+        assert_eq!(parse_brew_info_v2_cask_version("{}"), None);
+        assert_eq!(parse_brew_info_v2_cask_version(r#"{"casks":[]}"#), None);
+        // Only formulae populated → cask path returns None.
+        assert_eq!(
+            parse_brew_info_v2_cask_version(
+                r#"{"formulae":[{"versions":{"stable":"1.0.0"}}],"casks":[]}"#
+            ),
+            None
+        );
+    }
+
+    // ─── matches_fresh_install_argv (whitelist) ───
+    #[test]
+    fn matches_fresh_install_argv_brew_cask_exact() {
+        let m = FreshInstallMethod::Brew {
+            package: "codex".into(),
+            is_cask: true,
+        };
+        let argv = vec![
+            "brew".into(),
+            "install".into(),
+            "--cask".into(),
+            "codex".into(),
+        ];
+        assert!(matches_fresh_install_argv(&argv, &m));
+    }
+    #[test]
+    fn matches_fresh_install_argv_brew_formula_exact() {
+        let m = FreshInstallMethod::Brew {
+            package: "rg".into(),
+            is_cask: false,
+        };
+        let argv = vec!["brew".into(), "install".into(), "rg".into()];
+        assert!(matches_fresh_install_argv(&argv, &m));
+    }
+    #[test]
+    fn matches_fresh_install_argv_npm_exact() {
+        let m = FreshInstallMethod::Npm {
+            package: "@openai/codex".into(),
+        };
+        let argv = vec![
+            "npm".into(),
+            "install".into(),
+            "-g".into(),
+            "@openai/codex".into(),
+        ];
+        assert!(matches_fresh_install_argv(&argv, &m));
+    }
+    #[test]
+    fn matches_fresh_install_argv_rejects_extra_flag() {
+        let m = FreshInstallMethod::Brew {
+            package: "codex".into(),
+            is_cask: true,
+        };
+        // Extra `--force` tacked on — must REJECT.
+        let argv = vec![
+            "brew".into(),
+            "install".into(),
+            "--cask".into(),
+            "codex".into(),
+            "--force".into(),
+        ];
+        assert!(!matches_fresh_install_argv(&argv, &m));
+    }
+    #[test]
+    fn matches_fresh_install_argv_rejects_wrong_package() {
+        let m = FreshInstallMethod::Brew {
+            package: "codex".into(),
+            is_cask: true,
+        };
+        let argv = vec![
+            "brew".into(),
+            "install".into(),
+            "--cask".into(),
+            "evil-pkg".into(),
+        ];
+        assert!(!matches_fresh_install_argv(&argv, &m));
+    }
+    #[test]
+    fn matches_fresh_install_argv_rejects_swapped_method() {
+        // Method says cask=true, argv is formula shape → reject.
+        let m = FreshInstallMethod::Brew {
+            package: "codex".into(),
+            is_cask: true,
+        };
+        let argv = vec!["brew".into(), "install".into(), "codex".into()];
+        assert!(!matches_fresh_install_argv(&argv, &m));
+    }
+
+    // ─── safe_to_auto_run for FreshInstall ───
+    fn fresh_install_check(method: FreshInstallMethod, argv: Vec<String>) -> CliCheck {
+        CliCheck {
+            tool: "codex",
+            current: None,
+            latest: None,
+            source: InstallSource::FreshInstall { method },
+            suggested_command: Some(argv),
+            manual_note: None,
+            installable: true,
+        }
+    }
+    #[test]
+    fn safe_to_auto_run_accepts_fresh_install_brew_cask() {
+        let m = FreshInstallMethod::Brew {
+            package: "codex".into(),
+            is_cask: true,
+        };
+        let argv = vec![
+            "brew".into(),
+            "install".into(),
+            "--cask".into(),
+            "codex".into(),
+        ];
+        let c = fresh_install_check(m, argv);
+        assert!(c.safe_to_auto_run());
+    }
+    #[test]
+    fn safe_to_auto_run_accepts_fresh_install_brew_formula() {
+        let m = FreshInstallMethod::Brew {
+            package: "rg".into(),
+            is_cask: false,
+        };
+        let argv = vec!["brew".into(), "install".into(), "rg".into()];
+        let c = fresh_install_check(m, argv);
+        assert!(c.safe_to_auto_run());
+    }
+    #[test]
+    fn safe_to_auto_run_accepts_fresh_install_npm() {
+        let m = FreshInstallMethod::Npm {
+            package: "@openai/codex".into(),
+        };
+        let argv = vec![
+            "npm".into(),
+            "install".into(),
+            "-g".into(),
+            "@openai/codex".into(),
+        ];
+        let c = fresh_install_check(m, argv);
+        assert!(c.safe_to_auto_run());
+    }
+    #[test]
+    fn safe_to_auto_run_rejects_fresh_install_with_tampered_argv() {
+        let m = FreshInstallMethod::Brew {
+            package: "codex".into(),
+            is_cask: true,
+        };
+        let argv = vec![
+            "brew".into(),
+            "install".into(),
+            "--cask".into(),
+            "codex".into(),
+            "--force".into(),
+        ];
+        let c = fresh_install_check(m, argv);
+        assert!(!c.safe_to_auto_run());
+    }
+    #[test]
+    fn safe_to_auto_run_rejects_fresh_install_without_argv() {
+        let m = FreshInstallMethod::Brew {
+            package: "codex".into(),
+            is_cask: true,
+        };
+        let mut c = fresh_install_check(m, vec![]);
+        c.suggested_command = None;
+        assert!(!c.safe_to_auto_run());
+    }
+
+    // ─── select_fresh_install_source ───
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn select_fresh_install_source_macos_prefers_brew_cask() {
+        let r = FakeCommandRunner::new();
+        r.set("brew", &["--version"], true, "Homebrew 4.0.0\n");
+        r.set("npm", &["--version"], true, "10.0.0\n");
+        let res = select_fresh_install_source(&r, "@openai/codex", "codex", true);
+        let (src, argv) = res.expect("brew available, should return Some");
+        match src {
+            InstallSource::FreshInstall {
+                method: FreshInstallMethod::Brew { package, is_cask },
+            } => {
+                assert_eq!(package, "codex");
+                assert!(is_cask, "codex IS a cask");
+            }
+            other => panic!("expected brew cask FreshInstall, got {other:?}"),
+        }
+        assert_eq!(argv, vec!["brew", "install", "--cask", "codex"]);
+    }
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn select_fresh_install_source_macos_falls_back_to_npm_when_brew_unavailable() {
+        let r = FakeCommandRunner::new();
+        // brew --version fails (exit nonzero) → fall through to npm.
+        r.set("brew", &["--version"], false, "");
+        r.set("npm", &["--version"], true, "10.0.0\n");
+        let res = select_fresh_install_source(&r, "@openai/codex", "codex", true);
+        let (src, argv) = res.expect("npm available, should return Some");
+        assert!(matches!(
+            src,
+            InstallSource::FreshInstall {
+                method: FreshInstallMethod::Npm { .. }
+            }
+        ));
+        assert_eq!(argv, vec!["npm", "install", "-g", "@openai/codex"]);
+    }
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn select_fresh_install_source_non_macos_uses_npm() {
+        let r = FakeCommandRunner::new();
+        r.set("npm", &["--version"], true, "10.0.0\n");
+        let res = select_fresh_install_source(&r, "@openai/codex", "codex", true);
+        let (src, argv) = res.expect("npm available");
+        assert!(matches!(
+            src,
+            InstallSource::FreshInstall {
+                method: FreshInstallMethod::Npm { .. }
+            }
+        ));
+        assert_eq!(argv, vec!["npm", "install", "-g", "@openai/codex"]);
+    }
+    #[test]
+    fn select_fresh_install_source_returns_none_when_no_pkg_manager() {
+        let r = FakeCommandRunner::new();
+        // No fixtures for brew/npm → runner errs → both probes treated as unavailable.
+        let res = select_fresh_install_source(&r, "@openai/codex", "codex", true);
+        assert!(
+            res.is_none(),
+            "no brew/npm available → must return None, got {res:?}"
+        );
+    }
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn select_fresh_install_source_formula_argv_omits_cask_flag() {
+        let r = FakeCommandRunner::new();
+        r.set("brew", &["--version"], true, "Homebrew 4.0.0\n");
+        let res = select_fresh_install_source(&r, "ripgrep", "ripgrep", false);
+        let (_src, argv) = res.expect("brew available");
+        assert_eq!(argv, vec!["brew", "install", "ripgrep"]);
+    }
+
+    // ─── check_codex_with / check_claude_with: missing-tool path ───
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn check_codex_with_missing_tool_macos_returns_brew_cask_fresh_install() {
+        let r = FakeCommandRunner::new();
+        r.set("codex", &["--version"], false, "");
+        r.set("brew", &["--version"], true, "Homebrew 4.0.0\n");
+        let resolver = FakePathResolver::new();
+        // resolver finds nothing → tool_path = None → fresh-install path
+        let check = check_codex_with(&r, &resolver);
+        assert!(check.installable, "missing-installable codex");
+        match check.source {
+            InstallSource::FreshInstall {
+                method: FreshInstallMethod::Brew { package, is_cask },
+            } => {
+                assert_eq!(package, "codex");
+                assert!(is_cask, "codex IS a cask, not a formula (Codex R2 B1)");
+            }
+            other => panic!("expected brew-cask FreshInstall, got {other:?}"),
+        }
+        assert_eq!(
+            check.suggested_command.unwrap(),
+            vec!["brew", "install", "--cask", "codex"]
+        );
+    }
+    #[test]
+    fn check_codex_with_missing_tool_only_npm_available_returns_npm_fresh_install() {
+        let r = FakeCommandRunner::new();
+        r.set("codex", &["--version"], false, "");
+        // On macOS, also fail brew so we exercise the npm fallback path.
+        #[cfg(target_os = "macos")]
+        r.set("brew", &["--version"], false, "");
+        r.set("npm", &["--version"], true, "10.0.0\n");
+        let resolver = FakePathResolver::new();
+        let check = check_codex_with(&r, &resolver);
+        assert!(check.installable);
+        match check.source {
+            InstallSource::FreshInstall {
+                method: FreshInstallMethod::Npm { package },
+            } => {
+                assert_eq!(package, "@openai/codex");
+            }
+            other => panic!("expected npm FreshInstall, got {other:?}"),
+        }
+    }
+    #[test]
+    fn check_codex_with_missing_tool_no_pm_returns_unknown() {
+        let r = FakeCommandRunner::new();
+        r.set("codex", &["--version"], false, "");
+        // No brew/npm fixtures at all → no fresh-install path.
+        let resolver = FakePathResolver::new();
+        let check = check_codex_with(&r, &resolver);
+        assert!(!check.installable);
+        match check.source {
+            InstallSource::Unknown { reason, .. } => {
+                assert!(
+                    reason.contains("not on PATH"),
+                    "expected reason mentioning PATH, got `{reason}`"
+                );
+            }
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+        assert!(check.suggested_command.is_none());
+    }
+    #[test]
+    fn check_claude_with_brew_cask_installed_returns_brew_with_claude_code_package() {
+        // Codex R3 lock-in: when claude IS installed at a brew path, the verified
+        // brew package MUST be `claude-code` (the CASK), not `claude` (the desktop
+        // app cask). R4 (code-gate): candidates are tried in order
+        // [`claude-code@latest`, `claude-code`]; this fixture covers the
+        // second-candidate match by making `@latest` fail and `claude-code` succeed.
+        let r = FakeCommandRunner::new();
+        r.set("claude", &["--version"], true, "2.1.150 (Claude Code)\n");
+        // Resolver returns a brew-shaped path.
+        let resolver = FakePathResolver::new();
+        resolver.set("claude", "/opt/homebrew/bin/claude");
+        // First candidate `claude-code@latest` — both formula and cask paths fail.
+        r.set("brew", &["list", "claude-code@latest"], false, "");
+        r.set("brew", &["list", "--cask", "claude-code@latest"], false, "");
+        // Second candidate `claude-code` — formula path succeeds.
+        r.set("brew", &["list", "claude-code"], true, "");
+        // Latest lookup — return a stable version so latest is parsed.
+        r.set(
+            "brew",
+            &["info", "--json=v2", "claude-code"],
+            true,
+            r#"{"formulae":[],"casks":[{"token":"claude-code","version":"2.1.151"}]}"#,
+        );
+        let check = check_claude_with(&r, &resolver);
+        match check.source {
+            InstallSource::Brew { package } => {
+                assert_eq!(
+                    package, "claude-code",
+                    "claude's brew package is claude-code (NOT claude)"
+                );
+            }
+            other => panic!("expected Brew{{claude-code}}, got {other:?}"),
+        }
+        assert_eq!(
+            check.suggested_command.unwrap(),
+            vec!["brew", "upgrade", "claude-code"]
+        );
+    }
+    #[test]
+    fn check_claude_with_brew_cask_at_latest_returns_versioned_package() {
+        // v0.21.0 R4 (Codex code-gate fix): users who installed via
+        // `brew install --cask claude-code@latest` must be detected as
+        // `Brew { package: "claude-code@latest" }` so the suggested update is
+        // `brew upgrade claude-code@latest` (NOT `brew upgrade claude-code`,
+        // which would target a different cask).
+        let r = FakeCommandRunner::new();
+        r.set("claude", &["--version"], true, "2.1.150 (Claude Code)\n");
+        let resolver = FakePathResolver::new();
+        resolver.set("claude", "/opt/homebrew/bin/claude");
+        // First candidate `claude-code@latest` — cask path succeeds.
+        r.set("brew", &["list", "claude-code@latest"], false, "");
+        r.set("brew", &["list", "--cask", "claude-code@latest"], true, "");
+        // Second candidate must NOT be tried after the first matches; supply no
+        // fixture to surface a regression if order changes.
+        r.set(
+            "brew",
+            &["info", "--json=v2", "claude-code@latest"],
+            true,
+            r#"{"formulae":[],"casks":[{"token":"claude-code@latest","version":"2.1.151"}]}"#,
+        );
+        let check = check_claude_with(&r, &resolver);
+        match check.source {
+            InstallSource::Brew { package } => {
+                assert_eq!(
+                    package, "claude-code@latest",
+                    "must carry exact installed cask name"
+                );
+            }
+            other => panic!("expected Brew{{claude-code@latest}}, got {other:?}"),
+        }
+        assert_eq!(
+            check.suggested_command.unwrap(),
+            vec!["brew", "upgrade", "claude-code@latest"]
+        );
+    }
+    #[test]
+    fn brew_list_confirms_cask_fallback_after_formula_fails() {
+        // v0.21.0 R4 (Codex code-gate medium): direct regression test for the
+        // `brew_list_confirms` formula→cask fallback. Formula `brew list <pkg>`
+        // fails; `brew list --cask <pkg>` succeeds → must return true.
+        let r = FakeCommandRunner::new();
+        r.set("brew", &["list", "codex"], false, "");
+        r.set("brew", &["list", "--cask", "codex"], true, "");
+        assert!(brew_list_confirms(&r, "codex"));
+    }
+    #[test]
+    fn brew_list_confirms_returns_false_when_both_paths_fail() {
+        let r = FakeCommandRunner::new();
+        r.set("brew", &["list", "codex"], false, "");
+        r.set("brew", &["list", "--cask", "codex"], false, "");
+        assert!(!brew_list_confirms(&r, "codex"));
+    }
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn check_claude_with_missing_tool_macos_returns_claude_code_brew_cask() {
+        // Codex R3 lock-in for the FreshInstall path on macOS.
+        let r = FakeCommandRunner::new();
+        r.set("claude", &["--version"], false, "");
+        r.set("brew", &["--version"], true, "Homebrew 4.0.0\n");
+        let resolver = FakePathResolver::new();
+        let check = check_claude_with(&r, &resolver);
+        assert!(check.installable);
+        match check.source {
+            InstallSource::FreshInstall {
+                method: FreshInstallMethod::Brew { package, is_cask },
+            } => {
+                assert_eq!(
+                    package, "claude-code",
+                    "fresh install must target claude-code cask (NOT claude desktop app)"
+                );
+                assert!(is_cask);
+            }
+            other => panic!("expected claude-code brew cask FreshInstall, got {other:?}"),
+        }
+    }
+    #[test]
+    fn check_claude_with_missing_tool_only_npm_uses_anthropic_ai_claude_code() {
+        let r = FakeCommandRunner::new();
+        r.set("claude", &["--version"], false, "");
+        #[cfg(target_os = "macos")]
+        r.set("brew", &["--version"], false, "");
+        r.set("npm", &["--version"], true, "10.0.0\n");
+        let resolver = FakePathResolver::new();
+        let check = check_claude_with(&r, &resolver);
+        match check.source {
+            InstallSource::FreshInstall {
+                method: FreshInstallMethod::Npm { package },
+            } => {
+                assert_eq!(package, "@anthropic-ai/claude-code");
+            }
+            other => panic!("expected @anthropic-ai/claude-code npm FreshInstall, got {other:?}"),
+        }
+    }
+
+    // ─── decide_action coverage for FreshInstall ───
+    fn fresh_install_brew_cask_codex() -> CliCheck {
+        let m = FreshInstallMethod::Brew {
+            package: "codex".into(),
+            is_cask: true,
+        };
+        let argv = vec![
+            "brew".into(),
+            "install".into(),
+            "--cask".into(),
+            "codex".into(),
+        ];
+        fresh_install_check(m, argv)
+    }
+    #[test]
+    fn decide_action_installable_check_mode_skips() {
+        let a = decide_action(&fresh_install_brew_cask_codex(), Mode::Check);
+        assert!(matches!(a, Action::Skip { .. }));
+    }
+    #[test]
+    fn decide_action_installable_yes_runs_fresh_install() {
+        let a = decide_action(&fresh_install_brew_cask_codex(), Mode::YesAuto);
+        match a {
+            Action::Run { argv, .. } => {
+                assert_eq!(argv, vec!["brew", "install", "--cask", "codex"]);
+            }
+            other => panic!("expected Run under --yes, got {other:?}"),
+        }
+    }
+    #[test]
+    fn decide_action_installable_interactive_prompts() {
+        let a = decide_action(&fresh_install_brew_cask_codex(), Mode::InteractiveTty);
+        assert!(matches!(a, Action::Prompt { .. }));
+    }
+    #[test]
+    fn decide_action_installable_overrides_up_to_date_when_versions_unknown() {
+        // current=None, latest=None — without `installable`, `up_to_date` returns
+        // true. With `installable=true`, the action surfaces.
+        let c = fresh_install_brew_cask_codex();
+        assert!(c.current.is_none());
+        assert!(c.latest.is_none());
+        assert!(!c.up_to_date(), "installable must NOT be up_to_date");
+        let a = decide_action(&c, Mode::InteractiveTty);
+        assert!(matches!(a, Action::Prompt { .. }));
     }
 }

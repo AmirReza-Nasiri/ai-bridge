@@ -6,6 +6,38 @@ versioning is semver.
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-05-27
+
+### Added
+- **Auto-install for `claude` and `codex` when missing from PATH.** Previously, `aibridge update` would surface missing-tool rows as plain "Unknown — manual install" hints. v0.21.0 adds a new typed `InstallSource::FreshInstall { method: FreshInstallMethod }` variant that drives a verified install command — `brew install --cask codex`, `brew install --cask claude-code`, or `npm install -g <package>` — through the same `--yes` auto-apply path used by existing brew/npm upgrades. macOS prefers Homebrew (matches the dominant install method for both tools); all platforms fall back to npm when brew is unavailable. The `select_fresh_install_source` helper probes `brew --version` / `npm --version` to confirm the package manager is actually on PATH before suggesting it; if neither is available, the row still falls back to a manual hint with the docs URL.
+- **`claude-code@latest` Homebrew cask is now detected and updated correctly** (Codex code-gate R4 catch). Claude's docs ship two casks: `claude-code` and the versioned `claude-code@latest`. v0.21.0's `detect_install_source_with_verification` accepts an ORDERED list of brew package candidates — claude detection tries `["claude-code@latest", "claude-code"]` in that order and the first that `brew list` confirms flows verbatim into `InstallSource::Brew { package }`. The suggested `brew upgrade <package>` command then targets the EXACT cask the user installed.
+- **`safe_to_auto_run` whitelist for fresh-install argv shapes.** A new pure helper `matches_fresh_install_argv(argv, method)` requires EXACT matches against the canonical install argv for each method — extra flags (`--force`), wrong package names, reordered args, or method/argv mismatches (cask method with formula-shape argv) all reject. Wired into `safe_to_auto_run` ahead of the rtk-internal whitelist so a tampered `FreshInstall.suggested_command` can't slip an unrelated install through `--yes`.
+
+### Internal
+- **`FreshInstallMethod` enum** (`Brew { package, is_cask }` | `Npm { package }`) carrying both the package manager AND the exact package name. Cask vs. formula is preserved so the argv shape (`brew install --cask <pkg>` vs `brew install <pkg>`) matches the brew CLI contract. `codex` and `claude-code` are both treated as casks; the npm packages are `@openai/codex` and `@anthropic-ai/claude-code`.
+- **`parse_brew_info_v2_cask_version` pure helper.** Casks store the version at `casks[0].version` (string), not `formulae[0].versions.stable`. `brew_latest_version` now tries the formula path first (existing behavior) and falls back to the cask path so version detection works for both kinds of package.
+- **`brew_list_confirms` cask fallback.** `brew list <pkg>` (formula path) is tried first; on failure, `brew list --cask <pkg>` is tried. Either matching means the package is brew-managed.
+- **`check_codex_with` / `check_claude_with` resolver-injectable variants** mirroring the `check_rtk_with` pattern from v0.20.0. Production callers continue using `check_codex` / `check_claude` which wrap with `RealPathResolver`; tests inject a `FakePathResolver` so the missing-on-PATH fresh-install path is hermetically covered.
+- `detect_install_source_with_verification` signature widened from `brew_package: &str` to `brew_package_candidates: &[&str]` (ordered). Callers: `check_codex_with` passes `&["codex"]`; `check_claude_with` passes `&["claude-code@latest", "claude-code"]`. The Unknown reason now names the candidates that failed, so logs are unambiguous.
+
+### Tests
+- **+26 new unit tests** in `crates/aibridge-core/src/cli_update.rs`. Total: **337 passing in core** (was 311 in v0.20.2).
+  - Cask helper (×2): `parse_brew_info_v2_cask_version` picks cask version / returns None when missing.
+  - `matches_fresh_install_argv` whitelist (×6): brew cask exact, brew formula exact, npm exact, rejects extra flag, rejects wrong package, rejects method/argv swap.
+  - `safe_to_auto_run` for FreshInstall (×5): accepts brew-cask/brew-formula/npm; rejects tampered argv; rejects when suggested_command absent.
+  - `select_fresh_install_source` (×4 + ×1 cfg-gated): macOS prefers brew cask / falls back to npm when brew unavailable / formula argv omits `--cask`; non-macOS uses npm; returns None when no package manager available.
+  - `check_codex_with` / `check_claude_with` missing-tool path (×6): brew-cask FreshInstall on macOS; npm fallback when only npm; Unknown when no package manager; `claude-code@latest` and `claude-code` cask detection lock-ins; npm uses `@anthropic-ai/claude-code` (NOT `@anthropic-ai/claude`).
+  - `decide_action` for installable rows (×4): Check skips; YesAuto runs fresh-install argv; InteractiveTty prompts; installable overrides current=None/latest=None.
+  - `brew_list_confirms` cask fallback (×2): formula fails + cask succeeds → true; both fail → false.
+
+### Deferred to v0.22+
+- TUI-level test for selecting a `FreshInstall` row from the Update tab (Codex code-gate R2 non-blocking note).
+- Reviewer findings F3, F4, F5, F8, F10–F14 (carried from v0.20.1/v0.20.2).
+- `docs/install/{windows,macos}.md` rtk-policy text update.
+- Native installer fallback for `claude` (claude.com/download).
+- Linuxbrew detection in `select_fresh_install_source`.
+- npm sudo handling for global installs that need elevation.
+
 ## [0.20.2] - 2026-05-27
 
 ### Fixed
