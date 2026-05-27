@@ -473,22 +473,197 @@ pub struct ApplyOptions {
     pub target_path: Option<String>,
 }
 
-/// Download the latest release's binary for this platform, verify it, and replace
-/// the installed binary. Returns a user-facing message. `Err` is a clean,
-/// actionable failure (the install is never left half-written).
-pub fn apply_update(opts: ApplyOptions) -> Result<String, String> {
-    if opts.from_source {
-        return Err(
-            "`--from-source` isn't implemented yet — for now update by rebuilding: \
-                    `git pull && cargo build --release`, then copy the binary onto your PATH."
-                .to_string(),
-        );
-    }
+// ───────────────────────── plan/apply split (v0.20.0 hotfix) ─────────────────────────
 
-    let (tag, _assets) = match latest_release(Duration::from_secs(20)) {
+/// A complete, validated update plan ready to apply. Constructed only by
+/// [`plan_update`] (or its injection variant). `apply_planned_update` accepts
+/// only this struct — compile-time impossible to call apply with a Skip decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedUpdate {
+    pub install_path: PathBuf,
+    pub tag: String,
+    pub from: Option<Version>,
+    pub to: Version,
+}
+
+/// Result of [`plan_update`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdateDecision {
+    /// No update needed. `reason` is user-facing.
+    Skip { reason: String },
+    /// An update IS available and valid. Hand to `apply_planned_update`.
+    Apply(PlannedUpdate),
+}
+
+/// Cleanup mode for stale-process handling. Computed by `decide_cleanup_mode`
+/// from the `--yes`, `--close-stale`, and TTY flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CleanupMode {
+    /// Interactive TTY default — ask the user `[y/N]`.
+    Prompt,
+    /// CLI passed `--close-stale` (and possibly `--yes`) — auto-close without asking.
+    AutoClose,
+    /// Non-TTY without `--close-stale` — refuse with a helpful error.
+    RefuseNonInteractive,
+}
+
+/// Pure helper: decide cleanup mode from flags + TTY. Tested via table-driven cases.
+pub fn decide_cleanup_mode(yes: bool, close_stale: bool, is_tty: bool) -> CleanupMode {
+    if close_stale {
+        CleanupMode::AutoClose
+    } else if is_tty {
+        CleanupMode::Prompt
+    } else if yes {
+        // --yes alone in non-TTY: still refuse (can't get explicit cleanup consent).
+        CleanupMode::RefuseNonInteractive
+    } else {
+        CleanupMode::RefuseNonInteractive
+    }
+}
+
+/// Confirmation seam. Production uses `RealConfirmer` (reads stdin); tests use
+/// `FakeConfirmer` (predetermined responses).
+pub trait Confirmer: Send + Sync {
+    fn confirm(&self, prompt: &str) -> bool;
+    fn confirm_close_pids(&self, install: &Path, pids: &[u32]) -> bool;
+}
+
+pub struct RealConfirmer;
+impl Confirmer for RealConfirmer {
+    fn confirm(&self, prompt: &str) -> bool {
+        confirm(prompt)
+    }
+    fn confirm_close_pids(&self, install: &Path, pids: &[u32]) -> bool {
+        println!(
+            "Found {} stale aibridge process(es) at {}:",
+            pids.len(),
+            install.display()
+        );
+        for pid in pids {
+            println!("  PID {pid}");
+        }
+        confirm("Close these and apply the update? [y/N] ")
+    }
+}
+
+pub struct AlwaysYesConfirmer;
+impl Confirmer for AlwaysYesConfirmer {
+    fn confirm(&self, _: &str) -> bool {
+        true
+    }
+    fn confirm_close_pids(&self, _: &Path, _: &[u32]) -> bool {
+        true
+    }
+}
+
+/// Orchestration options for [`orchestrate_update`].
+pub struct OrchestrationOpts {
+    /// `true` when the update was already confirmed (e.g. TUI user pressed `u`,
+    /// or CLI `--yes`). Skips the "Update X → Y? [y/N]" prompt.
+    pub update_already_confirmed: bool,
+    /// What to do when stale aibridge processes hold the install path.
+    pub cleanup_mode: CleanupMode,
+}
+
+/// Phase-2 orchestrator: takes a precomputed `UpdateDecision`, runs the
+/// update-confirmation gate (unless already confirmed), enumerates + kills (or
+/// declines) stale processes, then invokes `apply_fn`. ALL I/O is injected.
+pub fn orchestrate_update(
+    decision: UpdateDecision,
+    opts: OrchestrationOpts,
+    enumerator: &dyn crate::process_cleanup::ProcessEnumerator,
+    killer: &dyn crate::process_cleanup::ProcessKiller,
+    confirmer: &dyn Confirmer,
+    apply_fn: &dyn Fn(PlannedUpdate) -> Result<String, String>,
+) -> Result<String, String> {
+    let planned = match decision {
+        UpdateDecision::Skip { reason } => return Ok(reason),
+        UpdateDecision::Apply(p) => p,
+    };
+    // 1. Update-confirmation gate (skipped if already confirmed).
+    if !opts.update_already_confirmed {
+        let from_s = planned
+            .from
+            .as_ref()
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "?".into());
+        if !confirmer.confirm(&format!("Update {from_s} → {to}? [y/N] ", to = planned.to)) {
+            return Ok("Update cancelled.".to_string());
+        }
+    }
+    // 2. Stale-process enumeration.
+    let all_stale = enumerator
+        .list_aibridge()
+        .map_err(|e| format!("process enumeration failed: {e}"))?;
+    let target = crate::process_cleanup::select_stale_processes(
+        &all_stale,
+        &planned.install_path,
+        std::process::id(),
+        crate::process_cleanup::parent_pid(),
+    );
+    if !target.is_empty() {
+        // 3. Cleanup gate.
+        match opts.cleanup_mode {
+            CleanupMode::RefuseNonInteractive => {
+                let pids: Vec<u32> = target.iter().map(|p| p.pid).collect();
+                return Err(format!(
+                    "{} stale aibridge process(es) at {} (PIDs {:?}); \
+                     re-run with `--close-stale` (or in an interactive shell)",
+                    target.len(),
+                    planned.install_path.display(),
+                    pids
+                ));
+            }
+            CleanupMode::Prompt => {
+                let pids: Vec<u32> = target.iter().map(|p| p.pid).collect();
+                if !confirmer.confirm_close_pids(&planned.install_path, &pids) {
+                    return Ok("Cleanup declined; update cancelled.".to_string());
+                }
+            }
+            CleanupMode::AutoClose => { /* proceed */ }
+        }
+        // 4. Kill.
+        let report =
+            crate::process_cleanup::kill_stale_processes(&target, &planned.install_path, killer);
+        if !report.failed.is_empty() {
+            return Err(format!(
+                "couldn't terminate {} stale aibridge process(es): {:?}",
+                report.failed.len(),
+                report.failed
+            ));
+        }
+    }
+    // 5. Apply.
+    apply_fn(planned)
+}
+
+/// Pure planner intermediate: a successful Apply WITHOUT the install_path yet.
+/// Lets us validate assets BEFORE doing install-path resolution I/O.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InitialPlan {
+    Skip {
+        reason: String,
+    },
+    Apply {
+        tag: String,
+        from: Option<Version>,
+        to: Version,
+    },
+}
+
+/// Pure planner: from a release-lookup result + current version, return Skip or
+/// Apply-without-install-path. Validates that the release has THIS platform's
+/// asset + checksum sidecar BEFORE returning Apply.
+fn plan_from_lookup(
+    lookup: ReleaseLookup,
+    current: Option<Version>,
+) -> Result<InitialPlan, String> {
+    let (tag, assets) = match lookup {
         ReleaseLookup::Found { tag, assets } => (tag, assets),
         ReleaseLookup::None => {
-            return Ok("No published releases yet — nothing to update to.".to_string())
+            return Ok(InitialPlan::Skip {
+                reason: "No published releases yet — nothing to update to.".to_string(),
+            })
         }
         ReleaseLookup::GhMissing => {
             return Err(
@@ -498,58 +673,114 @@ pub fn apply_update(opts: ApplyOptions) -> Result<String, String> {
         ReleaseLookup::Timeout => return Err("timed out reaching GitHub.".to_string()),
         ReleaseLookup::Failed(w) => return Err(format!("couldn't reach GitHub: {w}")),
     };
-
     let latest = parse_version(&tag)
         .ok_or_else(|| format!("latest release tag '{tag}' isn't clean stable semver"))?;
-    let current = current_version();
     if let Some(c) = current {
         if latest <= c {
-            return Ok(format!("Already on the latest release ({c})."));
+            return Ok(InitialPlan::Skip {
+                reason: format!("Already on the latest release ({c})."),
+            });
         }
     }
-    let cur_str = current
-        .map(|c| c.to_string())
-        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
-
-    if !opts.assume_yes && !confirm(&format!("Update {cur_str} → {latest}? [y/N] ")) {
-        return Ok("Update cancelled.".to_string());
+    // Asset validation: refuse to plan an Apply if this platform's asset or its
+    // checksum sidecar is missing from the release. Prevents "kill stale procs
+    // then fail at download" UX.
+    let need_bin = asset_name();
+    let need_sha = format!("{need_bin}.sha256");
+    if !assets.iter().any(|a| a == &need_bin) {
+        return Err(format!(
+            "release {tag} has no asset '{need_bin}' for this platform; available: {assets:?}"
+        ));
     }
+    if !assets.iter().any(|a| a == &need_sha) {
+        return Err(format!(
+            "release {tag} is missing checksum sidecar '{need_sha}'; refusing to update"
+        ));
+    }
+    Ok(InitialPlan::Apply {
+        tag,
+        from: current,
+        to: latest,
+    })
+}
 
+/// Phase-1 planner WITH injected release lookup. Tests pass a closure that
+/// panics if called (proves no network for `--from-source` short-circuit).
+pub fn plan_update_with_lookup(
+    opts: &ApplyOptions,
+    lookup_fn: impl FnOnce(Duration) -> ReleaseLookup,
+) -> Result<UpdateDecision, String> {
+    // 1. --from-source: short-circuit BEFORE any I/O.
+    if opts.from_source {
+        return Err(
+            "`--from-source` isn't implemented yet — for now update by rebuilding: \
+             `git pull && cargo build --release`, then copy the binary onto your PATH."
+                .to_string(),
+        );
+    }
+    // 2. Network lookup.
+    let lookup = lookup_fn(Duration::from_secs(20));
+    // 3. Pure planner (asset validation included).
+    let initial = plan_from_lookup(lookup, current_version())?;
+    // 4. If Skip → no install_path resolution needed.
+    let (tag, from, to) = match initial {
+        InitialPlan::Skip { reason } => return Ok(UpdateDecision::Skip { reason }),
+        InitialPlan::Apply { tag, from, to } => (tag, from, to),
+    };
+    // 5. NOW resolve install_path (honors --target).
     let install = opts
         .target_path
         .clone()
         .or_else(resolve_install_path)
         .ok_or("couldn't resolve which binary to replace")?;
-    let install_path = PathBuf::from(&install);
+    Ok(UpdateDecision::Apply(PlannedUpdate {
+        install_path: PathBuf::from(install),
+        tag,
+        from,
+        to,
+    }))
+}
+
+/// Production phase-1 planner — uses real `latest_release`.
+pub fn plan_update(opts: &ApplyOptions) -> Result<UpdateDecision, String> {
+    plan_update_with_lookup(opts, latest_release)
+}
+
+/// Phase-2 applier. Takes a validated `PlannedUpdate` (no Skip possible).
+/// Retains an abort-only stale-process guard as a safety net — caller should
+/// have already closed same-path processes via the orchestrator, but a race
+/// between cleanup and apply (or a direct call bypassing the orchestrator)
+/// could leave one alive. The guard never kills — just aborts cleanly.
+pub fn apply_planned_update(planned: PlannedUpdate) -> Result<String, String> {
+    let install_path = planned.install_path.clone();
+    let tag = planned.tag.clone();
+    let latest = planned.to;
+    let cur_str = planned
+        .from
+        .as_ref()
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
     let install_dir = install_path
         .parent()
         .ok_or("install path has no parent directory")?;
 
-    // v0.20.0 Task A: refuse to update when same-install-path stale aibridge
-    // processes are running. Caller (CLI / TUI) is responsible for closing them
-    // first (interactive prompt or `--close-stale` flag). On Windows the lock
-    // would cause `replace_binary` to fail mid-swap; on macOS the OLD process
-    // image keeps serving stale code even after a successful rename. Best to
-    // fail-fast with PID details.
-    let enumerator = crate::process_cleanup::RealProcessEnumerator;
-    if let Ok(stale) = crate::process_cleanup::ProcessEnumerator::list_aibridge(&enumerator) {
-        let parent = crate::process_cleanup::parent_pid();
-        let same_path = crate::process_cleanup::select_stale_processes(
+    // Safety net: refuse if same-path stale processes remain.
+    let enum_ = crate::process_cleanup::RealProcessEnumerator;
+    if let Ok(stale) = crate::process_cleanup::ProcessEnumerator::list_aibridge(&enum_) {
+        let target = crate::process_cleanup::select_stale_processes(
             &stale,
             &install_path,
             std::process::id(),
-            parent,
+            crate::process_cleanup::parent_pid(),
         );
-        if !same_path.is_empty() {
-            let pids: Vec<u32> = same_path.iter().map(|p| p.pid).collect();
+        if !target.is_empty() {
+            let pids: Vec<u32> = target.iter().map(|p| p.pid).collect();
             return Err(format!(
-                "refusing to update {}: {} stale aibridge process(es) hold the install path \
-                 (PIDs: {:?}). Close them first (e.g. quit any open `aibridge status` TUI \
-                 sessions; on Windows close MCP servers spawned by Claude Code) and re-run. \
-                 The CLI orchestration with `--close-stale` will automate this in v0.20.1.",
-                install,
-                same_path.len(),
-                pids,
+                "race detected: {} stale aibridge process(es) at {} (PIDs {:?}); \
+                 close them and re-run",
+                target.len(),
+                install_path.display(),
+                pids
             ));
         }
     }
@@ -637,11 +868,58 @@ pub fn apply_update(opts: ApplyOptions) -> Result<String, String> {
     let _ = std::fs::remove_dir_all(&tmp);
 
     // Record the now-installed version (the tag we just placed), not the old one.
-    write_installed_meta(&install, &latest.to_string());
+    let install_str = install_path.display().to_string();
+    write_installed_meta(&install_str, &latest.to_string());
 
     Ok(format!(
-        "Updated {cur_str} → {latest} at {install} — {note}"
+        "Updated {cur_str} → {latest} at {install_str} — {note}"
     ))
+}
+
+/// Backward-compat wrapper around the v0.20.0 plan/apply split. Used by tests +
+/// any caller that doesn't want to drive the orchestrator manually. Preserves
+/// the historical update-confirmation prompt (`assume_yes=false` → asks
+/// `[y/N]`); the inline stale-process guard remains in `apply_planned_update`.
+pub fn apply_update(opts: ApplyOptions) -> Result<String, String> {
+    apply_update_with(opts, latest_release, &RealConfirmer, apply_planned_update)
+}
+
+/// Injectable variant of [`apply_update`]. Tests use `FakeLookup` /
+/// `FakeConfirmer` / fake `apply_fn` to prove ordering + no-network behavior
+/// for the `from_source` / `assume_yes` paths.
+pub fn apply_update_with(
+    opts: ApplyOptions,
+    lookup_fn: impl FnOnce(Duration) -> ReleaseLookup,
+    confirmer: &dyn Confirmer,
+    apply_fn: impl FnOnce(PlannedUpdate) -> Result<String, String>,
+) -> Result<String, String> {
+    // 1. --from-source short-circuit (no network, no fs).
+    if opts.from_source {
+        return Err(
+            "`--from-source` isn't implemented yet — for now update by rebuilding: \
+             `git pull && cargo build --release`, then copy the binary onto your PATH."
+                .to_string(),
+        );
+    }
+    // 2. Plan via injected lookup.
+    let decision = plan_update_with_lookup(&opts, lookup_fn)?;
+    let planned = match decision {
+        UpdateDecision::Skip { reason } => return Ok(reason),
+        UpdateDecision::Apply(p) => p,
+    };
+    // 3. Update-confirmation gate (PRESERVED from v0.19.0 behavior).
+    if !opts.assume_yes {
+        let from_s = planned
+            .from
+            .as_ref()
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "?".into());
+        if !confirmer.confirm(&format!("Update {from_s} → {to}? [y/N] ", to = planned.to)) {
+            return Ok("Update cancelled.".to_string());
+        }
+    }
+    // 4. Apply.
+    apply_fn(planned)
 }
 
 /// The install binary's own file name (e.g. `aibridge.exe`), for staging `<name>.new`.
@@ -675,6 +953,365 @@ fn write_installed_meta(install_path: &str, version: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── plan/apply split (v0.20.0 hotfix) ───
+
+    fn fake_lookup_found(tag: &str, assets: Vec<&str>) -> ReleaseLookup {
+        ReleaseLookup::Found {
+            tag: tag.to_string(),
+            assets: assets.into_iter().map(String::from).collect(),
+        }
+    }
+
+    #[test]
+    fn plan_from_lookup_skip_when_no_release() {
+        let r = plan_from_lookup(ReleaseLookup::None, parse_version("1.0.0")).unwrap();
+        assert!(matches!(r, InitialPlan::Skip { .. }));
+    }
+
+    #[test]
+    fn plan_from_lookup_skip_when_already_latest() {
+        let r = plan_from_lookup(
+            fake_lookup_found(
+                "0.5.0",
+                vec![&asset_name(), &format!("{}.sha256", asset_name())],
+            ),
+            parse_version("0.5.0"),
+        )
+        .unwrap();
+        assert!(matches!(r, InitialPlan::Skip { .. }));
+    }
+
+    #[test]
+    fn plan_from_lookup_apply_when_newer_with_assets() {
+        let r = plan_from_lookup(
+            fake_lookup_found(
+                "9.9.9",
+                vec![&asset_name(), &format!("{}.sha256", asset_name())],
+            ),
+            parse_version("0.5.0"),
+        )
+        .unwrap();
+        assert!(matches!(r, InitialPlan::Apply { .. }));
+    }
+
+    #[test]
+    fn plan_from_lookup_err_when_platform_asset_missing() {
+        let r = plan_from_lookup(
+            fake_lookup_found("9.9.9", vec!["aibridge-unrelated-target"]),
+            parse_version("0.5.0"),
+        );
+        assert!(r.is_err(), "got: {r:?}");
+    }
+
+    #[test]
+    fn plan_from_lookup_err_when_checksum_missing() {
+        let r = plan_from_lookup(
+            fake_lookup_found("9.9.9", vec![&asset_name()]),
+            parse_version("0.5.0"),
+        );
+        assert!(r.is_err(), "expected missing-checksum error, got: {r:?}");
+    }
+
+    #[test]
+    fn plan_from_lookup_err_when_gh_missing() {
+        assert!(plan_from_lookup(ReleaseLookup::GhMissing, None).is_err());
+    }
+
+    #[test]
+    fn plan_update_with_lookup_from_source_short_circuits_without_calling_lookup() {
+        let opts = ApplyOptions {
+            assume_yes: true,
+            from_source: true,
+            target_path: None,
+        };
+        let r = plan_update_with_lookup(&opts, |_| {
+            panic!("lookup must NOT be called when --from-source is set");
+        });
+        assert!(r.is_err(), "got: {r:?}");
+        assert!(r.unwrap_err().contains("from-source"));
+    }
+
+    #[test]
+    fn apply_update_with_from_source_short_circuits_without_calling_lookup_or_apply() {
+        let opts = ApplyOptions {
+            assume_yes: true,
+            from_source: true,
+            target_path: None,
+        };
+        let r = apply_update_with(
+            opts,
+            |_| panic!("lookup must NOT be called"),
+            &AlwaysYesConfirmer,
+            |_| panic!("apply must NOT be called"),
+        );
+        assert!(r.is_err(), "got: {r:?}");
+    }
+
+    struct DeclineConfirmer;
+    impl Confirmer for DeclineConfirmer {
+        fn confirm(&self, _: &str) -> bool {
+            false
+        }
+        fn confirm_close_pids(&self, _: &Path, _: &[u32]) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn apply_update_with_assume_yes_false_decline_does_not_apply() {
+        // Lookup returns newer with proper assets; confirmer DECLINES; apply must NOT be called.
+        let opts = ApplyOptions {
+            assume_yes: false,
+            from_source: false,
+            target_path: Some("/tmp/test-aibridge".to_string()),
+        };
+        let r = apply_update_with(
+            opts,
+            |_| {
+                fake_lookup_found(
+                    "99.0.0",
+                    vec![&asset_name(), &format!("{}.sha256", asset_name())],
+                )
+            },
+            &DeclineConfirmer,
+            |_| panic!("apply must NOT be called when user declines"),
+        );
+        let s = r.unwrap();
+        assert!(s.contains("cancelled"), "got: {s}");
+    }
+
+    #[test]
+    fn apply_update_with_assume_yes_true_skips_confirm_and_applies() {
+        let opts = ApplyOptions {
+            assume_yes: true,
+            from_source: false,
+            target_path: Some("/tmp/test-aibridge".to_string()),
+        };
+        let r = apply_update_with(
+            opts,
+            |_| {
+                fake_lookup_found(
+                    "99.0.0",
+                    vec![&asset_name(), &format!("{}.sha256", asset_name())],
+                )
+            },
+            &DeclineConfirmer, // would decline, but assume_yes skips it
+            |_| Ok("applied-by-test".to_string()),
+        );
+        assert_eq!(r.unwrap(), "applied-by-test");
+    }
+
+    #[test]
+    fn plan_update_with_lookup_honors_target_path() {
+        let opts = ApplyOptions {
+            assume_yes: true,
+            from_source: false,
+            target_path: Some("/tmp/override-aibridge".to_string()),
+        };
+        let r = plan_update_with_lookup(&opts, |_| {
+            fake_lookup_found(
+                "99.0.0",
+                vec![&asset_name(), &format!("{}.sha256", asset_name())],
+            )
+        })
+        .unwrap();
+        match r {
+            UpdateDecision::Apply(p) => {
+                assert_eq!(p.install_path, PathBuf::from("/tmp/override-aibridge"));
+            }
+            other => panic!("expected Apply, got {other:?}"),
+        }
+    }
+
+    // ─── decide_cleanup_mode ───
+    #[test]
+    fn decide_cleanup_mode_close_stale_wins_always() {
+        assert_eq!(
+            decide_cleanup_mode(true, true, true),
+            CleanupMode::AutoClose
+        );
+        assert_eq!(
+            decide_cleanup_mode(false, true, false),
+            CleanupMode::AutoClose
+        );
+    }
+
+    #[test]
+    fn decide_cleanup_mode_tty_prompts_by_default() {
+        assert_eq!(decide_cleanup_mode(false, false, true), CleanupMode::Prompt);
+        assert_eq!(decide_cleanup_mode(true, false, true), CleanupMode::Prompt);
+    }
+
+    #[test]
+    fn decide_cleanup_mode_non_tty_refuses_without_close_stale() {
+        assert_eq!(
+            decide_cleanup_mode(false, false, false),
+            CleanupMode::RefuseNonInteractive
+        );
+        assert_eq!(
+            decide_cleanup_mode(true, false, false),
+            CleanupMode::RefuseNonInteractive
+        );
+    }
+
+    // ─── orchestrate_update ───
+    use crate::process_cleanup as pc;
+
+    struct EmptyEnumerator;
+    impl pc::ProcessEnumerator for EmptyEnumerator {
+        fn list_aibridge(&self) -> Result<Vec<pc::StaleProcess>, String> {
+            Ok(Vec::new())
+        }
+    }
+
+    struct StaleEnumerator {
+        stale: Vec<pc::StaleProcess>,
+    }
+    impl pc::ProcessEnumerator for StaleEnumerator {
+        fn list_aibridge(&self) -> Result<Vec<pc::StaleProcess>, String> {
+            Ok(self.stale.clone())
+        }
+    }
+
+    struct NoopKiller;
+    impl pc::ProcessKiller for NoopKiller {
+        fn kill_one(&self, _: &pc::StaleProcess, _: &Path) -> pc::KillOutcome {
+            pc::KillOutcome::TerminatedGracefully
+        }
+    }
+
+    fn fake_plan(install: &str) -> UpdateDecision {
+        UpdateDecision::Apply(PlannedUpdate {
+            install_path: PathBuf::from(install),
+            tag: "v9.9.9".into(),
+            from: parse_version("0.1.0"),
+            to: parse_version("9.9.9").unwrap(),
+        })
+    }
+
+    #[test]
+    fn orchestrate_skip_returns_reason_without_calling_apply() {
+        let decision = UpdateDecision::Skip {
+            reason: "Already on the latest release (0.5.0).".to_string(),
+        };
+        let r = orchestrate_update(
+            decision,
+            OrchestrationOpts {
+                update_already_confirmed: true,
+                cleanup_mode: CleanupMode::Prompt,
+            },
+            &EmptyEnumerator,
+            &NoopKiller,
+            &AlwaysYesConfirmer,
+            &|_| panic!("apply must NOT be called for Skip"),
+        )
+        .unwrap();
+        assert!(r.contains("Already"));
+    }
+
+    #[test]
+    fn orchestrate_no_stale_proceeds_to_apply() {
+        let r = orchestrate_update(
+            fake_plan("/tmp/aib"),
+            OrchestrationOpts {
+                update_already_confirmed: true,
+                cleanup_mode: CleanupMode::Prompt,
+            },
+            &EmptyEnumerator,
+            &NoopKiller,
+            &AlwaysYesConfirmer,
+            &|p| Ok(format!("applied at {}", p.install_path.display())),
+        )
+        .unwrap();
+        assert!(r.contains("applied at /tmp/aib"));
+    }
+
+    #[test]
+    fn orchestrate_update_confirmation_declined_cancels() {
+        let r = orchestrate_update(
+            fake_plan("/tmp/aib"),
+            OrchestrationOpts {
+                update_already_confirmed: false,
+                cleanup_mode: CleanupMode::Prompt,
+            },
+            &EmptyEnumerator,
+            &NoopKiller,
+            &DeclineConfirmer, // declines BOTH prompts
+            &|_| panic!("apply must NOT be called when update is declined"),
+        )
+        .unwrap();
+        assert!(r.contains("cancelled"));
+    }
+
+    #[test]
+    fn orchestrate_stale_refuse_non_interactive_aborts() {
+        let stale = vec![pc::StaleProcess {
+            pid: 999,
+            exe_path: Some(PathBuf::from("/tmp/aib")),
+            start_time_secs: Some(1),
+        }];
+        let r = orchestrate_update(
+            fake_plan("/tmp/aib"),
+            OrchestrationOpts {
+                update_already_confirmed: true,
+                cleanup_mode: CleanupMode::RefuseNonInteractive,
+            },
+            &StaleEnumerator { stale },
+            &NoopKiller,
+            &AlwaysYesConfirmer,
+            &|_| panic!("apply must NOT be called when stale + non-interactive"),
+        );
+        let err = r.unwrap_err();
+        assert!(
+            err.contains("re-run with") || err.contains("close-stale"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn orchestrate_stale_cleanup_declined_cancels() {
+        let stale = vec![pc::StaleProcess {
+            pid: 999,
+            exe_path: Some(PathBuf::from("/tmp/aib")),
+            start_time_secs: Some(1),
+        }];
+        let r = orchestrate_update(
+            fake_plan("/tmp/aib"),
+            OrchestrationOpts {
+                update_already_confirmed: true,
+                cleanup_mode: CleanupMode::Prompt,
+            },
+            &StaleEnumerator { stale },
+            &NoopKiller,
+            &DeclineConfirmer, // declines the cleanup prompt
+            &|_| panic!("apply must NOT be called when cleanup is declined"),
+        )
+        .unwrap();
+        assert!(r.contains("Cleanup declined"));
+    }
+
+    #[test]
+    fn orchestrate_stale_auto_close_kills_then_applies() {
+        let stale = vec![pc::StaleProcess {
+            pid: 999,
+            exe_path: Some(PathBuf::from("/tmp/aib")),
+            start_time_secs: Some(1),
+        }];
+        let r = orchestrate_update(
+            fake_plan("/tmp/aib"),
+            OrchestrationOpts {
+                update_already_confirmed: true,
+                cleanup_mode: CleanupMode::AutoClose,
+            },
+            &StaleEnumerator { stale },
+            &NoopKiller, // returns TerminatedGracefully for all
+            &AlwaysYesConfirmer,
+            &|_| Ok("applied-after-cleanup".to_string()),
+        )
+        .unwrap();
+        assert!(r.contains("applied-after-cleanup"));
+    }
 
     #[test]
     fn parses_clean_stable_versions() {

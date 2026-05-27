@@ -31,10 +31,23 @@ versioning is semver.
 - New `sysinfo`, `zip`, `tar`, `flate2` deps in `aibridge-core` (process enumeration + archive extraction; all pure Rust, well-audited).
 - Memory file `feedback_push_by_default.md` saved (durable user preference: future release commits push to origin by default).
 
+### Added — hotfix: TUI/CLI update orchestration (plan/apply split, brought forward)
+
+User feedback flagged that pressing `u` in the TUI Update tab silently aborted because Claude-Code-spawned MCP servers held the install path. Brought the v0.20.1 deferred refactor forward to fix the UX in v0.20.0.
+
+- **`update.rs` plan/apply split** — `update::plan_update(opts) → UpdateDecision { Skip | Apply(PlannedUpdate) }` (network + version-compare + asset validation, NO mutation, NO prompts); `update::apply_planned_update(PlannedUpdate)` (download + verify + replace with abort-only stale-process safety net). Type-safe boundary: apply is impossible to call with a Skip decision.
+- **`update::orchestrate_update(decision, opts, &enumerator, &killer, &confirmer, &apply_fn)`** — wires planning + cleanup-confirmation + kill + apply with injected seams. Tests prove correct ordering: skip-returns-without-apply, cleanup-declined-cancels, stale-auto-close-then-apply, stale-non-interactive-refuses-without-killing.
+- **CLI `--close-stale` flag on `aibridge update`** — opt-in auto-close of same-install-path stale processes. Without it, an interactive TTY prompts `[y/N]`; a non-TTY refuses with a helpful error.
+- **TUI Update tab `u` on the aibridge row** — now plans → prompts for cleanup in the restored terminal (default-no, shows PID list) → kills → applies. User no longer hits the stale-process abort. Pressing `u` consents to UPDATE only; killing other same-path aibridge processes (MCP servers, other TUIs) requires a SEPARATE explicit `[y/N]`.
+- **`update::Confirmer` trait** — `RealConfirmer` (stdin), `AlwaysYesConfirmer` (test). Production callers + TUI use Real; tests inject Fake/Always/Decline.
+- **`update::CleanupMode` + `decide_cleanup_mode(yes, close_stale, is_tty)`** — pure helper with table-driven tests.
+- **Asset validation BEFORE prompting cleanup** — `plan_update` refuses early if the release is missing THIS platform's asset or its `.sha256` sidecar. Prevents the "kill MCP servers then fail at download" UX.
+- **`--from-source` short-circuits BEFORE network** in `plan_update`, `apply_update`, and `main::update_cmd` — no GitHub lookup, no cleanup.
+- **`apply_update(opts)` backward-compat wrapper preserved** — keeps the existing "Update X → Y? [y/N]" prompt for direct callers. Tests cover `assume_yes=false-decline-doesn't-apply` and `assume_yes=true-skips-prompt`.
+- **+20 new unit tests in `update.rs`** covering plan/apply split, orchestrate variants, CleanupMode matrix, asset validation, from-source short-circuits. Total: **303 passing** (was 263 in v0.20.0 base + 20 new + minor adjustments).
+
 ### Deferred (will land in v0.20.1)
-- **`update.rs` plan/apply split** — currently `apply_update` does release-lookup + cleanup-check + confirmation + download + replace in one call. The full split into `plan_update` + `apply_planned_update` (with `ReleaseProvider`/`Confirmer`/`ProcessKiller` injection seams + CLI `--close-stale` flag + TUI after-exit cleanup confirmation) is queued for v0.20.1 as a separate refactor PR.
 - **`docs/install/{windows,macos}.md` updates** — manual-install-only guidance still present in those files; v0.20.1 will replace with `aibridge rtk install` recommendation.
-- **TUI after-exit cleanup confirmation prompt** — self-update via `u` on the aibridge row still triggers the new stale-process abort error (no cleanup orchestration); same UX gap that v0.20.1 will close.
 
 ## [0.19.0] - 2026-05-26
 

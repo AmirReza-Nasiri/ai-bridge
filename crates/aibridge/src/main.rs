@@ -87,6 +87,12 @@ enum Commands {
         /// (codex, claude, rtk). Useful for periodic CLI maintenance.
         #[arg(long = "cli-only")]
         cli_only: bool,
+        /// Auto-close same-install-path stale `aibridge` processes (TUI sessions
+        /// and Claude-Code-spawned MCP servers) before applying the update,
+        /// without an interactive confirmation. Use with `--yes` for unattended
+        /// runs. v0.20.0.
+        #[arg(long = "close-stale")]
+        close_stale: bool,
     },
     /// Internal hook entry points (invoked by Claude Code hooks, not by you).
     Hook {
@@ -294,7 +300,8 @@ fn main() -> Result<()> {
             from_source,
             target,
             cli_only,
-        } => update_cmd(check, yes, from_source, target, cli_only),
+            close_stale,
+        } => update_cmd(check, yes, from_source, target, cli_only, close_stale),
         Commands::Hook { action } => match action {
             HookAction::Pretooluse => hook_pretooluse(),
             HookAction::UserPromptSubmit => hook_user_prompt_submit(),
@@ -548,10 +555,16 @@ fn update_cmd(
     from_source: bool,
     target: Option<String>,
     cli_only: bool,
+    close_stale: bool,
 ) -> Result<()> {
     use aibridge_core::cli_update::{
         apply_cli_update, check_all, decide_action, effective_mode, prompt_parse, scan_mcps,
         Action, RealCommandRunner,
+    };
+    use aibridge_core::process_cleanup::{RealProcessEnumerator, RealProcessKiller};
+    use aibridge_core::update::{
+        apply_planned_update, decide_cleanup_mode, orchestrate_update, plan_update, ApplyOptions,
+        OrchestrationOpts, RealConfirmer,
     };
     use std::io::{BufRead, IsTerminal, Write};
     use std::time::Duration;
@@ -564,13 +577,45 @@ fn update_cmd(
                 "{}",
                 aibridge_core::update::check_report(Duration::from_secs(15))
             );
+        } else if from_source {
+            // Short-circuit per Codex R5/R6 — never hit the network.
+            eprintln!(
+                "AI Bridge update: `--from-source` isn't implemented yet — for now update by \
+                 rebuilding: `git pull && cargo build --release`, then copy the binary onto \
+                 your PATH."
+            );
+            std::process::exit(1);
         } else {
-            match aibridge_core::update::apply_update(aibridge_core::update::ApplyOptions {
+            // v0.20.0 plan/apply split: plan first, then orchestrate cleanup+apply.
+            let opts = ApplyOptions {
                 assume_yes: yes,
                 from_source,
-                target_path: target,
-            }) {
-                Ok(msg) => println!("{msg}"),
+                target_path: target.clone(),
+            };
+            match plan_update(&opts) {
+                Ok(decision) => {
+                    let is_tty = std::io::stdin().is_terminal();
+                    let cleanup_mode = decide_cleanup_mode(yes, close_stale, is_tty);
+                    let orch_opts = OrchestrationOpts {
+                        update_already_confirmed: yes,
+                        cleanup_mode,
+                    };
+                    let result = orchestrate_update(
+                        decision,
+                        orch_opts,
+                        &RealProcessEnumerator,
+                        &RealProcessKiller,
+                        &RealConfirmer,
+                        &apply_planned_update,
+                    );
+                    match result {
+                        Ok(msg) => println!("{msg}"),
+                        Err(msg) => {
+                            eprintln!("AI Bridge update: {msg}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
                 Err(msg) => {
                     eprintln!("AI Bridge update: {msg}");
                     std::process::exit(1);

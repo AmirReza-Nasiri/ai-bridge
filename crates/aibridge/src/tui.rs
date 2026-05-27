@@ -1137,13 +1137,40 @@ pub fn run() -> Result<()> {
     // shows normally and replacing the running binary can't corrupt the dashboard.
     // Only if the loop ended cleanly (don't self-update on top of a loop error).
     if res.is_ok() && app.update_on_exit {
+        use aibridge_core::process_cleanup::{RealProcessEnumerator, RealProcessKiller};
+        use aibridge_core::update::{
+            apply_planned_update, orchestrate_update, plan_update, ApplyOptions, CleanupMode,
+            OrchestrationOpts, RealConfirmer,
+        };
         println!("AI Bridge {}\n", aibridge_core::VERSION_FULL);
-        match aibridge_core::update::apply_update(aibridge_core::update::ApplyOptions {
+        // v0.20.0 hotfix: plan_update first, then orchestrate cleanup+apply in
+        // the restored terminal. User pressed `u` → update_already_confirmed=true.
+        // Cleanup mode is Prompt — pressing `u` consents to UPDATE only; killing
+        // other same-path aibridge processes (MCP servers, other TUIs) requires
+        // a separate explicit [y/N].
+        let opts = ApplyOptions {
             assume_yes: true,
             from_source: false,
             target_path: None,
-        }) {
-            Ok(m) => println!("{m}"),
+        };
+        match plan_update(&opts) {
+            Ok(decision) => {
+                let orch = OrchestrationOpts {
+                    update_already_confirmed: true,
+                    cleanup_mode: CleanupMode::Prompt,
+                };
+                match orchestrate_update(
+                    decision,
+                    orch,
+                    &RealProcessEnumerator,
+                    &RealProcessKiller,
+                    &RealConfirmer,
+                    &apply_planned_update,
+                ) {
+                    Ok(m) => println!("{m}"),
+                    Err(e) => eprintln!("AI Bridge update: {e}"),
+                }
+            }
             Err(e) => eprintln!("AI Bridge update: {e}"),
         }
     }
