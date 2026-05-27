@@ -876,6 +876,147 @@ pub fn install_or_update(
     Ok(msg)
 }
 
+/// v0.22.0: in-TUI variant of [`install_or_update`] limited to NATIVE rtk paths
+/// (no brew). Emits stage names via `on_stage` before each major phase so the
+/// caller (TUI) can render live progress. Returns `Err` for brew-managed rtk —
+/// the brew path still uses [`install_or_update`] in the restored terminal.
+///
+/// Cancellation: NOT cooperative. Once started, runs to completion. The caller
+/// (TUI) blocks `q` while a worker is active. Note: in a crossterm raw-mode
+/// TUI, Ctrl+C is delivered as a key event (NOT an OS signal) and v0.22.0
+/// installs no Ctrl+C handler — practical emergency abort is forced process
+/// termination (closing the terminal window, OS kill). Termination during the
+/// atomic-replace + identity-verify critical section may leave temp files,
+/// staged files, backups, or an unverified replacement — manual recovery may
+/// be required (delete `<system tmp>/aibridge-rtk-*`, restore from the rollback
+/// backup at `<install>.old.<pid>.<ts>` if present).
+pub fn install_or_update_native_with_progress(
+    runner: &dyn CommandRunner,
+    resolver: &dyn PathResolver,
+    downloader: &dyn ReleaseDownloader,
+    fs: &dyn FsOps,
+    opts: InstallOpts,
+    on_stage: &(dyn Fn(&str) + Send + Sync),
+) -> Result<String, String> {
+    on_stage("resolving target");
+    let target = detect_target(runner, resolver);
+    let install_path = match target {
+        RtkTarget::Brew => {
+            return Err(
+                "not a native install — use install_or_update for brew-managed rtk".to_string(),
+            );
+        }
+        RtkTarget::NativeBin {
+            path,
+            writable: true,
+        } => path,
+        RtkTarget::NativeBin {
+            path,
+            writable: false,
+        } => {
+            return Err(format!(
+                "rtk install path {path:?} is not writable by the current user; \
+                 update manually or fix permissions"
+            ));
+        }
+        RtkTarget::NotInstalled { install_to } => {
+            if !opts.allow_fresh_install {
+                return Err(format!(
+                    "rtk is not installed; run `aibridge rtk install [--yes]` to fetch it to {install_to:?}"
+                ));
+            }
+            if let Some(parent) = install_to.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("can't create install dir {parent:?}: {e}"))?;
+            }
+            install_to
+        }
+        RtkTarget::Unknown { reason } => {
+            return Err(format!("rtk auto-update unavailable: {reason}"));
+        }
+        RtkTarget::Unsupported { reason } => {
+            return Err(format!(
+                "rtk auto-install unsupported on this platform: {reason}"
+            ));
+        }
+    };
+
+    let target_triple = crate::update::current_target();
+    let asset = rtk_asset_name(target_triple).ok_or_else(|| {
+        format!(
+            "no rtk asset published for target '{target_triple}' — \
+             see https://github.com/rtk-ai/rtk/releases"
+        )
+    })?;
+    let bin_name = rtk_binary_name(target_triple);
+
+    on_stage("resolving latest release tag");
+    let tag = crate::cli_update::gh_latest_release_tag_raw(runner, "rtk-ai/rtk")
+        .ok_or("could not resolve rtk's latest release tag from GitHub")?;
+
+    on_stage(&format!("downloading {asset}"));
+    let tmp = make_temp_dir()?;
+    let dl_res = downloader.download("rtk-ai/rtk", &tag, asset, &tmp);
+    if let Err(e) = dl_res {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return Err(e);
+    }
+    let archive = tmp.join(asset);
+    let checksums_path = tmp.join("checksums.txt");
+    if !archive.exists() || !checksums_path.exists() {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return Err(format!(
+            "rtk download incomplete (missing {asset} or checksums.txt in {tmp:?})"
+        ));
+    }
+    let checksums_txt = std::fs::read_to_string(&checksums_path)
+        .map_err(|e| format!("can't read checksums.txt: {e}"))?;
+    let expected = match lookup_checksum(&checksums_txt, asset) {
+        Ok(h) => h,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return Err(e);
+        }
+    };
+
+    on_stage("verifying SHA256");
+    if let Err(e) = verify_sha256(&archive, &expected) {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return Err(format!("refusing to extract: {e}"));
+    }
+
+    on_stage("extracting");
+    let extracted = match extract_rtk_binary(&archive, bin_name, &tmp) {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return Err(e);
+        }
+    };
+
+    on_stage("atomic-replacing");
+    if let Err(e) = stage_swap_verify(&install_path, &extracted, runner, fs) {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return Err(e);
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+
+    let mut msg = format!(
+        "rtk installed at {} (from {asset} @ {tag})",
+        install_path.display()
+    );
+    let mut visible_on_path = false;
+    if let Ok(resolved) = resolver.find("rtk") {
+        if crate::process_cleanup::same_install_path(&resolved, &install_path) {
+            visible_on_path = true;
+        }
+    }
+    if !visible_on_path {
+        msg.push_str("\nWARNING: install dir is not on PATH; add it to your shell rc to use 'rtk' from your prompt.");
+    }
+    Ok(msg)
+}
+
 fn run_brew_upgrade(_runner: &dyn CommandRunner) -> Result<String, String> {
     // Use the inherited-stdio mutation path (same pattern as cli_update::apply_cli_update).
     let argv = vec!["brew".to_string(), "upgrade".to_string(), "rtk".to_string()];
@@ -1530,5 +1671,154 @@ mod tests {
         assert!(err.contains("post-install identity failed"), "got: {err}");
         assert!(err.contains("BAD BINARY REMAINS"), "got: {err}");
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ─── v0.22.0: install_or_update_native_with_progress refusal paths ───
+    // These tests verify the function correctly refuses non-native targets
+    // BEFORE any download/io. We cannot run the full happy-path in unit tests
+    // because it shells out to `gh` and mutates a real install location.
+
+    /// PathResolver that says rtk is at a brew-shaped path (triggers Brew detection).
+    struct BrewLikePathResolver;
+    impl PathResolver for BrewLikePathResolver {
+        fn find(&self, name: &str) -> Result<PathBuf, String> {
+            if name == "rtk" {
+                Ok(PathBuf::from("/opt/homebrew/bin/rtk"))
+            } else {
+                Err(format!("not found: {name}"))
+            }
+        }
+    }
+
+    /// PathResolver that says rtk isn't installed (triggers NotInstalled).
+    struct MissingPathResolver;
+    impl PathResolver for MissingPathResolver {
+        fn find(&self, _name: &str) -> Result<PathBuf, String> {
+            Err("not found".into())
+        }
+    }
+
+    /// Stub Downloader/FsOps for tests that should fail BEFORE any download.
+    struct UnreachableDownloader;
+    impl ReleaseDownloader for UnreachableDownloader {
+        fn download(&self, _: &str, _: &str, _: &str, _: &Path) -> Result<(), String> {
+            panic!("downloader must not be called for refusal-path tests")
+        }
+    }
+    struct UnreachableFs;
+    impl FsOps for UnreachableFs {
+        fn exists(&self, _p: &Path) -> bool {
+            panic!("fs must not be called for refusal-path tests")
+        }
+        fn rename(&self, _s: &Path, _d: &Path) -> Result<(), String> {
+            panic!("fs must not be called")
+        }
+        fn remove_file(&self, _p: &Path) -> Result<(), String> {
+            panic!("fs must not be called")
+        }
+        fn copy(&self, _s: &Path, _d: &Path) -> Result<(), String> {
+            panic!("fs must not be called")
+        }
+    }
+
+    fn noop_stage(_s: &str) {}
+
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn install_or_update_native_refuses_brew_target() {
+        // BrewLikePathResolver + FakeRunner whose `brew list rtk` confirms brew →
+        // detect_target returns Brew. Native variant must refuse.
+        let mut runner = FakeRunner::new();
+        let path = PathBuf::from("/opt/homebrew/bin/rtk");
+        runner.set_path(&path, &["--version"], true, "rtk-ai/rtk 0.42.0\n");
+        runner.set("brew", &["list", "rtk"], true, "/opt/homebrew/bin/rtk\n");
+        let result = install_or_update_native_with_progress(
+            &runner,
+            &BrewLikePathResolver,
+            &UnreachableDownloader,
+            &UnreachableFs,
+            InstallOpts {
+                yes: true,
+                allow_fresh_install: false,
+            },
+            &noop_stage,
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("not a native install"),
+            "expected brew refusal, got: {err}"
+        );
+    }
+
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn install_or_update_native_refuses_not_installed_when_no_fresh_install() {
+        let runner = FakeRunner::new();
+        let result = install_or_update_native_with_progress(
+            &runner,
+            &MissingPathResolver,
+            &UnreachableDownloader,
+            &UnreachableFs,
+            InstallOpts {
+                yes: true,
+                allow_fresh_install: false,
+            },
+            &noop_stage,
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("rtk is not installed"),
+            "expected 'not installed' error, got: {err}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn install_or_update_native_refuses_on_linux() {
+        // Linux returns Unsupported from detect_target.
+        let runner = FakeRunner::new();
+        let result = install_or_update_native_with_progress(
+            &runner,
+            &MissingPathResolver,
+            &UnreachableDownloader,
+            &UnreachableFs,
+            InstallOpts {
+                yes: true,
+                allow_fresh_install: true,
+            },
+            &noop_stage,
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("unsupported on this platform"),
+            "expected unsupported, got: {err}"
+        );
+    }
+
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn install_or_update_native_emits_first_stage_before_target_detect() {
+        // Captures that on_stage IS called at least once with "resolving target"
+        // before any error path returns. Uses BrewLikePathResolver so we trip
+        // the refusal AFTER the first stage emit.
+        let mut runner = FakeRunner::new();
+        let path = PathBuf::from("/opt/homebrew/bin/rtk");
+        runner.set_path(&path, &["--version"], true, "rtk-ai/rtk 0.42.0\n");
+        runner.set("brew", &["list", "rtk"], true, "/opt/homebrew/bin/rtk\n");
+        let stages = std::sync::Mutex::new(Vec::<String>::new());
+        let cb = |s: &str| stages.lock().unwrap().push(s.to_string());
+        let _ = install_or_update_native_with_progress(
+            &runner,
+            &BrewLikePathResolver,
+            &UnreachableDownloader,
+            &UnreachableFs,
+            InstallOpts {
+                yes: true,
+                allow_fresh_install: false,
+            },
+            &cb,
+        );
+        let s = stages.lock().unwrap().clone();
+        assert_eq!(s, vec!["resolving target".to_string()]);
     }
 }

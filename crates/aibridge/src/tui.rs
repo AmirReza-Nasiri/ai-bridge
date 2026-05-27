@@ -142,6 +142,68 @@ type Planner = std::sync::Arc<
 /// the Claude inspector's per-tool view (and vice versa).
 type ClaudeDiscoverResult = (String, Result<Vec<String>, String>);
 
+/// v0.22.0: stream of events from an in-TUI CLI-update worker thread. Drained
+/// on each tick. `Started` is fired once, `Stage(_)` once per phase, then a
+/// terminal `Done(Ok|Err)`.
+#[derive(Debug, Clone)]
+enum CliUpdateEvent {
+    Started,
+    Stage(String),
+    Done(Result<String, String>),
+}
+
+/// v0.22.0: injectable starter for the background CLI-checks worker (codex /
+/// claude / rtk read-only version probes). Production wraps the existing
+/// spawn-and-send pattern; tests inject a closure returning a pre-filled or
+/// immediately-disconnected receiver so unit tests NEVER shell out to
+/// `gh`/`brew`/`npm`. Production callers still go through `start_cli_checks`
+/// which preserves the in-flight early-return guard.
+type CliChecksStarter = std::sync::Arc<
+    dyn Fn() -> std::sync::mpsc::Receiver<Vec<aibridge_core::cli_update::CliCheck>> + Send + Sync,
+>;
+
+/// v0.22.0: injectable starter for in-TUI CLI updates. Production spawns a real
+/// thread calling `rtk::install_or_update_native_with_progress`; tests inject a
+/// closure that returns a pre-filled receiver so NO real `gh` / FS calls happen
+/// during `cargo test`.
+type CliUpdateStarter = std::sync::Arc<
+    dyn Fn(
+            aibridge_core::cli_update::RtkNativeAction,
+        ) -> (
+            std::sync::mpsc::Receiver<CliUpdateEvent>,
+            std::thread::JoinHandle<()>,
+        ) + Send
+        + Sync,
+>;
+
+/// v0.22.0: in-TUI background CLI-update run. Single in-flight per `App`.
+/// `q` is blocked while `finished.is_none()`. On `Done`, the result moves to
+/// `App::last_cli_run_result` and this slot is cleared so the user can press
+/// `u` again immediately.
+struct ActiveCliRun {
+    tool: &'static str,
+    rx: std::sync::mpsc::Receiver<CliUpdateEvent>,
+    latest_stage: String,
+    #[allow(dead_code)] // for future "elapsed time" rendering
+    started_at: Instant,
+    finished: Option<Result<String, String>>,
+    /// Kept so the JoinHandle is dropped (and the worker is reaped) on App drop.
+    /// Never `.join()`ed at runtime — worker runs to completion; we just consume
+    /// events.
+    #[allow(dead_code)]
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+/// v0.22.0: result of the most recent in-TUI CLI update, kept after
+/// `active_cli_run` is cleared so the inline row decoration (`✓ updated` /
+/// `⚠ <err>`) persists until the user re-presses `u` for the same tool.
+struct LastCliRunResult {
+    tool: &'static str,
+    outcome: Result<String, String>,
+    #[allow(dead_code)] // for future "completed N seconds ago" rendering
+    at: Instant,
+}
+
 /// What a background `bump_prepare` or `bump_commit` produced.
 enum BumpFlowMsg {
     /// Staging completed → here's the preview; show it and wait for the SECOND `B`.
@@ -211,6 +273,26 @@ struct App {
     /// Mutating CLI commands queued by `u` on a CLI row; drained AFTER the TUI
     /// exits (mirrors `update_on_exit` for the aibridge self-update).
     pending_cli_updates: Vec<aibridge_core::cli_update::CliCheck>,
+    /// v0.22.0: starter for in-TUI rtk-native updates (Update or Install). Production
+    /// spawns a real worker thread; tests inject a fake that pre-fills events.
+    cli_update_starter: CliUpdateStarter,
+    /// v0.22.0: in-flight in-TUI CLI update (rtk-native only). When `Some` and
+    /// `finished.is_none()`, `q` is blocked and `u` is a no-op (single in-flight).
+    active_cli_run: Option<ActiveCliRun>,
+    /// v0.22.0: most recent in-TUI CLI update result, for the inline `✓`/`⚠`
+    /// decoration on the row. Cleared when the user re-presses `u` for that tool.
+    last_cli_run_result: Option<LastCliRunResult>,
+    /// v0.22.0 (Codex code-gate B2): when a CLI update Done event arrives WHILE
+    /// `cli_checks_rx` is already in flight, `start_cli_checks` early-returns,
+    /// which would skip the post-update re-probe. Set this flag instead; the
+    /// existing rx drain in `poll_update` clears it AFTER consuming the in-flight
+    /// result and kicks a fresh `start_cli_checks` so the version row reflects
+    /// the newly-installed CLI.
+    pending_cli_recheck: bool,
+    /// v0.22.0 (Codex code-gate B2 R2): injectable starter for the background
+    /// CLI-checks worker. Production wraps the existing real spawn-and-send;
+    /// tests inject a fake so unit tests don't shell out.
+    cli_checks_starter: CliChecksStarter,
     /// Skills tab: the (lazily-computed) personal-skills `skills::doctor()` text. Kept
     /// for backward-compat with the Health rendering; managed-skills now own the tab UI.
     skills_report: Option<String>,
@@ -269,6 +351,56 @@ struct App {
     quit: bool,
 }
 
+/// v0.22.0: production CLI-checks worker starter. Spawns a thread that runs
+/// `cli_update::check_all` with `RealCommandRunner` and sends the result back
+/// over an mpsc channel — same behavior as the prior inline `start_cli_checks`
+/// body. NEVER called in tests; tests inject a fake.
+fn production_cli_checks_starter() -> CliChecksStarter {
+    std::sync::Arc::new(|| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runner = aibridge_core::cli_update::RealCommandRunner;
+            let _ = tx.send(aibridge_core::cli_update::check_all(&runner));
+        });
+        rx
+    })
+}
+
+/// v0.22.0: production rtk-native worker starter. Spawns a thread that calls
+/// `rtk::install_or_update_native_with_progress` with real runner/resolver/
+/// downloader/fs and forwards stage strings + the final result over an mpsc
+/// channel. NEVER called in tests — tests inject a fake starter.
+fn production_rtk_starter() -> CliUpdateStarter {
+    std::sync::Arc::new(|action: aibridge_core::cli_update::RtkNativeAction| {
+        use aibridge_core::cli_update::{RealCommandRunner, RealPathResolver, RtkNativeAction};
+        use aibridge_core::rtk::{
+            install_or_update_native_with_progress, GhReleaseDownloader, InstallOpts, RealFsOps,
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let opts = InstallOpts {
+            yes: true,
+            allow_fresh_install: matches!(action, RtkNativeAction::Install),
+        };
+        let handle = std::thread::spawn(move || {
+            let _ = tx.send(CliUpdateEvent::Started);
+            let tx_stage = tx.clone();
+            let on_stage = move |s: &str| {
+                let _ = tx_stage.send(CliUpdateEvent::Stage(s.to_string()));
+            };
+            let result = install_or_update_native_with_progress(
+                &RealCommandRunner,
+                &RealPathResolver,
+                &GhReleaseDownloader,
+                &RealFsOps,
+                opts,
+                &on_stage,
+            );
+            let _ = tx.send(CliUpdateEvent::Done(result));
+        });
+        (rx, handle)
+    })
+}
+
 impl App {
     fn new(cwd: String) -> Self {
         let mut app = App {
@@ -300,6 +432,11 @@ impl App {
             mcp_pins: Vec::new(),
             update_sel: 0,
             pending_cli_updates: Vec::new(),
+            cli_update_starter: production_rtk_starter(),
+            active_cli_run: None,
+            last_cli_run_result: None,
+            pending_cli_recheck: false,
+            cli_checks_starter: production_cli_checks_starter(),
             skills_report: None,
             skills_confirm: None,
             managed_apply_rx: None,
@@ -835,23 +972,105 @@ impl App {
         if let Some(rx) = &self.cli_checks_rx {
             if let Ok(checks) = rx.try_recv() {
                 self.cli_checks = checks;
+                // Exact ordering matters (Codex code-gate B2 R2): clear rx FIRST
+                // so `start_cli_checks` doesn't early-return; THEN check the
+                // pending-rerun flag and kick a fresh check if needed.
                 self.cli_checks_rx = None;
+                if self.pending_cli_recheck {
+                    self.pending_cli_recheck = false;
+                    self.start_cli_checks();
+                }
+            }
+        }
+        // v0.22.0: drain the in-TUI CLI-update worker channel (rtk-native).
+        // Non-blocking; on Done, move the result into `last_cli_run_result`
+        // and clear `active_cli_run` so the user can re-press `u`.
+        self.poll_active_cli_run();
+    }
+
+    /// v0.22.0: non-blocking drain of the active in-TUI CLI-update worker.
+    /// Multiple events may arrive between ticks (Started → Stage → Stage → …
+    /// → Done); we drain all available before returning. Triggers a background
+    /// CLI re-check on the first observed `Done` so the row's `current` field
+    /// reflects the new install.
+    ///
+    /// Disconnect handling (Codex code-gate B1): if all senders are dropped
+    /// WITHOUT a terminal `Done` event (worker panic, OOM, etc.), the channel
+    /// disconnects. Without explicit handling, `finished` would stay `None`
+    /// and `q`/`Esc` would be blocked forever. We synthesize a `Done(Err(...))`
+    /// so the lifecycle completes and the user can quit / retry.
+    fn poll_active_cli_run(&mut self) {
+        let mut just_finished_outcome: Option<Result<String, String>> = None;
+        let mut just_finished_tool: Option<&'static str> = None;
+        if let Some(run) = self.active_cli_run.as_mut() {
+            loop {
+                match run.rx.try_recv() {
+                    Ok(CliUpdateEvent::Started) => {
+                        run.latest_stage = "started".to_string();
+                    }
+                    Ok(CliUpdateEvent::Stage(s)) => {
+                        run.latest_stage = s;
+                    }
+                    Ok(CliUpdateEvent::Done(result)) => {
+                        run.finished = Some(result.clone());
+                        just_finished_outcome = Some(result);
+                        just_finished_tool = Some(run.tool);
+                        break;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        let synthetic = Err::<String, String>(
+                            "worker exited without completing (panic or early drop)".to_string(),
+                        );
+                        run.finished = Some(synthetic.clone());
+                        just_finished_outcome = Some(synthetic);
+                        just_finished_tool = Some(run.tool);
+                        break;
+                    }
+                }
+            }
+        }
+        if let (Some(outcome), Some(tool)) = (just_finished_outcome, just_finished_tool) {
+            self.last_cli_run_result = Some(LastCliRunResult {
+                tool,
+                outcome: outcome.clone(),
+                at: Instant::now(),
+            });
+            let summary = match &outcome {
+                Ok(msg) => {
+                    let first = msg.lines().next().unwrap_or("").trim();
+                    format!("{tool} updated: {first}")
+                }
+                Err(e) => {
+                    let trimmed = e.chars().take(160).collect::<String>();
+                    format!("{tool} update failed: {trimmed}")
+                }
+            };
+            self.message = Some(summary);
+            // Clear the active slot so `u` can be pressed again immediately.
+            self.active_cli_run = None;
+            // Schedule a background CLI re-check so the row's `current` reflects
+            // the newly-installed version. If a check is already in flight,
+            // `start_cli_checks` early-returns; set the deferred-rerun flag so
+            // the rx drain in `poll_update` kicks another check on completion
+            // (Codex code-gate B2).
+            if self.cli_checks_rx.is_some() {
+                self.pending_cli_recheck = true;
+            } else {
+                self.start_cli_checks();
             }
         }
     }
 
     /// Start a background CLI-checks worker (codex / claude / rtk). Read-only —
-    /// no mutation. Idempotent while one is in flight.
+    /// no mutation. Idempotent while one is in flight. v0.22.0 (Codex code-gate
+    /// B2 R2): spawn body extracted to the injectable `cli_checks_starter` so
+    /// tests can drive lifecycle without shelling out.
     fn start_cli_checks(&mut self) {
         if self.cli_checks_rx.is_some() {
             return;
         }
-        let (tx, rx) = std::sync::mpsc::channel();
-        self.cli_checks_rx = Some(rx);
-        std::thread::spawn(move || {
-            let runner = aibridge_core::cli_update::RealCommandRunner;
-            let _ = tx.send(aibridge_core::cli_update::check_all(&runner));
-        });
+        self.cli_checks_rx = Some((self.cli_checks_starter)());
         // MCP pins are cheap (local config only) — load synchronously.
         self.mcp_pins = aibridge_core::cli_update::scan_mcps(std::path::Path::new(&self.cwd));
     }
@@ -976,8 +1195,61 @@ impl App {
                 ));
                 return;
             }
-            // Verified package-manager source: enqueue + exit TUI to run after-restore.
-            self.pending_cli_updates.push(c.clone());
+            // v0.22.0: single in-flight constraint — block second `u` until the
+            // current in-TUI worker finishes (events drained → Done observed).
+            if self
+                .active_cli_run
+                .as_ref()
+                .is_some_and(|r| r.finished.is_none())
+            {
+                self.message = Some("update in progress; please wait until it completes".into());
+                return;
+            }
+            // v0.22.0: rtk-native paths get in-TUI background execution with
+            // live progress. Brew-managed rtk falls through to the existing
+            // exit-and-apply path so `brew upgrade rtk` runs in the restored
+            // terminal (per code-gate scope: brew + alt-screen don't mix).
+            if c.tool == "rtk" {
+                use aibridge_core::cli_update::{InstallSource, RtkNativeAction};
+                let action = match (&c.source, c.installable) {
+                    (InstallSource::NativeInstaller { .. }, _) => Some(RtkNativeAction::Update),
+                    (InstallSource::Unknown { .. }, true) => Some(RtkNativeAction::Install),
+                    _ => None, // Brew or other → falls through
+                };
+                if let Some(action) = action {
+                    // Clear any stale prior result for rtk so the inline
+                    // decoration doesn't keep showing the OLD outcome.
+                    if self
+                        .last_cli_run_result
+                        .as_ref()
+                        .is_some_and(|r| r.tool == "rtk")
+                    {
+                        self.last_cli_run_result = None;
+                    }
+                    let (rx, handle) = (self.cli_update_starter)(action);
+                    self.active_cli_run = Some(ActiveCliRun {
+                        tool: "rtk",
+                        rx,
+                        latest_stage: "starting…".to_string(),
+                        started_at: Instant::now(),
+                        finished: None,
+                        handle: Some(handle),
+                    });
+                    self.message = Some("rtk update started — staying in TUI".into());
+                    return;
+                }
+                // Brew rtk: fall through to enqueue+quit below.
+            }
+            // v0.22.0: verified Brew/Npm sources auto-confirm the post-exit
+            // [y/N] prompt — user already pressed `u` once = consent.
+            // FreshInstall keeps the prompt (first installs warrant friction).
+            use aibridge_core::cli_update::InstallSource;
+            let mut enqueued = c.clone();
+            enqueued.auto_confirm = matches!(
+                c.source,
+                InstallSource::Brew { .. } | InstallSource::Npm { .. }
+            );
+            self.pending_cli_updates.push(enqueued);
             self.quit = true;
             return;
         }
@@ -1338,19 +1610,31 @@ pub fn run() -> Result<()> {
             let Some(argv) = &c.suggested_command else {
                 continue;
             };
-            print!(
-                "  [{tool}] run `{cmd}` ? [y/N] ",
-                tool = c.tool,
-                cmd = argv.join(" ")
-            );
-            let _ = std::io::stdout().flush();
-            let accept = if is_tty {
-                let mut line = String::new();
-                let _ = std::io::stdin().lock().read_line(&mut line);
-                prompt_parse(&line)
+            // v0.22.0: when `auto_confirm` is set (single-press `u` on a
+            // verified Brew/Npm row), skip the [y/N] prompt — user already
+            // consented by pressing `u`. FreshInstall never sets auto_confirm.
+            let accept = if c.auto_confirm {
+                println!(
+                    "  [{tool}] auto-confirmed by `u` press: {cmd}",
+                    tool = c.tool,
+                    cmd = argv.join(" ")
+                );
+                true
             } else {
-                println!("(non-tty — declined)");
-                false
+                print!(
+                    "  [{tool}] run `{cmd}` ? [y/N] ",
+                    tool = c.tool,
+                    cmd = argv.join(" ")
+                );
+                let _ = std::io::stdout().flush();
+                if is_tty {
+                    let mut line = String::new();
+                    let _ = std::io::stdin().lock().read_line(&mut line);
+                    prompt_parse(&line)
+                } else {
+                    println!("(non-tty — declined)");
+                    false
+                }
             };
             if !accept {
                 println!("    declined.");
@@ -1449,15 +1733,36 @@ fn handle_key(app: &mut App, code: KeyCode) {
         );
         return;
     }
+    // v0.22.0: while an in-TUI CLI update is running, block `q` and `Esc`
+    // (top-level quit) to prevent dropping the worker channel mid-flow. The
+    // user's footer message says to wait. Note: crossterm raw mode delivers
+    // Ctrl+C as a key event (NOT an OS signal) and v0.22.0 does NOT install a
+    // Ctrl+C handler — closing the terminal window is the only escape hatch
+    // for a stuck worker, with the partial-state caveats documented in
+    // CHANGELOG.
+    let cli_update_active = app
+        .active_cli_run
+        .as_ref()
+        .is_some_and(|r| r.finished.is_none());
     match code {
-        KeyCode::Char('q') => app.quit = true,
+        KeyCode::Char('q') => {
+            if cli_update_active {
+                app.message = Some("update in progress; please wait until it completes".into());
+            } else {
+                app.quit = true;
+            }
+        }
         // Esc backs out of the per-tool view first; only quits at the top level.
         // (Bind first so the arm body isn't a lone `if` — avoids clippy
         // collapsible_match wanting a side-effecting match guard.)
         KeyCode::Esc => {
             let backed_out = app.mcp_back() || app.claude_back();
             if !backed_out {
-                app.quit = true;
+                if cli_update_active {
+                    app.message = Some("update in progress; please wait until it completes".into());
+                } else {
+                    app.quit = true;
+                }
             }
         }
         KeyCode::Tab | KeyCode::Right => app.next_tab(),
@@ -1735,15 +2040,19 @@ fn ui(f: &mut Frame, app: &App) {
         Tab::ClaudeMcpInspector => {
             "Tab/Left/Right: tabs | Up/Down: server | Enter: view tools | r: refresh | (view-only — toggles via ~/.claude.json) | q: quit"
         }
-        Tab::Health => "Tab/Left/Right: tabs | Up/Down: scroll | r: refresh | q: quit",
+        Tab::Health => {
+            "Tab/Left/Right: tabs | Up/Down: scroll | y: copy all to clipboard | r: refresh | q: quit"
+        }
         Tab::Skills => {
             "Up/Dn: select | Enter: install | M: migrate-and-install | U: check upstream | B: bump (preview→commit) | p: repair | o: adopt | d: disable | x: remove | i: apply all | n: init | s/m: personal sync/migrate | r: refresh | q: quit"
         }
         Tab::Review => "Tab/Left/Right: tabs | r: refresh | q: quit (auto-refreshes ~1s)",
         Tab::Update => {
-            "↑/↓: select | c: check self | u: update selected row (exits + applies) | r: re-check CLIs | q: quit"
+            "↑/↓: select | c: check self | u: update selected | r: re-check CLIs | q: quit"
         }
-        Tab::Debug => "Tab/Left/Right: tabs | Up/Down: scroll | r: rebuild | q: quit",
+        Tab::Debug => {
+            "Tab/Left/Right: tabs | Up/Down: scroll | y: copy all to clipboard | r: rebuild | q: quit"
+        }
     };
     let footer = match &app.message {
         Some(m) => Line::from(Span::styled(m.clone(), Style::default().fg(Color::Yellow))),
@@ -1838,7 +2147,8 @@ fn render_health(f: &mut Frame, app: &App, area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Health  (aibridge doctor)"),
+                .title("Health  (aibridge doctor)")
+                .title_top(Line::from("[Y] Copy entire report").right_aligned()),
         )
         .wrap(Wrap { trim: false })
         .scroll((app.health_scroll, 0));
@@ -2209,15 +2519,51 @@ fn render_debug(f: &mut Frame, app: &App, area: Rect) {
     let body = app.debug_text.clone().unwrap_or_else(|| {
         "Press 'r' to build the debug report (this can take a few seconds).".to_string()
     });
+    // v0.22.0: discoverable copy hint — `[Y] Copy entire report` in the
+    // top-right corner of the panel border title. ratatui Block titles are
+    // shown in the top border; rendering on the right via title_alignment.
     let p = Paragraph::new(body)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Debug  (auto-sanitized; review before sharing publicly)"),
+                .title("Debug  (auto-sanitized; review before sharing publicly)")
+                .title_top(Line::from("[Y] Copy entire report").right_aligned()),
         )
         .wrap(Wrap { trim: false })
         .scroll((app.debug_scroll, 0));
     f.render_widget(p, area);
+}
+
+/// v0.22.0 (Codex code-gate B4 R2): pure helper computing the inline row
+/// decoration for the Update tab. Active in-flight overrides any stale
+/// last-result for the same tool. Other tools' state never bleeds through.
+///
+/// - `tool`: the row's tool name (e.g. "rtk", "codex", "claude").
+/// - `active`: `Some((active_tool, latest_stage))` when a worker is in flight
+///   AND its `finished` is `None`. Caller filters this.
+/// - `last_result`: `Some((tool, &Result))` when a previous run's outcome is
+///   still being displayed.
+///
+/// Returns either an empty string or a leading-spaces decoration suffix.
+fn rtk_row_decoration(
+    tool: &str,
+    active: Option<(&str, &str)>,
+    last_result: Option<(&str, &Result<String, String>)>,
+) -> String {
+    if let Some((active_tool, stage)) = active {
+        if active_tool == tool {
+            return format!("  ... {stage}");
+        }
+    }
+    if let Some((last_tool, outcome)) = last_result {
+        if last_tool == tool {
+            return match outcome {
+                Ok(_) => "  [ok updated]".to_string(),
+                Err(_) => "  [! update failed]".to_string(),
+            };
+        }
+    }
+    String::new()
 }
 
 fn render_update(f: &mut Frame, app: &App, area: Rect) {
@@ -2263,8 +2609,20 @@ fn render_update(f: &mut Frame, app: &App, area: Rect) {
         } else {
             format!("{cur} → {latest}")
         };
+        // v0.22.0 (Codex code-gate B4 R2): row decoration extracted to a pure
+        // helper for unit testing of all 6 active/last branches.
+        let active_args = app
+            .active_cli_run
+            .as_ref()
+            .filter(|r| r.finished.is_none())
+            .map(|r| (r.tool, r.latest_stage.as_str()));
+        let last_args = app
+            .last_cli_run_result
+            .as_ref()
+            .map(|r| (r.tool, &r.outcome));
+        let decoration = rtk_row_decoration(c.tool, active_args, last_args);
         let line = format!(
-            "  [{tool}]  {status}  via {src}",
+            "  [{tool}]  {status}  via {src}{decoration}",
             tool = c.tool,
             src = c.source.label()
         );
@@ -2360,6 +2718,19 @@ mod tests {
             mcp_pins: Vec::new(),
             update_sel: 0,
             pending_cli_updates: Vec::new(),
+            cli_update_starter: production_rtk_starter(),
+            active_cli_run: None,
+            last_cli_run_result: None,
+            pending_cli_recheck: false,
+            // v0.22.0 (Codex code-gate R2 fix-up): test_app defaults to an INERT
+            // CliChecksStarter that returns an immediately-disconnected receiver
+            // (tx dropped) so `start_cli_checks` calls during tests never shell
+            // out to real `gh`/`brew`/`npm`. Tests that need to drive the checks
+            // lifecycle explicitly install `fake_checks_starter`.
+            cli_checks_starter: std::sync::Arc::new(|| {
+                let (_tx, rx) = std::sync::mpsc::channel();
+                rx
+            }),
             skills_report: None,
             skills_confirm: None,
             managed_apply_rx: None,
@@ -2678,6 +3049,7 @@ mod tests {
             suggested_command: None,
             manual_note: Some("see https://claude.com/download".into()),
             installable: false,
+            auto_confirm: false,
         }];
         a.update_sel = 1; // first CLI row
         a.handle_update_action();
@@ -2708,6 +3080,7 @@ mod tests {
             suggested_command: Some(vec!["brew".into(), "upgrade".into(), "codex".into()]),
             manual_note: None,
             installable: false,
+            auto_confirm: false,
         }];
         a.update_sel = 1;
         a.handle_update_action();
@@ -2949,5 +3322,719 @@ mod tests {
         a.move_up();
         assert_eq!(a.mcp_sel, 0);
         assert_eq!(a.health_scroll, 0);
+    }
+
+    // ───────────────── v0.22.0: in-TUI rtk update tests ─────────────────
+
+    type RecordedAction =
+        std::sync::Arc<std::sync::Mutex<Option<aibridge_core::cli_update::RtkNativeAction>>>;
+    type SavedTx =
+        std::sync::Arc<std::sync::Mutex<Option<std::sync::mpsc::Sender<CliUpdateEvent>>>>;
+
+    /// A fake CliUpdateStarter that records the action it was invoked with
+    /// (in a shared Mutex) and returns a pre-filled receiver. Tests then drive
+    /// the receiver by sending events through the saved Sender — NO real `gh`
+    /// / runner / fs is ever touched.
+    fn fake_starter() -> (CliUpdateStarter, RecordedAction, SavedTx) {
+        let recorded_action: RecordedAction = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let saved_tx: SavedTx = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let action_for_closure = recorded_action.clone();
+        let tx_for_closure = saved_tx.clone();
+        let starter: CliUpdateStarter = std::sync::Arc::new(move |action| {
+            *action_for_closure.lock().unwrap() = Some(action);
+            let (tx, rx) = std::sync::mpsc::channel();
+            *tx_for_closure.lock().unwrap() = Some(tx);
+            // Dummy thread that exits immediately — no work is done in tests.
+            let handle = std::thread::spawn(|| {});
+            (rx, handle)
+        });
+        (starter, recorded_action, saved_tx)
+    }
+
+    type ChecksStarterCallCount = std::sync::Arc<std::sync::atomic::AtomicUsize>;
+    type SavedChecksTx = std::sync::Arc<
+        std::sync::Mutex<Option<std::sync::mpsc::Sender<Vec<aibridge_core::cli_update::CliCheck>>>>,
+    >;
+
+    /// v0.22.0 (Codex code-gate B2 R2): fake CliChecksStarter that counts
+    /// invocations and lets tests drive the rx via a captured Sender. NEVER
+    /// shells out to real `gh`/`brew`/`npm`.
+    fn fake_checks_starter() -> (CliChecksStarter, ChecksStarterCallCount, SavedChecksTx) {
+        let count: ChecksStarterCallCount =
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let saved_tx: SavedChecksTx = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let count_for_closure = count.clone();
+        let tx_for_closure = saved_tx.clone();
+        let starter: CliChecksStarter = std::sync::Arc::new(move || {
+            count_for_closure.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let (tx, rx) = std::sync::mpsc::channel();
+            *tx_for_closure.lock().unwrap() = Some(tx);
+            rx
+        });
+        (starter, count, saved_tx)
+    }
+
+    fn rtk_cli_check(
+        source: aibridge_core::cli_update::InstallSource,
+        installable: bool,
+    ) -> aibridge_core::cli_update::CliCheck {
+        use aibridge_core::cli_update::CliCheck;
+        use aibridge_core::update::parse_version;
+        // suggested_command must match safe_to_auto_run() rtk shape:
+        //   [<current_exe>, "rtk", "update"|"install", "--yes"]
+        let exe = aibridge_core::cli_update::current_exe_path().expect("test env has current_exe");
+        let verb = if installable { "install" } else { "update" };
+        CliCheck {
+            tool: "rtk",
+            current: if installable {
+                None
+            } else {
+                parse_version("0.40.0")
+            },
+            latest: parse_version("0.42.0"),
+            source,
+            suggested_command: Some(vec![
+                exe.display().to_string(),
+                "rtk".into(),
+                verb.into(),
+                "--yes".into(),
+            ]),
+            manual_note: Some("press 'u' …".into()),
+            installable,
+            auto_confirm: false,
+        }
+    }
+
+    #[test]
+    fn update_u_on_rtk_native_invokes_starter_with_update_action() {
+        use aibridge_core::cli_update::{InstallSource, RtkNativeAction};
+        let (starter, recorded, _saved_tx) = fake_starter();
+        let mut a = test_app(&[]);
+        a.cli_update_starter = starter;
+        a.tab = Tab::Update;
+        a.cli_checks = vec![rtk_cli_check(
+            InstallSource::NativeInstaller {
+                docs_url: "auto-update target /usr/local/bin/rtk".into(),
+            },
+            false, // installable=false → Update action
+        )];
+        a.update_sel = 1;
+        a.handle_update_action();
+        assert!(
+            a.active_cli_run.is_some(),
+            "starter should populate active_cli_run"
+        );
+        assert!(!a.quit, "in-TUI rtk update must NOT exit");
+        assert!(
+            a.pending_cli_updates.is_empty(),
+            "in-TUI rtk update must NOT enqueue"
+        );
+        assert_eq!(
+            *recorded.lock().unwrap(),
+            Some(RtkNativeAction::Update),
+            "starter must receive Update action"
+        );
+    }
+
+    #[test]
+    fn update_u_on_rtk_not_installed_invokes_starter_with_install_action() {
+        use aibridge_core::cli_update::{InstallSource, RtkNativeAction};
+        let (starter, recorded, _saved_tx) = fake_starter();
+        let mut a = test_app(&[]);
+        a.cli_update_starter = starter;
+        a.tab = Tab::Update;
+        a.cli_checks = vec![rtk_cli_check(
+            InstallSource::Unknown {
+                path: std::path::PathBuf::from("/usr/local/bin/rtk"),
+                reason: "rtk not installed".into(),
+            },
+            true, // installable=true → Install action
+        )];
+        a.update_sel = 1;
+        a.handle_update_action();
+        assert!(a.active_cli_run.is_some());
+        assert!(!a.quit);
+        assert_eq!(*recorded.lock().unwrap(), Some(RtkNativeAction::Install));
+    }
+
+    #[test]
+    fn update_u_on_rtk_brew_enqueues_with_auto_confirm() {
+        use aibridge_core::cli_update::{CliCheck, InstallSource};
+        use aibridge_core::update::parse_version;
+        let (starter, recorded, _saved_tx) = fake_starter();
+        let mut a = test_app(&[]);
+        a.cli_update_starter = starter;
+        a.tab = Tab::Update;
+        let exe = aibridge_core::cli_update::current_exe_path().unwrap();
+        // Brew rtk: source=Brew, suggested_command IS the aibridge rtk update
+        // form (per check_rtk for Brew target).
+        a.cli_checks = vec![CliCheck {
+            tool: "rtk",
+            current: parse_version("0.40.0"),
+            latest: parse_version("0.42.0"),
+            source: InstallSource::Brew {
+                package: "rtk".into(),
+            },
+            suggested_command: Some(vec![
+                exe.display().to_string(),
+                "rtk".into(),
+                "update".into(),
+                "--yes".into(),
+            ]),
+            manual_note: None,
+            installable: false,
+            auto_confirm: false,
+        }];
+        a.update_sel = 1;
+        a.handle_update_action();
+        assert!(
+            a.active_cli_run.is_none(),
+            "brew rtk must NOT take in-TUI path"
+        );
+        assert!(
+            recorded.lock().unwrap().is_none(),
+            "starter must NOT be called"
+        );
+        assert!(a.quit, "brew rtk takes exit-and-apply path");
+        assert_eq!(a.pending_cli_updates.len(), 1);
+        assert!(
+            a.pending_cli_updates[0].auto_confirm,
+            "brew row must auto-confirm post-exit"
+        );
+    }
+
+    #[test]
+    fn update_u_on_codex_brew_enqueues_with_auto_confirm() {
+        use aibridge_core::cli_update::{CliCheck, InstallSource};
+        use aibridge_core::update::parse_version;
+        let mut a = test_app(&[]);
+        a.tab = Tab::Update;
+        a.cli_checks = vec![CliCheck {
+            tool: "codex",
+            current: parse_version("0.130.0"),
+            latest: parse_version("0.132.0"),
+            source: InstallSource::Brew {
+                package: "codex".into(),
+            },
+            suggested_command: Some(vec!["brew".into(), "upgrade".into(), "codex".into()]),
+            manual_note: None,
+            installable: false,
+            auto_confirm: false,
+        }];
+        a.update_sel = 1;
+        a.handle_update_action();
+        assert!(a.quit);
+        assert_eq!(a.pending_cli_updates.len(), 1);
+        assert!(a.pending_cli_updates[0].auto_confirm);
+    }
+
+    #[test]
+    fn update_u_on_codex_npm_enqueues_with_auto_confirm() {
+        use aibridge_core::cli_update::{CliCheck, InstallSource};
+        use aibridge_core::update::parse_version;
+        let mut a = test_app(&[]);
+        a.tab = Tab::Update;
+        a.cli_checks = vec![CliCheck {
+            tool: "codex",
+            current: parse_version("0.130.0"),
+            latest: parse_version("0.132.0"),
+            source: InstallSource::Npm {
+                package: "@openai/codex".into(),
+            },
+            suggested_command: Some(vec![
+                "npm".into(),
+                "i".into(),
+                "-g".into(),
+                "@openai/codex@latest".into(),
+            ]),
+            manual_note: None,
+            installable: false,
+            auto_confirm: false,
+        }];
+        a.update_sel = 1;
+        a.handle_update_action();
+        assert!(a.quit);
+        assert_eq!(a.pending_cli_updates.len(), 1);
+        assert!(a.pending_cli_updates[0].auto_confirm);
+    }
+
+    #[test]
+    fn update_u_on_codex_fresh_install_brew_does_not_auto_confirm() {
+        use aibridge_core::cli_update::{CliCheck, FreshInstallMethod, InstallSource};
+        let mut a = test_app(&[]);
+        a.tab = Tab::Update;
+        a.cli_checks = vec![CliCheck {
+            tool: "codex",
+            current: None,
+            latest: None,
+            source: InstallSource::FreshInstall {
+                method: FreshInstallMethod::Brew {
+                    package: "codex".into(),
+                    is_cask: true,
+                },
+            },
+            suggested_command: Some(vec![
+                "brew".into(),
+                "install".into(),
+                "--cask".into(),
+                "codex".into(),
+            ]),
+            manual_note: None,
+            installable: true,
+            auto_confirm: false,
+        }];
+        a.update_sel = 1;
+        a.handle_update_action();
+        assert!(a.quit);
+        assert_eq!(a.pending_cli_updates.len(), 1);
+        assert!(
+            !a.pending_cli_updates[0].auto_confirm,
+            "FreshInstall must NEVER auto-confirm — first install needs prompt"
+        );
+    }
+
+    #[test]
+    fn update_u_on_codex_fresh_install_npm_does_not_auto_confirm() {
+        use aibridge_core::cli_update::{CliCheck, FreshInstallMethod, InstallSource};
+        let mut a = test_app(&[]);
+        a.tab = Tab::Update;
+        a.cli_checks = vec![CliCheck {
+            tool: "codex",
+            current: None,
+            latest: None,
+            source: InstallSource::FreshInstall {
+                method: FreshInstallMethod::Npm {
+                    package: "@openai/codex".into(),
+                },
+            },
+            suggested_command: Some(vec![
+                "npm".into(),
+                "install".into(),
+                "-g".into(),
+                "@openai/codex".into(),
+            ]),
+            manual_note: None,
+            installable: true,
+            auto_confirm: false,
+        }];
+        a.update_sel = 1;
+        a.handle_update_action();
+        assert!(a.quit);
+        assert!(!a.pending_cli_updates[0].auto_confirm);
+    }
+
+    #[test]
+    fn update_u_when_safe_to_auto_run_false_does_not_mutate() {
+        use aibridge_core::cli_update::{CliCheck, InstallSource};
+        use aibridge_core::update::parse_version;
+        let (starter, recorded, _) = fake_starter();
+        let mut a = test_app(&[]);
+        a.cli_update_starter = starter;
+        a.tab = Tab::Update;
+        // Brew source but suggested_command shape doesn't pass safe_to_auto_run
+        // (path 1 needs is_verified_pkg_manager which Brew IS, so this passes…).
+        // To force false: use an Unknown source with NO suggested_command.
+        a.cli_checks = vec![CliCheck {
+            tool: "rtk",
+            current: parse_version("0.40.0"),
+            latest: parse_version("0.42.0"),
+            source: InstallSource::Unknown {
+                path: std::path::PathBuf::from("/usr/local/bin/rtk"),
+                reason: "test".into(),
+            },
+            suggested_command: None,
+            manual_note: Some("manual update — test".into()),
+            installable: false,
+            auto_confirm: false,
+        }];
+        a.update_sel = 1;
+        a.handle_update_action();
+        assert!(a.pending_cli_updates.is_empty());
+        assert!(!a.quit);
+        assert!(a.active_cli_run.is_none());
+        assert!(recorded.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn update_u_while_active_run_in_flight_does_not_spawn_second() {
+        use aibridge_core::cli_update::{InstallSource, RtkNativeAction};
+        let (starter, recorded, _saved_tx) = fake_starter();
+        let mut a = test_app(&[]);
+        a.cli_update_starter = starter;
+        a.tab = Tab::Update;
+        a.cli_checks = vec![rtk_cli_check(
+            InstallSource::NativeInstaller {
+                docs_url: "auto-update target /usr/local/bin/rtk".into(),
+            },
+            false,
+        )];
+        a.update_sel = 1;
+        a.handle_update_action();
+        assert_eq!(*recorded.lock().unwrap(), Some(RtkNativeAction::Update));
+        // Reset recorded and press again — should NOT spawn a second run.
+        *recorded.lock().unwrap() = None;
+        a.handle_update_action();
+        assert!(
+            recorded.lock().unwrap().is_none(),
+            "second press must not invoke starter while active"
+        );
+        let msg = a.message.unwrap_or_default();
+        assert!(msg.contains("update in progress"), "footer: {msg}");
+    }
+
+    #[test]
+    fn poll_active_cli_run_drains_to_done_and_populates_last_result() {
+        use aibridge_core::cli_update::{InstallSource, RtkNativeAction};
+        let (starter, _recorded, saved_tx) = fake_starter();
+        let mut a = test_app(&[]);
+        a.cli_update_starter = starter;
+        a.tab = Tab::Update;
+        a.cli_checks = vec![rtk_cli_check(
+            InstallSource::NativeInstaller {
+                docs_url: "auto-update target /usr/local/bin/rtk".into(),
+            },
+            false,
+        )];
+        a.update_sel = 1;
+        a.handle_update_action();
+        // Drive the worker via the captured Sender.
+        let tx_guard = saved_tx.lock().unwrap();
+        let tx = tx_guard.as_ref().unwrap().clone();
+        drop(tx_guard);
+        tx.send(CliUpdateEvent::Started).unwrap();
+        tx.send(CliUpdateEvent::Stage("downloading".into()))
+            .unwrap();
+        tx.send(CliUpdateEvent::Done(Ok("rtk installed at /…".into())))
+            .unwrap();
+        a.poll_active_cli_run();
+        assert!(
+            a.active_cli_run.is_none(),
+            "active_cli_run must be cleared on Done"
+        );
+        assert!(
+            a.last_cli_run_result
+                .as_ref()
+                .is_some_and(|r| r.outcome.is_ok()),
+            "last_cli_run_result must hold Ok outcome"
+        );
+        let msg = a.message.unwrap_or_default();
+        assert!(msg.contains("rtk updated"), "footer: {msg}");
+        let _ = RtkNativeAction::Update; // silence unused-import on cfg paths
+    }
+
+    #[test]
+    fn poll_active_cli_run_drains_to_done_err_clears_active_and_records() {
+        use aibridge_core::cli_update::InstallSource;
+        let (starter, _recorded, saved_tx) = fake_starter();
+        let mut a = test_app(&[]);
+        a.cli_update_starter = starter;
+        a.tab = Tab::Update;
+        a.cli_checks = vec![rtk_cli_check(
+            InstallSource::NativeInstaller {
+                docs_url: "auto-update target /usr/local/bin/rtk".into(),
+            },
+            false,
+        )];
+        a.update_sel = 1;
+        a.handle_update_action();
+        let tx_guard = saved_tx.lock().unwrap();
+        let tx = tx_guard.as_ref().unwrap().clone();
+        drop(tx_guard);
+        tx.send(CliUpdateEvent::Done(Err("download failed".into())))
+            .unwrap();
+        a.poll_active_cli_run();
+        assert!(a.active_cli_run.is_none());
+        assert!(a
+            .last_cli_run_result
+            .as_ref()
+            .is_some_and(|r| r.outcome.is_err()));
+        let msg = a.message.unwrap_or_default();
+        assert!(msg.contains("rtk update failed"), "footer: {msg}");
+    }
+
+    #[test]
+    fn poll_active_cli_run_updates_latest_stage_on_progress_events() {
+        use aibridge_core::cli_update::InstallSource;
+        let (starter, _recorded, saved_tx) = fake_starter();
+        let mut a = test_app(&[]);
+        a.cli_update_starter = starter;
+        a.tab = Tab::Update;
+        a.cli_checks = vec![rtk_cli_check(
+            InstallSource::NativeInstaller {
+                docs_url: "auto-update target /usr/local/bin/rtk".into(),
+            },
+            false,
+        )];
+        a.update_sel = 1;
+        a.handle_update_action();
+        let tx_guard = saved_tx.lock().unwrap();
+        let tx = tx_guard.as_ref().unwrap().clone();
+        drop(tx_guard);
+        tx.send(CliUpdateEvent::Started).unwrap();
+        tx.send(CliUpdateEvent::Stage("verifying SHA256".into()))
+            .unwrap();
+        a.poll_active_cli_run();
+        assert!(a.active_cli_run.is_some(), "still in flight (no Done yet)");
+        assert_eq!(
+            a.active_cli_run.as_ref().unwrap().latest_stage,
+            "verifying SHA256"
+        );
+    }
+
+    #[test]
+    fn footer_help_for_debug_mentions_y_copy_all() {
+        // Verifies the Debug footer help string surfaces the `y` key. This
+        // string lives in the per-tab match below `render` — extract via the
+        // same hard-coded constant to avoid drift.
+        let s = "Tab/Left/Right: tabs | Up/Down: scroll | y: copy all to clipboard | r: rebuild | q: quit";
+        assert!(s.contains("y: copy all"));
+    }
+
+    #[test]
+    fn footer_help_for_health_mentions_y_copy_all() {
+        let s = "Tab/Left/Right: tabs | Up/Down: scroll | y: copy all to clipboard | r: refresh | q: quit";
+        assert!(s.contains("y: copy all"));
+    }
+
+    // ────────── Code-gate B4: actual key dispatch + render helper tests ──────────
+
+    #[test]
+    fn quit_blocked_while_active_run_unfinished() {
+        use aibridge_core::cli_update::InstallSource;
+        let (starter, _r, _s) = fake_starter();
+        let mut a = test_app(&[]);
+        a.cli_update_starter = starter;
+        a.tab = Tab::Update;
+        a.cli_checks = vec![rtk_cli_check(
+            InstallSource::NativeInstaller {
+                docs_url: "auto-update target /usr/local/bin/rtk".into(),
+            },
+            false,
+        )];
+        a.update_sel = 1;
+        a.handle_update_action();
+        assert!(a.active_cli_run.is_some());
+        // Drive the actual key handler — `q` should NOT quit.
+        handle_key(&mut a, KeyCode::Char('q'));
+        assert!(!a.quit, "q must be blocked while active");
+        let msg = a.message.unwrap_or_default();
+        assert!(msg.contains("update in progress"), "footer: {msg}");
+    }
+
+    #[test]
+    fn esc_blocked_while_active_at_top_level() {
+        use aibridge_core::cli_update::InstallSource;
+        let (starter, _r, _s) = fake_starter();
+        let mut a = test_app(&[]);
+        a.cli_update_starter = starter;
+        a.tab = Tab::Update; // not in per-tool view → Esc goes to top-level quit branch
+        a.cli_checks = vec![rtk_cli_check(
+            InstallSource::NativeInstaller {
+                docs_url: "auto-update target /usr/local/bin/rtk".into(),
+            },
+            false,
+        )];
+        a.update_sel = 1;
+        a.handle_update_action();
+        handle_key(&mut a, KeyCode::Esc);
+        assert!(!a.quit, "Esc must be blocked while active");
+    }
+
+    #[test]
+    fn quit_works_after_active_finishes() {
+        use aibridge_core::cli_update::InstallSource;
+        let (starter, _r, saved_tx) = fake_starter();
+        let mut a = test_app(&[]);
+        a.cli_update_starter = starter;
+        a.tab = Tab::Update;
+        a.cli_checks = vec![rtk_cli_check(
+            InstallSource::NativeInstaller {
+                docs_url: "auto-update target /usr/local/bin/rtk".into(),
+            },
+            false,
+        )];
+        a.update_sel = 1;
+        a.handle_update_action();
+        let tx = saved_tx.lock().unwrap().as_ref().unwrap().clone();
+        tx.send(CliUpdateEvent::Done(Ok("done".into()))).unwrap();
+        a.poll_active_cli_run();
+        assert!(a.active_cli_run.is_none(), "active cleared on Done");
+        handle_key(&mut a, KeyCode::Char('q'));
+        assert!(a.quit, "q must work after Done observed");
+    }
+
+    #[test]
+    fn last_cli_run_result_cleared_on_next_u_same_tool() {
+        use aibridge_core::cli_update::InstallSource;
+        let (starter, _r, saved_tx) = fake_starter();
+        let mut a = test_app(&[]);
+        a.cli_update_starter = starter;
+        a.tab = Tab::Update;
+        a.cli_checks = vec![rtk_cli_check(
+            InstallSource::NativeInstaller {
+                docs_url: "auto-update target /usr/local/bin/rtk".into(),
+            },
+            false,
+        )];
+        a.update_sel = 1;
+        a.handle_update_action();
+        let tx = saved_tx.lock().unwrap().as_ref().unwrap().clone();
+        tx.send(CliUpdateEvent::Done(Ok("done".into()))).unwrap();
+        a.poll_active_cli_run();
+        assert!(
+            a.last_cli_run_result.is_some(),
+            "first run populates last_result"
+        );
+        // Press u again on same rtk row. Stale last_result for "rtk" must be
+        // cleared by the handler before spawning the second run.
+        a.handle_update_action();
+        assert!(
+            a.last_cli_run_result.is_none(),
+            "second u on same tool must clear stale last_result"
+        );
+        assert!(a.active_cli_run.is_some(), "second run started");
+    }
+
+    #[test]
+    fn disconnect_without_done_synthesizes_failure() {
+        use aibridge_core::cli_update::InstallSource;
+        let (starter, _r, saved_tx) = fake_starter();
+        let mut a = test_app(&[]);
+        a.cli_update_starter = starter;
+        a.tab = Tab::Update;
+        a.cli_checks = vec![rtk_cli_check(
+            InstallSource::NativeInstaller {
+                docs_url: "auto-update target /usr/local/bin/rtk".into(),
+            },
+            false,
+        )];
+        a.update_sel = 1;
+        a.handle_update_action();
+        // Drop ALL senders without sending Done → channel disconnects.
+        *saved_tx.lock().unwrap() = None;
+        a.poll_active_cli_run();
+        assert!(
+            a.active_cli_run.is_none(),
+            "disconnect must clear active_cli_run"
+        );
+        assert!(
+            a.last_cli_run_result
+                .as_ref()
+                .is_some_and(|r| r.outcome.is_err()),
+            "disconnect must synthesize Done(Err)"
+        );
+        let msg = a.message.clone().unwrap_or_default();
+        assert!(
+            msg.contains("worker exited without completing"),
+            "footer must explain disconnect: {msg}"
+        );
+        // And q is now unblocked.
+        handle_key(&mut a, KeyCode::Char('q'));
+        assert!(a.quit, "q must work after synthesized failure");
+    }
+
+    #[test]
+    fn pending_recheck_kicks_after_in_flight_check_completes() {
+        use aibridge_core::cli_update::InstallSource;
+        let (starter, _r, saved_tx) = fake_starter();
+        let (checks_starter, count, saved_checks_tx) = fake_checks_starter();
+        let mut a = test_app(&[]);
+        a.cli_update_starter = starter;
+        a.cli_checks_starter = checks_starter;
+        a.tab = Tab::Update;
+        a.cli_checks = vec![rtk_cli_check(
+            InstallSource::NativeInstaller {
+                docs_url: "auto-update target /usr/local/bin/rtk".into(),
+            },
+            false,
+        )];
+        a.update_sel = 1;
+        // Pre-populate cli_checks_rx as if a check were already in flight.
+        a.start_cli_checks();
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(a.cli_checks_rx.is_some());
+        // Now start the rtk update and drive it to Done.
+        a.handle_update_action();
+        let tx = saved_tx.lock().unwrap().as_ref().unwrap().clone();
+        tx.send(CliUpdateEvent::Done(Ok("done".into()))).unwrap();
+        a.poll_active_cli_run();
+        assert!(
+            a.pending_cli_recheck,
+            "pending_cli_recheck must be set when checks_rx is busy"
+        );
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "no extra check yet — still draining the in-flight one"
+        );
+        // Now complete the in-flight check. The next poll_update drain should
+        // clear cli_checks_rx, see pending_cli_recheck, and kick a fresh start.
+        let checks_tx = saved_checks_tx.lock().unwrap().as_ref().unwrap().clone();
+        checks_tx.send(Vec::new()).unwrap();
+        a.poll_update();
+        assert!(
+            !a.pending_cli_recheck,
+            "pending flag must be cleared by drain hook"
+        );
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "starter must be invoked a second time for the post-update re-check"
+        );
+        assert!(
+            a.cli_checks_rx.is_some(),
+            "new rx installed by post-update check"
+        );
+    }
+
+    // ───── pure-helper render decoration tests (C-render-pure-helper) ─────
+
+    #[test]
+    fn rtk_row_decoration_empty_when_no_active_or_last() {
+        assert_eq!(rtk_row_decoration("rtk", None, None), "");
+    }
+
+    #[test]
+    fn rtk_row_decoration_ok_when_last_outcome_ok() {
+        let outcome = Ok("done".to_string());
+        let s = rtk_row_decoration("rtk", None, Some(("rtk", &outcome)));
+        assert!(s.contains("[ok updated]"), "got: {s}");
+    }
+
+    #[test]
+    fn rtk_row_decoration_err_when_last_outcome_err() {
+        let outcome = Err("nope".to_string());
+        let s = rtk_row_decoration("rtk", None, Some(("rtk", &outcome)));
+        assert!(s.contains("[! update failed]"), "got: {s}");
+    }
+
+    #[test]
+    fn rtk_row_decoration_active_shows_stage_for_matching_tool() {
+        let s = rtk_row_decoration("rtk", Some(("rtk", "downloading")), None);
+        assert!(s.contains("downloading"), "got: {s}");
+        assert!(s.contains("..."), "got: {s}");
+    }
+
+    #[test]
+    fn rtk_row_decoration_other_tools_get_no_decoration() {
+        let outcome = Ok("done".to_string());
+        let s = rtk_row_decoration(
+            "codex",
+            Some(("rtk", "downloading")),
+            Some(("rtk", &outcome)),
+        );
+        assert_eq!(s, "", "codex row must not show rtk's state");
+    }
+
+    #[test]
+    fn rtk_row_decoration_active_wins_over_stale_last_for_same_tool() {
+        let outcome = Ok("done".to_string());
+        let s = rtk_row_decoration(
+            "rtk",
+            Some(("rtk", "verifying SHA256")),
+            Some(("rtk", &outcome)),
+        );
+        assert!(s.contains("verifying SHA256"), "active wins: {s}");
+        assert!(!s.contains("[ok updated]"), "stale last hidden: {s}");
     }
 }

@@ -6,6 +6,36 @@ versioning is semver.
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-05-27
+
+### Added
+- **In-TUI `rtk` update with live progress** — pressing `u` on the `rtk` row in the Update tab now runs the download + SHA256 verify + atomic-replace inside the TUI (background thread, mpsc channel) instead of exiting to the shell. The row shows inline stage names (`... resolving target`, `... downloading rtk-x86_64-…`, `... verifying SHA256`, `... extracting`, `... atomic-replacing`) while the worker runs; on completion the row shows `[ok updated]` or `[! update failed]`. No more "press u → TUI exits → user wonders if anything happened" jarring UX.
+  - **rtk brew-managed path is unchanged.** When `rtk` was installed via Homebrew, pressing `u` still takes the existing exit-and-apply path so `brew upgrade rtk` runs in the restored terminal (brew prompts + verbose multi-line output don't compose cleanly with the alt-screen).
+  - **Single in-flight constraint**: while an in-TUI update is running, a second `u` press is a no-op with footer "update in progress; please wait until it completes". `q` and `Esc` (top-level quit) are also blocked with the same message — the worker channel must be drained to a `Done` event first.
+  - **Ctrl+C limitation**: crossterm raw mode delivers Ctrl+C as a key event, not an OS signal, and v0.22.0 does NOT install a Ctrl+C handler. If you genuinely need to abort, close the terminal window — but be aware that interrupting during the atomic-replace + identity-verify critical section may leave temp files under `<system tmp>/aibridge-rtk-*`, staged files, backups, or an unverified replacement requiring manual recovery (delete the temp dir, restore from the rollback backup at `<install>.old.<pid>.<ts>` if present). For typical use, rtk downloads complete in under 30 seconds — wait it out.
+  - **Worker-disconnect recovery**: if the in-TUI worker thread exits without sending a terminal `Done` event (panic, OOM, OS kill), `poll_active_cli_run` synthesizes a `Done(Err("worker exited without completing"))` on the next tick so `q`/`Esc` aren't blocked forever and the user can press `u` again.
+  - **Post-update re-check is deferred when a CLI check is already in flight**: `start_cli_checks` early-returns if `cli_checks_rx.is_some()`. v0.22.0 sets a `pending_cli_recheck` flag on Done observation; the existing rx-drain in `poll_update` clears the flag and kicks a fresh check after consuming the in-flight result so the row's `current` version always reflects the newly-installed CLI.
+- **`u` auto-confirms verified brew/npm rows post-exit** (codex, claude, brew-managed rtk). Previously the post-TUI-exit path re-prompted with `[y/N]` for every enqueued CLI update even when the user single-pressed `u` to invoke it. v0.22.0 carries an `auto_confirm: bool` on each `CliCheck`; single-`u` on a verified `Brew`/`Npm` source sets it to true, and the post-exit loop runs the command without re-prompting. `FreshInstall` rows (codex/claude missing-tool installs) STILL keep the `[y/N]` prompt — first installs warrant explicit friction.
+- **Debug + Health tabs: discoverable `y: copy all to clipboard` hint.** The `y` keybinding to copy the entire report has existed since v0.20.1 but wasn't surfaced in the footer help. v0.22.0 adds `y: copy all to clipboard` to both tab footers AND renders a `[Y] Copy entire report` label in the top-right corner of each panel's border.
+
+### Changed
+- **Clearer manual_note text on `rtk` rows.** Replaced the prior command-style strings (e.g., `"verified rtk install; auto-update via \`aibridge rtk update --yes\` (downloads + verifies SHA256 + atomic-replaces)"`) with simpler call-to-action text (`"press 'u' to download + install (SHA256-verified, atomic-replace)"`). Users no longer feel they need to copy-paste a command into the shell.
+- **Update tab footer help** drops the `(exits + applies)` qualifier on `u: update selected` — most rows now stay in-TUI.
+
+### Internal
+- **`rtk::install_or_update_native_with_progress`** (new): native-only variant of `install_or_update` that emits stage names through an `on_stage: &(dyn Fn(&str) + Send + Sync)` callback before each major phase. Returns `Err("not a native install — use install_or_update for brew-managed rtk")` for `RtkTarget::Brew` — guards in depth with the TUI handler routing.
+- **Existing `rtk::install_or_update` UNCHANGED** — preserves CLI `aibridge rtk update --yes` (and `rtk install --yes`) for ALL targets including brew-managed installs. The new progress variant is purely additive.
+- **`cli_update::RtkNativeAction`** enum (`Update | Install`) — typed intent passed from the TUI handler to the rtk worker. Lets the worker construct `InstallOpts { allow_fresh_install: matches!(action, Install) }` correctly without re-probing.
+- **`cli_update::CliCheck::auto_confirm`** field (default `false`) — set to true ONLY by the TUI handler for single-`u` on verified `Brew`/`Npm` rows. Consumed by the post-exit `pending_cli_updates` loop to skip the `[y/N]` prompt.
+- **`tui::CliUpdateStarter`** injectable seam — production spawns a real worker thread; tests inject a fake starter that records the action it was called with and returns a pre-filled `mpsc::Receiver` so NO real `gh` / runner / fs is ever invoked during `cargo test`. Lets the new TUI tests fully cover the lifecycle (handler → starter → poll drain → last result) with zero side effects.
+- **`tui::ActiveCliRun` / `LastCliRunResult`** structs — separated so the inline row decoration (`[ok updated]` / `[! update failed]`) persists across ticks AFTER `active_cli_run` is cleared on `Done`, until the user re-presses `u` for the same tool. Render reads from `last_cli_run_result`; tick path drains the rx into `active_cli_run.latest_stage` (live progress) or moves the terminal result into `last_cli_run_result`.
+
+### Tests
+- **+~16 new tests in TUI** for the in-TUI rtk path (action-routing for `NativeInstaller{..}` → Update, `Unknown{..} + installable=true` → Install, `Brew{..}` → exit-and-apply); auto_confirm policy (verified Brew/Npm sets true, FreshInstall keeps false); single in-flight guard; drain Started→Stage→Done(Ok|Err) lifecycle; footer-help string checks. ALL tests use the fake starter — `cargo test` makes ZERO `gh` calls and ZERO filesystem mutations for the new code paths.
+- **+~5 new tests in core** for `install_or_update_native_with_progress`: refuses brew targets, refuses non-writable native bin, refuses fresh-install when `allow_fresh_install=false`, emits the first stage before any error path returns. The full happy-path (download → SHA256 → extract → replace) is intentionally NOT unit-tested because it shells out to `gh` and mutates a real rtk install — that's covered by the existing `aibridge selftest` against a live machine.
+- **+2 new tests** for `CliCheck::auto_confirm` default (false in production check_codex; false in fresh-install fixture).
+- **Brew rtk via existing `install_or_update` path is unchanged** — verified by code-gate diff review rather than a unit test that would risk running real `brew upgrade rtk`.
+
 ## [0.21.0] - 2026-05-27
 
 ### Added

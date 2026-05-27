@@ -115,6 +115,21 @@ pub struct CliCheck {
     /// Overrides `up_to_date()` so a missing-installable surfaces as actionable.
     /// v0.20.0 Codex Stop-gate R3 B2.
     pub installable: bool,
+    /// v0.22.0: when `true`, post-exit code skips the `[y/N]` prompt for this row
+    /// because the user already pressed `u` once (consent). Set ONLY by the TUI
+    /// handler when the row's source is verified Brew/Npm. NEVER set for
+    /// `FreshInstall` — first installs always require an explicit prompt.
+    /// Default: false (preserves existing prompt-always behavior for batch flows).
+    pub auto_confirm: bool,
+}
+
+/// v0.22.0: typed intent passed from the TUI to the rtk-native worker — `Update`
+/// for an existing native install, `Install` for a missing-but-installable fresh
+/// install. Lets the worker construct the right `InstallOpts` without re-probing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RtkNativeAction {
+    Update,
+    Install,
 }
 
 impl CliCheck {
@@ -876,6 +891,7 @@ pub fn check_codex_with(runner: &dyn CommandRunner, resolver: &dyn PathResolver)
         suggested_command: suggested,
         manual_note: note,
         installable,
+        auto_confirm: false,
     }
 }
 
@@ -1013,6 +1029,7 @@ pub fn check_claude_with(runner: &dyn CommandRunner, resolver: &dyn PathResolver
         suggested_command: suggested,
         manual_note: note,
         installable,
+        auto_confirm: false,
     }
 }
 
@@ -1043,7 +1060,7 @@ pub fn check_rtk_with(runner: &dyn CommandRunner, resolver: &dyn PathResolver) -
                     "--yes".into(),
                 ]
             }),
-            Some("brew-managed rtk; auto-update via `aibridge rtk update --yes`".to_string()),
+            Some("press 'u' to update via brew (TUI exits briefly)".to_string()),
             false,
         ),
         crate::rtk::RtkTarget::NativeBin {
@@ -1061,11 +1078,7 @@ pub fn check_rtk_with(runner: &dyn CommandRunner, resolver: &dyn PathResolver) -
                     "--yes".into(),
                 ]
             }),
-            Some(
-                "verified rtk install; auto-update via `aibridge rtk update --yes` \
-                 (downloads + verifies SHA256 + atomic-replaces)"
-                    .to_string(),
-            ),
+            Some("press 'u' to download + install (SHA256-verified, atomic-replace)".to_string()),
             false,
         ),
         crate::rtk::RtkTarget::NativeBin {
@@ -1096,8 +1109,7 @@ pub fn check_rtk_with(runner: &dyn CommandRunner, resolver: &dyn PathResolver) -
                 ]
             }),
             Some(format!(
-                "rtk is not installed; will install to {install_to:?} via \
-                 `aibridge rtk install --yes` (downloads + verifies + identity-checks)"
+                "press 'u' to install to {install_to:?} (SHA256-verified)"
             )),
             true, // missing-but-installable
         ),
@@ -1130,6 +1142,7 @@ pub fn check_rtk_with(runner: &dyn CommandRunner, resolver: &dyn PathResolver) -
         suggested_command: suggested,
         manual_note: note,
         installable,
+        auto_confirm: false,
     }
 }
 
@@ -1404,6 +1417,7 @@ mod tests {
             suggested_command: Some(vec!["brew".into(), "upgrade".into(), "codex".into()]),
             manual_note: Some("brew upgrade codex".into()),
             installable: false,
+            auto_confirm: false,
         }
     }
     fn check_outdated_native() -> CliCheck {
@@ -1417,6 +1431,7 @@ mod tests {
             suggested_command: None,
             manual_note: Some("see https://claude.com/download".into()),
             installable: false,
+            auto_confirm: false,
         }
     }
 
@@ -1480,6 +1495,7 @@ mod tests {
             suggested_command: Some(vec!["brew".into()]),
             manual_note: None,
             installable: false,
+            auto_confirm: false,
         };
         assert!(c.up_to_date(), "0.10.0 must be >= 0.9.9");
     }
@@ -1494,6 +1510,7 @@ mod tests {
             suggested_command: None,
             manual_note: None,
             installable: false,
+            auto_confirm: false,
         };
         assert!(c.up_to_date());
         assert!(matches!(
@@ -1786,6 +1803,7 @@ mod tests {
             suggested_command: Some(argv),
             manual_note: None,
             installable: true,
+            auto_confirm: false,
         }
     }
     #[test]
@@ -2169,5 +2187,26 @@ mod tests {
         assert!(!c.up_to_date(), "installable must NOT be up_to_date");
         let a = decide_action(&c, Mode::InteractiveTty);
         assert!(matches!(a, Action::Prompt { .. }));
+    }
+
+    // ─── v0.22.0: CliCheck::auto_confirm defaults to false ───
+    #[test]
+    fn cli_check_auto_confirm_defaults_to_false_in_check_codex() {
+        // Production check_codex constructs CliCheck without setting auto_confirm.
+        // It must default to false; only the TUI handler may flip it to true.
+        let r = FakeCommandRunner::new();
+        let c = check_codex_with(&r, &FakePathResolver::new());
+        assert!(
+            !c.auto_confirm,
+            "auto_confirm must default to false in production check_codex"
+        );
+    }
+    #[test]
+    fn cli_check_auto_confirm_defaults_to_false_in_fresh_install_fixture() {
+        let c = fresh_install_brew_cask_codex();
+        assert!(
+            !c.auto_confirm,
+            "auto_confirm must default to false in fresh-install fixture"
+        );
     }
 }
