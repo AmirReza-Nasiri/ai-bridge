@@ -306,22 +306,89 @@ pub fn record_install(install_path: &str) {
     }
 }
 
-/// The recorded install path, if metadata exists and is valid.
-pub fn recorded_install_path() -> Option<String> {
-    let raw = std::fs::read_to_string(metadata_path()?).ok()?;
-    let v: Value = serde_json::from_str(&raw).ok()?;
+/// Pure parser for the `install_path` field of install.json. Separated so the raw
+/// value extraction is unit-testable without touching the filesystem.
+pub(crate) fn parse_recorded_install_path(json: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(json).ok()?;
     v.get("install_path")
         .and_then(Value::as_str)
         .map(str::to_string)
 }
 
-/// Resolve the binary path to act on: recorded metadata → `current_exe()`.
+/// The recorded install path, if metadata exists and is valid. Returns the RAW
+/// stored value (doctor surfaces it verbatim); trust-filtering happens only in
+/// [`resolve_install_path`].
+pub fn recorded_install_path() -> Option<String> {
+    let raw = std::fs::read_to_string(metadata_path()?).ok()?;
+    parse_recorded_install_path(&raw)
+}
+
+/// v0.28: a recorded install path is trustworthy only if it still EXISTS and is NOT
+/// under the OS temp dir. Guards against a stale path recorded by a one-off run from
+/// a temp / staged-test location silently winning over the real installed binary
+/// (the macOS self-update-to-a-dead-temp-path bug). Pure → unit-testable.
+pub(crate) fn install_path_is_trustworthy(path: &Path, temp_dir: &Path, exists: bool) -> bool {
+    exists && !path_starts_with_ci(path, temp_dir)
+}
+
+/// Component-wise prefix check. Case-INSENSITIVE on Windows — paths there are
+/// case-insensitive, so the case-sensitive `Path::starts_with` would miss `c:\temp`
+/// vs `C:\Temp` and wrongly trust a temp path; case-sensitive elsewhere. Component-wise
+/// (not string-prefix) so `/tmpfoo` is NOT treated as under `/tmp`.
+///
+/// Limitation: Windows verbatim (`\\?\`) / UNC prefix variants are NOT normalized, so a
+/// recorded path and the temp root spelled with different prefix forms wouldn't match.
+/// In practice recorded install paths come from `current_exe()`/`init` in normal form,
+/// and the existence check in [`install_path_is_trustworthy`] is the primary guard;
+/// full prefix normalization is a deliberate non-goal here.
+fn path_starts_with_ci(path: &Path, prefix: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        let comps = |p: &Path| {
+            p.components()
+                .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
+                .collect::<Vec<_>>()
+        };
+        let (p, pre) = (comps(path), comps(prefix));
+        pre.len() <= p.len() && p[..pre.len()] == pre[..]
+    }
+    #[cfg(not(windows))]
+    {
+        path.starts_with(prefix)
+    }
+}
+
+/// v0.28: pure precedence resolver — a trustworthy recorded path wins; otherwise fall
+/// back to the running executable. Testable seam for [`resolve_install_path`] so the
+/// recorded-vs-current_exe precedence (and the trust filter) is provable without I/O.
+pub(crate) fn resolve_install_path_with(
+    recorded: Option<String>,
+    current_exe: Option<String>,
+    temp_dir: &Path,
+    exists: &dyn Fn(&Path) -> bool,
+) -> Option<String> {
+    if let Some(r) = recorded {
+        let p = Path::new(&r);
+        if install_path_is_trustworthy(p, temp_dir, exists(p)) {
+            return Some(r);
+        }
+    }
+    current_exe
+}
+
+/// Resolve the binary path to act on: a TRUSTWORTHY recorded metadata path →
+/// `current_exe()`. v0.28: a recorded path that no longer exists or lives under the
+/// OS temp dir is ignored (falls back to the running binary) so self-update can never
+/// target a stale temp location.
 pub fn resolve_install_path() -> Option<String> {
-    recorded_install_path().or_else(|| {
+    resolve_install_path_with(
+        recorded_install_path(),
         std::env::current_exe()
             .ok()
-            .map(|p| p.display().to_string())
-    })
+            .map(|p| p.display().to_string()),
+        &std::env::temp_dir(),
+        &|p| p.exists(),
+    )
 }
 
 // ── apply (download + verify + replace) ────────────────────────────────────────
@@ -1057,6 +1124,111 @@ pub(crate) fn write_installed_meta(install_path: &str, version: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── v0.28: install-path resolution (stale/temp recorded path must not win) ───
+    #[test]
+    fn parse_recorded_install_path_returns_raw_value() {
+        let json = r#"{"install_path":"/Users/x/.cargo/bin/aibridge","version":"0.27.0"}"#;
+        assert_eq!(
+            parse_recorded_install_path(json).as_deref(),
+            Some("/Users/x/.cargo/bin/aibridge")
+        );
+        assert_eq!(parse_recorded_install_path("not json"), None);
+        assert_eq!(parse_recorded_install_path(r#"{"other":1}"#), None);
+    }
+
+    #[test]
+    fn install_path_trustworthy_only_when_exists_and_not_temp() {
+        let tmp = Path::new("/tmp");
+        assert!(install_path_is_trustworthy(
+            Path::new("/usr/local/bin/aibridge"),
+            tmp,
+            true
+        ));
+        // under temp → never trustworthy, even if it exists
+        assert!(!install_path_is_trustworthy(
+            Path::new("/tmp/aibridge-staged-test-1/bin/aibridge"),
+            tmp,
+            true
+        ));
+        // missing → never trustworthy
+        assert!(!install_path_is_trustworthy(
+            Path::new("/usr/local/bin/aibridge"),
+            tmp,
+            false
+        ));
+        // component-wise (NOT string prefix): /tmpfoo is NOT under /tmp → trustworthy
+        assert!(install_path_is_trustworthy(
+            Path::new("/tmpfoo/aibridge"),
+            tmp,
+            true
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn install_path_temp_check_is_case_insensitive_on_windows() {
+        let temp = Path::new(r"C:\Temp");
+        // different casing of the same temp root → still under-temp ⇒ NOT trustworthy
+        assert!(!install_path_is_trustworthy(
+            Path::new(r"c:\temp\aibridge.exe"),
+            temp,
+            true
+        ));
+        // partial-name sibling must NOT be a false prefix ⇒ trustworthy
+        assert!(install_path_is_trustworthy(
+            Path::new(r"c:\tempfoo\aibridge.exe"),
+            temp,
+            true
+        ));
+    }
+
+    #[test]
+    fn resolve_install_path_precedence_valid_recorded_wins() {
+        // Recorded path exists and is not under temp → it wins over current_exe.
+        let got = resolve_install_path_with(
+            Some("/opt/aibridge".to_string()),
+            Some("/proc/self/exe-current".to_string()),
+            Path::new("/tmp"),
+            &|_p| true, // everything "exists"
+        );
+        assert_eq!(got.as_deref(), Some("/opt/aibridge"));
+    }
+
+    #[test]
+    fn resolve_install_path_falls_back_when_recorded_missing_on_disk() {
+        // Recorded path does NOT exist → fall back to current_exe.
+        let got = resolve_install_path_with(
+            Some("/gone/aibridge".to_string()),
+            Some("/real/current/aibridge".to_string()),
+            Path::new("/tmp"),
+            &|p| p != Path::new("/gone/aibridge"),
+        );
+        assert_eq!(got.as_deref(), Some("/real/current/aibridge"));
+    }
+
+    #[test]
+    fn resolve_install_path_falls_back_when_recorded_under_temp() {
+        // The exact bug: recorded path is a stale temp/staged-test dir → ignore it.
+        let got = resolve_install_path_with(
+            Some("/tmp/aibridge-staged-test-9/bin/aibridge".to_string()),
+            Some("/Users/x/.cargo/bin/aibridge".to_string()),
+            Path::new("/tmp"),
+            &|_p| true, // even if the temp path still exists
+        );
+        assert_eq!(got.as_deref(), Some("/Users/x/.cargo/bin/aibridge"));
+    }
+
+    #[test]
+    fn resolve_install_path_uses_current_exe_when_no_recorded() {
+        let got = resolve_install_path_with(
+            None,
+            Some("/real/current/aibridge".to_string()),
+            Path::new("/tmp"),
+            &|_p| true,
+        );
+        assert_eq!(got.as_deref(), Some("/real/current/aibridge"));
+    }
 
     // ─── v0.24.0: confirmation must fail closed on non-TTY ───
     #[test]

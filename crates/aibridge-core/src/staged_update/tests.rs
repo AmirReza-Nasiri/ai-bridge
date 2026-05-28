@@ -266,6 +266,342 @@ fn apply_clear_path_self_registers_and_swaps() {
     assert!(!staged_dir(&root, &st.id).exists(), "staged dir cleaned");
 }
 
+// v0.28: the macOS/unix immediate-apply entry — records the crash-recovery marker,
+// then applies in one pass WITHOUT waiting for other processes (no enumerator gate).
+#[cfg(unix)]
+#[test]
+fn apply_now_in_marks_attempt_then_swaps_immediately() {
+    let root = tmp_root();
+    let (p, target) = planned(&root);
+    let cur = fake_current_exe(&root);
+    let st = stage_in(&root, &p, &cur, &download_ok, &fixed_now(1000), &alive).unwrap();
+    apply_now_in(&root, &st, &fixed_now(2000), &alive).unwrap();
+    let status = read_status_in(&root).unwrap();
+    assert_eq!(status.state, StagedState::Succeeded, "applied in one pass");
+    assert!(target.exists(), "binary swapped into place without waiting");
+    assert_eq!(
+        status.spawn_attempted_ms,
+        Some(2000),
+        "crash-recovery marker recorded before apply"
+    );
+}
+
+// v0.28: pure platform dispatch — macOS applies immediately, others spawn the helper.
+#[test]
+fn activation_strategy_maps_platform() {
+    assert_eq!(
+        activation_strategy(true),
+        ActivationStrategy::ImmediateApply
+    );
+    assert_eq!(
+        activation_strategy(false),
+        ActivationStrategy::DetachedHelper
+    );
+}
+
+// v0.28: a stale handle whose record is now terminal must NOT be spawned against or
+// mutated by the detached path (same invariant as the immediate path).
+#[test]
+fn spawn_in_does_not_mutate_non_staged_record() {
+    let root = tmp_root();
+    let (p, _t) = planned(&root);
+    let cur = fake_current_exe(&root);
+    let st = stage_in(&root, &p, &cur, &download_ok, &fixed_now(1000), &alive).unwrap();
+    let mut s = read_status_in(&root).unwrap();
+    s.state = StagedState::Succeeded;
+    write_status_in(&root, &s).unwrap();
+    spawn_in(&root, &st, &fixed_now(2000), &alive).unwrap();
+    let after = read_status_in(&root).unwrap();
+    assert_eq!(
+        after.state,
+        StagedState::Succeeded,
+        "terminal record untouched"
+    );
+    assert_eq!(after.spawn_attempted_ms, None, "stale record not marked");
+}
+
+// v0.28: the immediate path must likewise leave a terminal record untouched (no marker,
+// no swap) — apply_in can't claim a non-Staged record.
+#[cfg(unix)]
+#[test]
+fn apply_now_in_does_not_mutate_terminal_record() {
+    let root = tmp_root();
+    let (p, target) = planned(&root);
+    let cur = fake_current_exe(&root);
+    let st = stage_in(&root, &p, &cur, &download_ok, &fixed_now(1000), &alive).unwrap();
+    let mut s = read_status_in(&root).unwrap();
+    s.state = StagedState::Succeeded;
+    write_status_in(&root, &s).unwrap();
+    apply_now_in(&root, &st, &fixed_now(2000), &alive).unwrap();
+    let after = read_status_in(&root).unwrap();
+    assert_eq!(
+        after.state,
+        StagedState::Succeeded,
+        "terminal record untouched"
+    );
+    assert_eq!(
+        after.spawn_attempted_ms, None,
+        "marker not written on non-Staged"
+    );
+    assert!(!target.exists(), "no swap on a non-Staged record");
+}
+
+// v0.28: a stale handle whose staged dir + spec.json are gone must NO-OP (Ok), not
+// surface a spurious "read spec" error — early-return before apply_in reads the spec.
+#[cfg(unix)]
+#[test]
+fn apply_now_in_noops_on_stale_handle_with_missing_spec() {
+    let root = tmp_root();
+    let (p, target) = planned(&root);
+    let cur = fake_current_exe(&root);
+    let st = stage_in(&root, &p, &cur, &download_ok, &fixed_now(1000), &alive).unwrap();
+    let mut s = read_status_in(&root).unwrap();
+    s.state = StagedState::Succeeded;
+    write_status_in(&root, &s).unwrap();
+    std::fs::remove_dir_all(staged_dir(&root, &st.id)).ok(); // spec.json gone
+    apply_now_in(&root, &st, &fixed_now(2000), &alive).unwrap(); // Ok, not Err
+    let after = read_status_in(&root).unwrap();
+    assert_eq!(after.state, StagedState::Succeeded);
+    assert!(!target.exists(), "no swap");
+}
+
+// v0.28: a superseded handle (DIFFERENT id) must not mark/mutate the NEW Staged record
+// nor read the stale spec — proves the full `id==ours && state==Staged` invariant.
+#[cfg(unix)]
+#[test]
+fn apply_now_in_noops_on_superseded_handle_without_touching_new_record() {
+    let root = tmp_root();
+    let (p, _t) = planned(&root);
+    let cur = fake_current_exe(&root);
+    let stale = stage_in(&root, &p, &cur, &download_ok, &fixed_now(1000), &alive).unwrap();
+    // a NEW staging supersedes it (cleans stale dir/spec; status now tracks fresh, Staged)
+    let fresh = stage_in(&root, &p, &cur, &download_ok, &fixed_now(2000), &alive).unwrap();
+    assert_ne!(stale.id, fresh.id);
+    apply_now_in(&root, &stale, &fixed_now(3000), &alive).unwrap();
+    let after = read_status_in(&root).unwrap();
+    assert_eq!(after.id, fresh.id, "status still tracks the fresh staging");
+    assert_eq!(after.state, StagedState::Staged, "new record left Staged");
+    assert_eq!(
+        after.spawn_attempted_ms, None,
+        "stale handle did not mark the new record"
+    );
+}
+
+// v0.28: proves retry_in's injected respawn CAN apply immediately on unix (the mechanism
+// behind macOS retry). Production retry_failed_update wires the shared
+// `activate_staged_update` (compile-visible) — the same dispatcher as the initial stage —
+// so this exercises the callback path, not the production cfg dispatch itself.
+#[cfg(unix)]
+#[test]
+fn retry_in_applies_immediately_with_injected_respawn() {
+    let root = tmp_root();
+    let (p, target) = planned(&root);
+    let cur = fake_current_exe(&root);
+    stage_in(&root, &p, &cur, &download_ok, &fixed_now(1000), &alive).unwrap();
+    let mut s = read_status_in(&root).unwrap();
+    s.state = StagedState::Failed;
+    s.error = Some("boom".into());
+    write_status_in(&root, &s).unwrap();
+    retry_in(&root, &fixed_now(2000), &alive, &|staged| {
+        apply_now_in(&root, staged, &fixed_now(2000), &alive)
+    })
+    .unwrap();
+    let after = read_status_in(&root).unwrap();
+    assert_eq!(
+        after.state,
+        StagedState::Succeeded,
+        "retry applied immediately"
+    );
+    assert!(target.exists(), "binary swapped on retry");
+}
+
+// v0.28: classify_after_failure — suppress (Gone) ONLY for a different id or a same-id
+// Superseded (cancel); same-id active states + missing record surface (StillOurs/Indeterminate).
+#[test]
+fn classify_after_failure_distinguishes_stale_from_ours() {
+    let root = tmp_root();
+    let (p, _t) = planned(&root);
+    let cur = fake_current_exe(&root);
+    let st = stage_in(&root, &p, &cur, &download_ok, &fixed_now(1000), &alive).unwrap();
+    let id = st.id.clone();
+    let set_state = |s: StagedState| {
+        let mut cur = read_status_in(&root).unwrap();
+        cur.state = s;
+        write_status_in(&root, &cur).unwrap();
+    };
+    assert_eq!(
+        classify_after_failure(&root, &id, &fixed_now(2), &alive),
+        StaleCheck::StillOurs,
+        "same id + Staged"
+    );
+    set_state(StagedState::Failed);
+    assert_eq!(
+        classify_after_failure(&root, &id, &fixed_now(2), &alive),
+        StaleCheck::StillOurs,
+        "same id + Failed surfaces"
+    );
+    set_state(StagedState::Applying);
+    assert_eq!(
+        classify_after_failure(&root, &id, &fixed_now(2), &alive),
+        StaleCheck::StillOurs,
+        "same id + Applying surfaces"
+    );
+    set_state(StagedState::Superseded);
+    assert_eq!(
+        classify_after_failure(&root, &id, &fixed_now(2), &alive),
+        StaleCheck::Gone,
+        "same id + Superseded (cancel) → Gone"
+    );
+    assert_eq!(
+        classify_after_failure(&root, "other-id", &fixed_now(2), &alive),
+        StaleCheck::Gone,
+        "different id (supersede) → Gone"
+    );
+}
+
+#[test]
+fn classify_after_failure_missing_record_is_indeterminate() {
+    let root = tmp_root();
+    assert_eq!(
+        classify_after_failure(&root, "x", &fixed_now(1), &alive),
+        StaleCheck::Indeterminate
+    );
+}
+
+// v0.28: immediate path — a supersede (different id) mid-apply is suppressed (Ok).
+#[cfg(unix)]
+#[test]
+fn apply_now_in_with_suppresses_supersede_race() {
+    let root = tmp_root();
+    let (p, _t) = planned(&root);
+    let cur = fake_current_exe(&root);
+    let st = stage_in(&root, &p, &cur, &download_ok, &fixed_now(1000), &alive).unwrap();
+    let apply = |_s: &StagedUpdate| -> Result<(), String> {
+        let mut s = read_status_in(&root).unwrap();
+        s.id = "newer-id".to_string();
+        write_status_in(&root, &s).unwrap();
+        Err("read spec: gone".to_string())
+    };
+    apply_now_in_with(&root, &st, &fixed_now(2000), &alive, &apply).unwrap();
+}
+
+// v0.28: immediate path — a cancel (same id → Superseded) mid-apply is suppressed (Ok),
+// and the cancelled status is left untouched.
+#[cfg(unix)]
+#[test]
+fn apply_now_in_with_suppresses_cancel_race() {
+    let root = tmp_root();
+    let (p, _t) = planned(&root);
+    let cur = fake_current_exe(&root);
+    let st = stage_in(&root, &p, &cur, &download_ok, &fixed_now(1000), &alive).unwrap();
+    let apply = |_s: &StagedUpdate| -> Result<(), String> {
+        let mut s = read_status_in(&root).unwrap();
+        s.state = StagedState::Superseded;
+        write_status_in(&root, &s).unwrap();
+        Err("read spec: gone".to_string())
+    };
+    apply_now_in_with(&root, &st, &fixed_now(2000), &alive, &apply).unwrap();
+    assert_eq!(
+        read_status_in(&root).unwrap().state,
+        StagedState::Superseded,
+        "cancelled status untouched"
+    );
+}
+
+// v0.28 (Blocking-3): a LEGIT same-id failure (apply_in moves Staged→Failed before
+// erroring) must SURFACE, not be suppressed.
+#[cfg(unix)]
+#[test]
+fn apply_now_in_with_surfaces_legit_same_id_failure() {
+    let root = tmp_root();
+    let (p, _t) = planned(&root);
+    let cur = fake_current_exe(&root);
+    let st = stage_in(&root, &p, &cur, &download_ok, &fixed_now(1000), &alive).unwrap();
+    let apply = |_s: &StagedUpdate| -> Result<(), String> {
+        let mut s = read_status_in(&root).unwrap();
+        s.state = StagedState::Failed;
+        write_status_in(&root, &s).unwrap();
+        Err("swap boom".to_string())
+    };
+    let res = apply_now_in_with(&root, &st, &fixed_now(2000), &alive, &apply);
+    assert!(res.is_err(), "legit same-id failure must surface");
+    assert_eq!(read_status_in(&root).unwrap().state, StagedState::Failed);
+}
+
+// v0.28: detached path — supersede mid-spawn is suppressed (Ok).
+#[test]
+fn spawn_in_with_suppresses_supersede_race() {
+    let root = tmp_root();
+    let (p, _t) = planned(&root);
+    let cur = fake_current_exe(&root);
+    let st = stage_in(&root, &p, &cur, &download_ok, &fixed_now(1000), &alive).unwrap();
+    let spawn = |_s: &StagedUpdate| -> Result<(), String> {
+        let mut s = read_status_in(&root).unwrap();
+        s.id = "newer-id".to_string();
+        write_status_in(&root, &s).unwrap();
+        Err("helper gone".to_string())
+    };
+    spawn_in_with(&root, &st, &fixed_now(2000), &alive, &spawn).unwrap();
+}
+
+// v0.28: detached path — cancel mid-spawn is suppressed (Ok) with NO spawn_error written.
+#[test]
+fn spawn_in_with_suppresses_cancel_race_without_spawn_error() {
+    let root = tmp_root();
+    let (p, _t) = planned(&root);
+    let cur = fake_current_exe(&root);
+    let st = stage_in(&root, &p, &cur, &download_ok, &fixed_now(1000), &alive).unwrap();
+    let spawn = |_s: &StagedUpdate| -> Result<(), String> {
+        let mut s = read_status_in(&root).unwrap();
+        s.state = StagedState::Superseded;
+        write_status_in(&root, &s).unwrap();
+        Err("helper gone".to_string())
+    };
+    spawn_in_with(&root, &st, &fixed_now(2000), &alive, &spawn).unwrap();
+    let after = read_status_in(&root).unwrap();
+    assert_eq!(after.state, StagedState::Superseded);
+    assert_eq!(
+        after.spawn_error, None,
+        "no spawn_error on a cancelled race"
+    );
+}
+
+// v0.28: detached path — a LEGIT same-id spawn failure surfaces + records spawn_error.
+#[test]
+fn spawn_in_with_surfaces_legit_same_id_failure() {
+    let root = tmp_root();
+    let (p, _t) = planned(&root);
+    let cur = fake_current_exe(&root);
+    let st = stage_in(&root, &p, &cur, &download_ok, &fixed_now(1000), &alive).unwrap();
+    let spawn = |_s: &StagedUpdate| -> Result<(), String> { Err("spawn boom".to_string()) };
+    let res = spawn_in_with(&root, &st, &fixed_now(2000), &alive, &spawn);
+    assert!(res.is_err(), "legit spawn failure must surface");
+    assert_eq!(
+        read_status_in(&root).unwrap().spawn_error.as_deref(),
+        Some("spawn boom")
+    );
+}
+
+// v0.28: detached path — a superseded (different id) handle before the call no-ops and
+// leaves the fresh record untouched (mirrors the immediate-path superseded test).
+#[test]
+fn spawn_in_noops_on_superseded_handle_before_call() {
+    let root = tmp_root();
+    let (p, _t) = planned(&root);
+    let cur = fake_current_exe(&root);
+    let stale = stage_in(&root, &p, &cur, &download_ok, &fixed_now(1000), &alive).unwrap();
+    let fresh = stage_in(&root, &p, &cur, &download_ok, &fixed_now(2000), &alive).unwrap();
+    assert_ne!(stale.id, fresh.id);
+    spawn_in(&root, &stale, &fixed_now(3000), &alive).unwrap();
+    let after = read_status_in(&root).unwrap();
+    assert_eq!(after.id, fresh.id);
+    assert_eq!(after.state, StagedState::Staged);
+    assert_eq!(
+        after.spawn_attempted_ms, None,
+        "stale handle didn't mark the fresh record"
+    );
+}
+
 #[test]
 fn apply_blocked_does_not_swap() {
     let root = tmp_root();

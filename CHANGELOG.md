@@ -6,6 +6,29 @@ versioning is semver.
 
 ## [Unreleased]
 
+## [0.28.0] - 2026-05-28
+
+Self-update reliability: the update now lands on the right binary and, on macOS, takes
+effect after a simple Claude Code reload — no need to fully quit every window.
+
+### Fixed
+- **Self-update could target a stale/temp path.** `resolve_install_path` preferred the
+  recorded install path with no validation, so a path recorded by a one-off run from a
+  temp / staged-test location would silently win over the real installed binary — the
+  update got written somewhere useless and the running binary never changed (seen on
+  macOS: "updated ✓ restart to use it" but a reload still ran the old version). The
+  recorded path is now ignored when it no longer exists or lives under the OS temp dir,
+  falling back to the running executable. `recorded_install_path` is unchanged so
+  `doctor` still surfaces the raw recorded value.
+- **macOS staged update never applied on a reload.** The detached apply waits until
+  *every* aibridge process exits — which a VS Code / Claude Code *reload* never achieves
+  (it respawns the MCP server immediately), so the update stayed pending. On macOS the
+  update now applies **immediately**: replacing a running binary's file in place is safe
+  on Unix (the running process keeps its open inode), so a reload picks up the new
+  version. A crash-recovery marker is recorded before applying, so a dead worker leaves a
+  sweepable record (recovered to Failed → retry works). Windows is unchanged — a locked
+  `.exe` can't be replaced while running, so it keeps the detached wait-for-exit helper.
+
 ## [0.27.0] - 2026-05-28
 
 Opt-in macOS Homebrew install, straight from the TUI — the missing piece behind the

@@ -158,7 +158,11 @@ fn production_self_stage_starter() -> SelfStageStarter {
             let res = (|| {
                 let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
                 let staged = aibridge_core::staged_update::stage_planned_update(&planned, &exe)?;
-                aibridge_core::staged_update::spawn_detached_staged_updater(&staged)
+                // v0.28: single platform dispatcher (also used by retry). macOS applies
+                // IMMEDIATELY (replacing a running binary in place is safe on Unix → a reload
+                // picks it up); Windows/Linux spawn the detached wait-for-exit helper. The
+                // choice is compile-time (cfg) inside activate_staged_update.
+                aibridge_core::staged_update::activate_staged_update(&staged)
             })();
             let _ = tx.send(res);
         });
@@ -1291,12 +1295,25 @@ impl App {
                         let rx = (self.self_stage_starter)(planned.clone());
                         self.self_stage_rx = Some(rx);
                         self.update_line = format!("Staging update {from} → {to}…");
-                        self.message = Some(
-                            "staging update — it applies automatically when all aibridge \
-                             processes (incl. Claude Code MCP servers) exit; this dashboard \
-                             keeps the current version until then"
-                                .into(),
-                        );
+                        // v0.28: platform-accurate copy — macOS applies immediately, others
+                        // apply once all aibridge processes exit (see production_self_stage_starter).
+                        #[cfg(target_os = "macos")]
+                        {
+                            self.message = Some(
+                                "applying update now — reload Claude Code (or reopen the TUI) \
+                                 to run the new version"
+                                    .into(),
+                            );
+                        }
+                        #[cfg(not(target_os = "macos"))]
+                        {
+                            self.message = Some(
+                                "staging update — it applies automatically when all aibridge \
+                                 processes (incl. Claude Code MCP servers) exit; this dashboard \
+                                 keeps the current version until then"
+                                    .into(),
+                            );
+                        }
                     }
                 }
                 SelfUpdateState::UpToDate { reason } => {

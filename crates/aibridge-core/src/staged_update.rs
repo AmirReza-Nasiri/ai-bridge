@@ -555,25 +555,53 @@ fn spawn_in(
     now_ms: &dyn Fn() -> u64,
     liveness: &dyn Fn(u32) -> PidLiveness,
 ) -> Result<(), String> {
+    spawn_in_with(root, staged, now_ms, liveness, &|s| {
+        do_spawn(&s.helper, &s.spec_path)
+    })
+}
+
+/// Testable core of [`spawn_in`] — `spawn` is injected so the post-guard supersede/cancel
+/// race is deterministically testable. A spawn failure is suppressed only when the record
+/// is no longer our active target (see [`classify_after_failure`]).
+fn spawn_in_with(
+    root: &Path,
+    staged: &StagedUpdate,
+    now_ms: &dyn Fn() -> u64,
+    liveness: &dyn Fn(u32) -> PidLiveness,
+    spawn: &dyn Fn(&StagedUpdate) -> Result<(), String>,
+) -> Result<(), String> {
     let now = now_ms();
-    with_status_lock(root, now_ms, liveness, || {
+    // Only spawn for our own, still-Staged record. A stale handle whose record is now
+    // terminal (Succeeded/Failed/Superseded) or already active (Waiting/Applying), or a
+    // different id, must neither be mutated nor spawned against — skip entirely.
+    let ours_staged = with_status_lock(root, now_ms, liveness, || {
         if let Some(mut st) = read_status_in(root) {
-            if st.id == staged.id {
+            if st.id == staged.id && st.state == StagedState::Staged {
                 st.spawn_attempted_ms = Some(now);
                 st.updated_ms = now;
                 write_status_in(root, &st)?;
+                return Ok(true);
             }
         }
-        Ok(())
+        Ok(false)
     })?;
+    if !ours_staged {
+        return Ok(());
+    }
 
-    let res = do_spawn(&staged.helper, &staged.spec_path);
+    let res = spawn(staged);
     if let Err(e) = &res {
+        // A supersede (new staging) or cancel can clean our helper/spec AFTER the guard,
+        // making spawn fail spuriously. If the record is no longer OUR active target,
+        // no-op — don't surface the error or write spawn_error.
+        if let StaleCheck::Gone = classify_after_failure(root, &staged.id, now_ms, liveness) {
+            return Ok(());
+        }
         let now2 = now_ms();
         let emsg = e.clone();
         let _ = with_status_lock(root, now_ms, liveness, || {
             if let Some(mut st) = read_status_in(root) {
-                if st.id == staged.id {
+                if st.id == staged.id && st.state == StagedState::Staged {
                     st.spawn_error = Some(emsg.clone());
                     st.updated_ms = now2;
                     write_status_in(root, &st)?;
@@ -583,6 +611,40 @@ fn spawn_in(
         });
     }
     res
+}
+
+/// v0.28: decides whether a post-guard apply/spawn FAILURE should be suppressed (the
+/// staged record was superseded/cancelled out from under us between the ours+Staged guard
+/// and the spec/helper read) or SURFACED (a genuine failure of our record). Suppress ONLY
+/// when the record is no longer our active target: a DIFFERENT id is now current (new
+/// staging), or our id is now `Superseded` (`cancel_in` keeps the id, sets Superseded,
+/// cleans the dir). Same-id `Failed` (apply_in moves Staged→Failed before erroring on a
+/// checksum/swap failure), same-id `Staged`/`Waiting`/`Applying`, a missing record, or a
+/// re-check error all SURFACE the original error (fail-safe — never swallow a real failure).
+#[derive(Debug, PartialEq, Eq)]
+enum StaleCheck {
+    Gone,
+    StillOurs,
+    Indeterminate,
+}
+
+fn classify_after_failure(
+    root: &Path,
+    id: &str,
+    now_ms: &dyn Fn() -> u64,
+    liveness: &dyn Fn(u32) -> PidLiveness,
+) -> StaleCheck {
+    match with_status_lock(root, now_ms, liveness, || Ok(read_status_in(root))) {
+        Ok(Some(st)) => {
+            if st.id != id || st.state == StagedState::Superseded {
+                StaleCheck::Gone
+            } else {
+                StaleCheck::StillOurs
+            }
+        }
+        Ok(None) => StaleCheck::Indeterminate,
+        Err(_) => StaleCheck::Indeterminate,
+    }
 }
 
 #[cfg(windows)]
@@ -653,6 +715,142 @@ pub fn apply_staged_update_from_spec_real(spec_path: &Path) -> Result<(), String
         &|target, payload| crate::update::replace_binary(target, payload),
         true,
     )
+}
+
+/// v0.28: macOS/unix IMMEDIATE apply (no wait-for-exit). Replacing a running binary's
+/// file in place is safe on Unix — the running process keeps its open inode — so a
+/// Claude Code *reload* (respawn) picks up the new version; we don't need every
+/// aibridge process to exit first (the Windows-only constraint behind the detached
+/// helper). Kept beside [`apply_in`] (which it wraps) for cohesion. Windows keeps the
+/// detached wait-for-exit path: a locked `.exe` can't be replaced while running.
+#[cfg(unix)]
+pub fn apply_staged_now(staged: &StagedUpdate) -> Result<(), String> {
+    let root = crate::update::global_dir().ok_or("can't resolve ~/.ai-bridge")?;
+    apply_now_in(&root, staged, &real_now_ms, &real_pid_liveness)
+}
+
+/// Testable core of [`apply_staged_now`] (takes `root`). Records `spawn_attempted_ms`
+/// BEFORE applying so a crash before [`apply_in`] claims `Staged→Waiting` leaves a
+/// Staged record that [`sweep_in`] recovers to Failed (then retry works) — mirroring
+/// the detached spawn's crash-recovery marker. Then applies via [`apply_in`] with an
+/// always-clear enumerator + single pass (no wait/sleep): on Unix the apply is gated by
+/// the exclusive `Applying` claim, not by other processes exiting.
+#[cfg(unix)]
+fn apply_now_in(
+    root: &Path,
+    staged: &StagedUpdate,
+    now_ms: &dyn Fn() -> u64,
+    liveness: &dyn Fn(u32) -> PidLiveness,
+) -> Result<(), String> {
+    apply_now_in_with(root, staged, now_ms, liveness, &|s| {
+        apply_in(
+            root,
+            &s.spec_path,
+            &AlwaysClearEnumerator,
+            now_ms,
+            liveness,
+            &|target, payload| crate::update::replace_binary(target, payload),
+            false,
+        )
+    })
+}
+
+/// Testable core of [`apply_now_in`] — `apply` is injected so the post-guard
+/// supersede/cancel race is deterministically testable. On an apply failure the error is
+/// suppressed ONLY when the record is no longer our active target (see
+/// [`classify_after_failure`]); a genuine same-id failure (incl. apply_in's Staged→Failed)
+/// always surfaces.
+#[cfg(unix)]
+fn apply_now_in_with(
+    root: &Path,
+    staged: &StagedUpdate,
+    now_ms: &dyn Fn() -> u64,
+    liveness: &dyn Fn(u32) -> PidLiveness,
+    apply: &dyn Fn(&StagedUpdate) -> Result<(), String>,
+) -> Result<(), String> {
+    let now = now_ms();
+    // Mark an apply attempt ONLY for our own, still-Staged record. A stale handle
+    // (terminal/active record, or a different id) early-returns Ok without marking or
+    // falling through to apply.
+    let ours_staged = with_status_lock(root, now_ms, liveness, || {
+        if let Some(mut st) = read_status_in(root) {
+            if st.id == staged.id && st.state == StagedState::Staged {
+                st.spawn_attempted_ms = Some(now);
+                st.updated_ms = now;
+                write_status_in(root, &st)?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    })?;
+    if !ours_staged {
+        return Ok(());
+    }
+    match apply(staged) {
+        Err(e) => {
+            // A supersede or cancel after the guard can clean our spec, making apply fail
+            // spuriously. Suppress ONLY when the record is no longer our active target.
+            match classify_after_failure(root, &staged.id, now_ms, liveness) {
+                StaleCheck::Gone => Ok(()),
+                StaleCheck::StillOurs | StaleCheck::Indeterminate => Err(e),
+            }
+        }
+        ok => ok,
+    }
+}
+
+/// Enumerator that reports NO aibridge processes — used ONLY by the Unix immediate
+/// apply, where replacing a running binary in place is safe and we deliberately skip
+/// the wait-for-all-exit gate. NEVER used on Windows (a locked `.exe` can't be replaced
+/// while running, so it keeps the real [`crate::process_cleanup::RealProcessEnumerator`]).
+#[cfg(unix)]
+struct AlwaysClearEnumerator;
+
+#[cfg(unix)]
+impl crate::process_cleanup::ProcessEnumerator for AlwaysClearEnumerator {
+    fn list_aibridge(&self) -> Result<Vec<crate::process_cleanup::StaleProcess>, String> {
+        Ok(Vec::new())
+    }
+}
+
+/// v0.28: how a staged update is activated. Pure decision split out from execution so
+/// the platform choice is unit-testable (the execution itself is a compile-time `cfg`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ActivationStrategy {
+    /// macOS: replace the running binary in place NOW (open inode keeps the live process
+    /// running; a reload picks up the new one). No wait-for-exit.
+    ImmediateApply,
+    /// Windows/Linux: spawn the detached helper that applies once all aibridge processes
+    /// exit (a locked `.exe` can't be replaced while running).
+    DetachedHelper,
+}
+
+/// Pure: pick the activation strategy for the platform. Testable on any host.
+pub(crate) fn activation_strategy(is_macos: bool) -> ActivationStrategy {
+    if is_macos {
+        ActivationStrategy::ImmediateApply
+    } else {
+        ActivationStrategy::DetachedHelper
+    }
+}
+
+/// v0.28: the SINGLE activation dispatcher — used by BOTH the initial stage
+/// (`production_self_stage_starter`) and [`retry_failed_update`], so retry can't diverge
+/// from initial behavior per-OS (the bug where macOS retry re-entered the wait-for-exit
+/// path). Decision via [`activation_strategy`]; execution is compile-time `cfg` because
+/// [`apply_staged_now`] only exists on Unix.
+pub fn activate_staged_update(staged: &StagedUpdate) -> Result<(), String> {
+    match activation_strategy(cfg!(target_os = "macos")) {
+        #[cfg(target_os = "macos")]
+        ActivationStrategy::ImmediateApply => apply_staged_now(staged),
+        // Consciously-untested defensive fallback: ImmediateApply isn't produced
+        // off-macOS today (so this arm is unreachable via activate_staged_update), but a
+        // future refactor that did produce it here degrades to the safe detached helper
+        // instead of panicking.
+        #[cfg(not(target_os = "macos"))]
+        ActivationStrategy::ImmediateApply => spawn_detached_staged_updater(staged),
+        ActivationStrategy::DetachedHelper => spawn_detached_staged_updater(staged),
+    }
 }
 
 /// The helper's coordinated apply. `block` = true sleeps between wait iterations
@@ -867,8 +1065,10 @@ fn cancel_in(
 /// existing payload and re-spawn the helper. Refuses if the payload is gone/corrupt.
 pub fn retry_failed_update() -> Result<(), String> {
     let root = crate::update::global_dir().ok_or("can't resolve ~/.ai-bridge")?;
+    // v0.28: respawn via the SAME platform dispatcher as the initial stage, so retry on
+    // macOS applies immediately instead of re-entering the detached wait-for-exit path.
     retry_in(&root, &real_now_ms, &real_pid_liveness, &|s| {
-        spawn_detached_staged_updater(s)
+        activate_staged_update(s)
     })
 }
 
