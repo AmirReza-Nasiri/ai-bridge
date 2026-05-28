@@ -234,6 +234,14 @@ pub fn set_status(cwd: &str, session: &str, status: &str) {
 /// pre-persistence frontier with no receipt fields — yields `None` so the Stop gate
 /// re-reviews. Fail-safe by construction: a stale receipt can never auto-allow.
 fn receipt_allows(v: &Value, expect_plan_hash: u64) -> Option<u64> {
+    // v0.23.0: the fast-path is honored ONLY when the frontier status is APPROVED.
+    // Otherwise a receipt left behind from a prior approve could fast-allow the next
+    // Stop even after a checkpoint (or Stop) recorded BLOCKED/NEEDS_USER debt against
+    // the SAME diff — laundering unresolved debt. A blocked/needs_user/open status
+    // makes the receipt inert until a genuine re-review re-approves (Codex code-gate).
+    if v.get("status").and_then(Value::as_str) != Some(STATUS_APPROVED) {
+        return None;
+    }
     if v.get("review_policy_version").and_then(Value::as_u64) != Some(REVIEW_POLICY_VERSION as u64)
     {
         return None;
@@ -254,6 +262,54 @@ fn receipt_allows(v: &Value, expect_plan_hash: u64) -> Option<u64> {
 pub fn read_allowed_hash(cwd: &str, session: &str, expect_plan_hash: u64) -> Option<u64> {
     let root = crate::git::repo_root(cwd)?;
     receipt_allows(&read_raw(&root, session)?, expect_plan_hash)
+}
+
+/// v0.23.0: Advance the review frontier base to `reviewed_head` after a checkpoint
+/// review APPROVED. Refuses (returns `Err`) if HEAD has moved since the review started
+/// (TOCTOU guard) or the working tree became dirty during review. On success: writes
+/// `base_kind="commit"`, `base_oid=reviewed_head`, `status=STATUS_APPROVED`.
+///
+/// `reviewed_head` MUST be the HEAD oid captured at bundle-assembly time. The function
+/// re-reads current HEAD and rejects mismatch — otherwise a concurrent commit during
+/// the (minutes-long) Codex review would silently advance the base past an unreviewed
+/// commit.
+pub fn checkpoint_approved(cwd: &str, session: &str, reviewed_head: &str) -> Result<(), String> {
+    let root = crate::git::repo_root(cwd).ok_or_else(|| "no git repository found".to_string())?;
+    // TOCTOU: current HEAD must still equal the SHA the reviewer judged.
+    let current_head =
+        crate::git::head_oid(cwd).ok_or_else(|| "could not read current HEAD".to_string())?;
+    if current_head != reviewed_head {
+        return Err(format!(
+            "HEAD advanced from {reviewed_head} to {current_head} during review; \
+             frontier unchanged"
+        ));
+    }
+    // Re-check working tree is still clean. A mid-review edit would mean the new
+    // bundle is not what was reviewed.
+    match crate::git::diff_bundle(cwd) {
+        Ok(b) if b.is_empty => {}
+        Ok(_) => {
+            return Err("working tree became dirty during review; frontier unchanged".to_string());
+        }
+        Err(e) => return Err(format!("could not re-check working tree: {e}")),
+    }
+    // Safe to advance: write base=commit(reviewed_head), status=approved. CRUCIAL:
+    // strip any prior Stop approval receipt (`allowed_diff_hash`/`allowed_plan_hash`/
+    // `review_policy_version`) — that receipt was scoped to the OLD base, so leaving it
+    // would let `review_stop_inner`'s fast-path hydrate a stale `last_allowed_diff_hash`
+    // and false-allow a bundle measured from the old frontier (Codex code-gate find).
+    let mut v = read_raw(&root, session).unwrap_or_else(|| json!({}));
+    if let Some(o) = v.as_object_mut() {
+        o.insert("base_kind".into(), json!("commit"));
+        o.insert("base_oid".into(), json!(reviewed_head));
+        o.insert("status".into(), json!(STATUS_APPROVED));
+        o.insert("updated_ms".into(), json!(now_ms() as u64));
+        o.remove("allowed_diff_hash");
+        o.remove("allowed_plan_hash");
+        o.remove("review_policy_version");
+    }
+    write_raw(&root, session, &v);
+    Ok(())
 }
 
 /// Record the approved-diff receipt (diff hash + the approved-plan scope hash it was
@@ -324,16 +380,18 @@ mod tests {
     #[test]
     fn receipt_allows_only_on_matching_policy_and_plan() {
         let good = json!({
+            "status": STATUS_APPROVED,
             "allowed_diff_hash": 12345u64,
             "allowed_plan_hash": 999u64,
             "review_policy_version": REVIEW_POLICY_VERSION,
         });
-        // Same policy + same approved-plan scope ⇒ the diff fast-path is honored.
+        // Same policy + same approved-plan scope + APPROVED status ⇒ honored.
         assert_eq!(receipt_allows(&good, 999), Some(12345));
         // A different approved plan (same diff) must NOT fast-path — re-review the scope.
         assert_eq!(receipt_allows(&good, 1000), None);
         // A stale policy version (review semantics changed) must NOT fast-path.
         let stale = json!({
+            "status": STATUS_APPROVED,
             "allowed_diff_hash": 12345u64,
             "allowed_plan_hash": 999u64,
             "review_policy_version": REVIEW_POLICY_VERSION + 1,
@@ -344,10 +402,83 @@ mod tests {
         // Plan-scope present but the diff hash missing ⇒ nothing to fast-path.
         assert_eq!(
             receipt_allows(
-                &json!({"allowed_plan_hash": 999u64, "review_policy_version": REVIEW_POLICY_VERSION}),
+                &json!({"status": STATUS_APPROVED, "allowed_plan_hash": 999u64, "review_policy_version": REVIEW_POLICY_VERSION}),
                 999
             ),
             None
         );
+    }
+
+    #[test]
+    fn receipt_allows_requires_approved_status() {
+        // v0.23.0: a complete + matching receipt is INERT unless status == approved,
+        // so checkpoint/Stop debt (blocked/needs_user) can't be laundered into an allow.
+        let mk = |status: &str| {
+            json!({
+                "status": status,
+                "allowed_diff_hash": 12345u64,
+                "allowed_plan_hash": 999u64,
+                "review_policy_version": REVIEW_POLICY_VERSION,
+            })
+        };
+        assert_eq!(receipt_allows(&mk(STATUS_APPROVED), 999), Some(12345));
+        assert_eq!(receipt_allows(&mk(STATUS_BLOCKED), 999), None);
+        assert_eq!(receipt_allows(&mk(STATUS_NEEDS_USER), 999), None);
+        assert_eq!(receipt_allows(&mk(STATUS_OPEN), 999), None);
+        // status field entirely absent ⇒ None.
+        assert_eq!(
+            receipt_allows(
+                &json!({
+                    "allowed_diff_hash": 12345u64,
+                    "allowed_plan_hash": 999u64,
+                    "review_policy_version": REVIEW_POLICY_VERSION,
+                }),
+                999
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn read_allowed_hash_none_when_status_blocked() {
+        // Integration: a real receipt written via set_allowed_hash becomes inert once
+        // set_status records BLOCKED, even though the receipt fields remain on disk.
+        let repo = make_test_repo();
+        let session = "sess-blocked";
+        on_task_start(&repo, session);
+        set_allowed_hash(&repo, session, 0xABCD, 0x42);
+        set_status(&repo, session, STATUS_APPROVED);
+        assert_eq!(read_allowed_hash(&repo, session, 0x42), Some(0xABCD));
+        // Record debt: the same receipt must no longer fast-allow.
+        set_status(&repo, session, STATUS_BLOCKED);
+        assert_eq!(read_allowed_hash(&repo, session, 0x42), None);
+    }
+
+    /// Minimal real git repo in a fresh temp dir (mirrors mcp tests' helper).
+    fn make_test_repo() -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!(
+            "aibridge-frontier-test-{}-{}-{}",
+            std::process::id(),
+            n,
+            now_ms()
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&p)
+                .output()
+                .expect("git");
+        };
+        run(&["init", "--initial-branch=main"]);
+        run(&["config", "user.email", "t@t.com"]);
+        run(&["config", "user.name", "T"]);
+        std::fs::write(p.join("seed.txt"), "seed").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-m", "init"]);
+        p.display().to_string()
     }
 }

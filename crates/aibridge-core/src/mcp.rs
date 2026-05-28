@@ -308,6 +308,7 @@ impl Server {
                 }
             }
             "review_diff" => self.review_diff(),
+            "review_checkpoint" => self.review_checkpoint(msg),
             "implement" => {
                 let task = msg
                     .pointer("/params/arguments/task")
@@ -660,32 +661,18 @@ impl Server {
         if stop_active {
             return allow(); // already in a stop-hook continuation; don't re-gate
         }
-        let mut bundle = match crate::git::diff_bundle(cwd) {
-            Ok(b) => b,
+        let ctx = match build_stop_review_bundle(cwd, session) {
+            Ok(c) => c,
             Err(_) => return allow(), // not a git repo / git missing: nothing to gate
         };
-
-        // Fold in work COMMITTED since the task's base so a `git commit` made BEFORE
-        // this Stop can't hide it from review (closing the commit-bypass).
-        // `committed_delta` degrades SAFELY on a diverged/missing base — it returns a
-        // warned net/full-tree diff (embedded in the text), never a silent skip — so
-        // here we just fold it in. No recorded base ⇒ uncommitted-only (pre-0.5.5
-        // behavior, no regression; `doctor` flags the missing task-start hook).
-        match crate::review_frontier::read(cwd, session).and_then(|f| {
-            f.base_spec()
-                .map(|base| crate::git::committed_delta(cwd, base))
-        }) {
-            Some(cd) => {
-                if !cd.is_empty {
-                    bundle = bundle.with_committed(&cd.text);
-                }
-            }
-            None => log_gate(
+        if ctx.frontier.is_none() {
+            log_gate(
                 cwd,
                 "no review base recorded — reviewing uncommitted tree only \
                  (re-run `aibridge init` to record a task-start base)",
-            ),
+            );
         }
+        let bundle = ctx.bundle;
 
         if bundle.is_empty {
             // Nothing committed-since-base AND a clean tree ⇒ nothing to review.
@@ -745,6 +732,120 @@ impl Server {
         }
         crate::review_frontier::set_status(cwd, session, status);
         decision
+    }
+
+    /// v0.23.0: `mcp__aibridge__review_checkpoint(reason)` — review the EXACT
+    /// Stop-equivalent bundle and on Codex APPROVE advance the review frontier to
+    /// current HEAD. Closes the per-PR vs Stop coverage gap: lets you checkpoint
+    /// already-merged committed work between PRs/tasks so the end-of-session Stop
+    /// short-circuits via the existing empty-bundle path.
+    ///
+    /// Refuses (without mutating frontier base) when:
+    /// - `reason` is empty
+    /// - plan gate is not effectively approved (stale approval / in-flight changed plan)
+    /// - session cannot be derived from plan-gate state
+    /// - no Stop-review frontier was recorded (UserPromptSubmit hook never ran)
+    /// - working tree is dirty (use `review_diff` for uncommitted-only feedback)
+    /// - `committed_delta` returned a warning (ambiguous base)
+    /// - Codex returns Blocked/Unparseable/transport error
+    ///
+    /// On the bundle-empty path (clean tree + no committed-since-base), sets
+    /// `STATUS_APPROVED` and returns without calling Codex — clears any prior
+    /// blocked/needs_user that lingered from a Stop refusal.
+    fn review_checkpoint(&mut self, msg: &Value) -> String {
+        let reason = msg
+            .pointer("/params/arguments/reason")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        if reason.is_empty() {
+            return "AI Bridge: `review_checkpoint` refused: reason is required; \
+                 explain the PR/task/phase being checkpointed.\nFrontier unchanged."
+                .to_string();
+        }
+        let cwd = std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| ".".to_string());
+        // Steps 1-9 (refusals + no-op + proceed) live in the free fn so they're
+        // testable without Codex or a Server. Frontier status side-effects for the
+        // frontier-known refusal paths are applied inside; here we ALSO invalidate the
+        // in-memory gate fast-path whenever a session was derived, so a prior Stop's
+        // cached `last_allowed_diff_hash` can't fast-allow over the recorded debt.
+        let (ctx, session, reviewed_head) = match checkpoint_prepare(&cwd, reason) {
+            CheckpointPrep::Refuse { message, session } => {
+                if let Some(s) = session {
+                    self.invalidate_gate_fastpath(&cwd, &s);
+                }
+                return message;
+            }
+            CheckpointPrep::NoOp(m) => return m,
+            CheckpointPrep::Proceed {
+                ctx,
+                session,
+                reviewed_head,
+            } => (ctx, session, reviewed_head),
+        };
+        // Anti-anchoring reset — required for every Gate ask_topic (shared bound
+        // with review_diff + review_stop_inner; without it the periodic reset never
+        // ticks for checkpoint reviews).
+        self.tick_gate_reset();
+        let approved_plan = crate::plan_gate::approved_plan(&cwd);
+        let prompt = gate::prompt_with_scope(&ctx.bundle.text, approved_plan.as_deref());
+        let review = match self.ask_topic(TopicKey::Gate, &prompt, &cwd) {
+            Ok(r) if !r.trim().is_empty() => r,
+            Ok(_) | Err(_) => {
+                crate::review_frontier::set_status(
+                    &cwd,
+                    &session,
+                    crate::review_frontier::STATUS_NEEDS_USER,
+                );
+                self.invalidate_gate_fastpath(&cwd, &session);
+                return "AI Bridge: `review_checkpoint`: peer review unavailable or \
+                     returned an empty reply.\nFrontier unchanged."
+                    .to_string();
+            }
+        };
+        let trace = gate::write_trace(&cwd, &ctx.bundle.text, &review);
+        let outcome = apply_checkpoint_review_result(&review);
+        // Post-review frontier mutation (incl. the post-review effective-approval
+        // race re-check + TOCTOU guard) lives in the free fn so it's testable.
+        let final_outcome = checkpoint_finalize(&cwd, &session, &reviewed_head, &outcome);
+        // Drop the in-memory gate fast-path on EVERY outcome: on Advanced the base
+        // moved (old hash is stale); on Blocked/Refused we recorded debt and a prior
+        // cached allow must not survive (Codex code-gate Fix 2 + R3).
+        self.invalidate_gate_fastpath(&cwd, &session);
+        match final_outcome {
+            CheckpointFinal::Advanced => format_checkpoint_approve(
+                reason,
+                &session,
+                ctx.frontier.as_ref(),
+                &reviewed_head,
+                &ctx.files_reviewed,
+                ctx.bundle.text.len(),
+                Some(trace.as_str()),
+            ),
+            CheckpointFinal::Blocked => format_checkpoint_request_changes(
+                reason,
+                &session,
+                ctx.frontier.as_ref(),
+                &gate::findings(&review),
+                Some(trace.as_str()),
+            ),
+            CheckpointFinal::Refused(m) => m,
+        }
+    }
+
+    /// v0.23.0: Drop the in-memory gate fast-path for a (repo, session) so a prior
+    /// Stop approve cached in `self.gates` can't fast-allow over checkpoint-recorded
+    /// debt. The on-disk receipt is separately neutralized by `receipt_allows` honoring
+    /// only `STATUS_APPROVED`. Removing the entry is safe: the next Stop re-derives
+    /// state (and only re-hydrates the disk receipt when its status is approved).
+    fn invalidate_gate_fastpath(&mut self, cwd: &str, session: &str) {
+        let key = format!(
+            "{}::{session}",
+            crate::git::repo_root(cwd).as_deref().unwrap_or(cwd)
+        );
+        self.gates.remove(&key);
     }
 
     fn gate_decide(
@@ -874,6 +975,403 @@ impl Server {
              allowed so you can deliver that question."
         ))
     }
+}
+
+/// v0.23.0: Stop-equivalent review bundle context. Shared between `review_stop_inner`
+/// and `review_checkpoint` so both paths review the exact same change set.
+struct StopReviewBundle {
+    bundle: crate::git::DiffBundle,
+    /// `None` ⇒ no frontier state recorded for this session.
+    /// `Some(Frontier { base: BaseKind::None, .. })` ⇒ state recorded but no base.
+    frontier: Option<crate::review_frontier::Frontier>,
+    /// Current HEAD oid (None if the repo has no commits yet).
+    head: Option<String>,
+    /// `committed_delta.warning` when set (ambiguous base after rebase/gc/branch).
+    committed_warning: Option<String>,
+    /// Working tree has uncommitted changes — set when the uncommitted side of the
+    /// bundle was non-empty BEFORE the committed-delta fold.
+    uncommitted_dirty: bool,
+    /// File paths included in the bundle (for output formatting).
+    files_reviewed: Vec<String>,
+}
+
+/// v0.23.0: Assemble the Stop-equivalent review bundle. Pulled out of
+/// `review_stop_inner` so both Stop and `review_checkpoint` use the SAME bundle
+/// scope (uncommitted + committed-since-frontier, project-subtree, `.ai-bridge`
+/// excluded). Returns `Err` only when git is missing / cwd is not a repo —
+/// callers map that to allow() (Stop) or refuse (checkpoint).
+fn build_stop_review_bundle(cwd: &str, session: &str) -> Result<StopReviewBundle, String> {
+    let uncommitted = crate::git::diff_bundle(cwd).map_err(|e| e.to_string())?;
+    let uncommitted_dirty = !uncommitted.is_empty;
+    let frontier = crate::review_frontier::read(cwd, session);
+    let head = crate::git::head_oid(cwd);
+    let mut committed_warning: Option<String> = None;
+    let mut files_reviewed: Vec<String> = collect_filenames_from_diff(&uncommitted.text);
+    let bundle = match frontier.as_ref().and_then(|f| f.base_spec()) {
+        Some(base) => {
+            let cd = crate::git::committed_delta(cwd, base);
+            if let Some(w) = cd.warning.clone() {
+                committed_warning = Some(w);
+            }
+            if cd.is_empty {
+                uncommitted
+            } else {
+                for f in collect_filenames_from_diff(&cd.text) {
+                    if !files_reviewed.contains(&f) {
+                        files_reviewed.push(f);
+                    }
+                }
+                uncommitted.with_committed(&cd.text)
+            }
+        }
+        None => uncommitted,
+    };
+    Ok(StopReviewBundle {
+        bundle,
+        frontier,
+        head,
+        committed_warning,
+        uncommitted_dirty,
+        files_reviewed,
+    })
+}
+
+/// v0.23.0: Best-effort path extraction from a unified-diff blob. Used only for
+/// human-readable output formatting; never for security decisions. Returns paths
+/// in the order they first appear, deduplicated.
+fn collect_filenames_from_diff(diff_text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in diff_text.lines() {
+        if let Some(rest) = line.strip_prefix("diff --git a/") {
+            if let Some((a, _b)) = rest.split_once(" b/") {
+                let p = a.to_string();
+                if !out.contains(&p) {
+                    out.push(p);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// v0.23.0: Pure-fn verdict mapper for the checkpoint review. Separated so the
+/// verdict-handling logic can be unit-tested without a live Codex call.
+enum CheckpointOutcome {
+    Approve,
+    RequestChanges,
+    Unparseable, // covers BLOCKED + Unparseable
+}
+
+fn apply_checkpoint_review_result(review_text: &str) -> CheckpointOutcome {
+    match gate::parse_verdict(review_text) {
+        gate::Verdict::Approve => CheckpointOutcome::Approve,
+        gate::Verdict::RequestChanges => CheckpointOutcome::RequestChanges,
+        gate::Verdict::Blocked | gate::Verdict::Unparseable => CheckpointOutcome::Unparseable,
+    }
+}
+
+/// v0.23.0: Result of the pre-Codex phase of `review_checkpoint`. Free fn (explicit
+/// `cwd`) so all refusal/no-op branches are unit-testable without Codex or a Server.
+enum CheckpointPrep {
+    /// Refusal — message to return; any frontier status side-effect already applied.
+    /// `session` is `Some` whenever a session was derived (so the orchestrator also
+    /// invalidates the in-memory gate fast-path for that session); `None` for the
+    /// pre-session refusals (not-approved / no-session) where there is nothing to clear.
+    Refuse {
+        message: String,
+        session: Option<String>,
+    },
+    /// Clean tree + nothing committed-since-base — approve without Codex (message ready).
+    NoOp(String),
+    /// Ready for the Codex review.
+    Proceed {
+        ctx: StopReviewBundle,
+        session: String,
+        reviewed_head: String,
+    },
+}
+
+/// v0.23.0: Pre-Codex phase of `review_checkpoint` (steps 1-9). Applies frontier
+/// status side-effects (`NEEDS_USER`/`APPROVED`) for the frontier-known refusal +
+/// no-op paths so `on_task_start` cannot advance over unreviewed work. `reason` is
+/// only used to format the no-op approve message.
+fn checkpoint_prepare(cwd: &str, reason: &str) -> CheckpointPrep {
+    // Pre-review: effective approval (not just is_approved) so a pending changed
+    // plan doesn't slip a checkpoint past a stale approval. No session yet ⇒ nothing
+    // to invalidate in-memory.
+    if !crate::plan_gate::is_effectively_approved(cwd) {
+        return CheckpointPrep::Refuse {
+            message: "AI Bridge: `review_checkpoint` refused: no currently approved \
+                 plan_gate scope; call plan_gate for this PR/task first.\nFrontier unchanged."
+                .to_string(),
+            session: None,
+        };
+    }
+    let session = match crate::plan_gate::current_session(cwd) {
+        Some(s) => s,
+        None => {
+            return CheckpointPrep::Refuse {
+                message: "AI Bridge: `review_checkpoint` refused: could not identify the \
+                     current Claude session; frontier mutation would be unsafe.\n\
+                     Frontier unchanged."
+                    .to_string(),
+                session: None,
+            };
+        }
+    };
+    let ctx = match build_stop_review_bundle(cwd, &session) {
+        Ok(c) => c,
+        Err(e) => {
+            return CheckpointPrep::Refuse {
+                message: format!(
+                    "AI Bridge: `review_checkpoint` refused: {e}.\nFrontier unchanged."
+                ),
+                session: Some(session),
+            };
+        }
+    };
+    // No frontier recorded (or BaseKind::None) ⇒ no base to advance. Don't synthesize
+    // one — that would launder unreviewed prior work. No status mutation (there is no
+    // frontier to mark) — but DO invalidate any stale in-memory fast-path for safety.
+    let frontier_is_active = matches!(
+        ctx.frontier.as_ref().map(|f| &f.base),
+        Some(crate::review_frontier::BaseKind::Commit(_))
+            | Some(crate::review_frontier::BaseKind::EmptyTree)
+    );
+    if !frontier_is_active {
+        return CheckpointPrep::Refuse {
+            message: "AI Bridge: `review_checkpoint` refused: no Stop-review frontier \
+                 was recorded for this session; send a new prompt or rerun \
+                 `aibridge init` so the task-start hook records a base.\n\
+                 Frontier unchanged."
+                .to_string(),
+            session: Some(session),
+        };
+    }
+    // Frontier IS recorded; from here, any refusal must set NEEDS_USER so
+    // `on_task_start` cannot advance the base over potentially-unreviewed work.
+    if ctx.uncommitted_dirty {
+        crate::review_frontier::set_status(
+            cwd,
+            &session,
+            crate::review_frontier::STATUS_NEEDS_USER,
+        );
+        return CheckpointPrep::Refuse {
+            message: "AI Bridge: `review_checkpoint` refused: working tree is dirty. \
+                 Commit, stash, or revert changes before checkpointing.\n\
+                 Frontier unchanged."
+                .to_string(),
+            session: Some(session),
+        };
+    }
+    if let Some(w) = &ctx.committed_warning {
+        crate::review_frontier::set_status(
+            cwd,
+            &session,
+            crate::review_frontier::STATUS_NEEDS_USER,
+        );
+        return CheckpointPrep::Refuse {
+            message: format!(
+                "AI Bridge: `review_checkpoint` refused: review base is ambiguous after \
+                 branch/rebase/gc: {w}. Stop can review conservatively, but checkpoint \
+                 will not advance this frontier.\nFrontier unchanged."
+            ),
+            session: Some(session),
+        };
+    }
+    // Bundle-empty: clean tree + no committed-since-base. No Codex call needed; set
+    // APPROVED to clear any prior blocked/needs_user since the net diff is empty.
+    if ctx.bundle.is_empty {
+        crate::review_frontier::set_status(cwd, &session, crate::review_frontier::STATUS_APPROVED);
+        return CheckpointPrep::NoOp(format_checkpoint_no_op(
+            reason,
+            &session,
+            ctx.frontier.as_ref(),
+        ));
+    }
+    // Reviewed-head must be present to advance the base later.
+    let reviewed_head = match ctx.head.as_deref() {
+        Some(h) => h.to_string(),
+        None => {
+            crate::review_frontier::set_status(
+                cwd,
+                &session,
+                crate::review_frontier::STATUS_NEEDS_USER,
+            );
+            return CheckpointPrep::Refuse {
+                message: "AI Bridge: `review_checkpoint`: could not capture HEAD for \
+                     frontier advance.\nFrontier unchanged."
+                    .to_string(),
+                session: Some(session),
+            };
+        }
+    };
+    CheckpointPrep::Proceed {
+        ctx,
+        session,
+        reviewed_head,
+    }
+}
+
+/// v0.23.0: Outcome of the post-Codex frontier-mutation phase.
+enum CheckpointFinal {
+    /// Frontier advanced — caller clears in-memory GateState + formats the approve.
+    Advanced,
+    /// RequestChanges — frontier status set to BLOCKED; caller formats findings.
+    Blocked,
+    /// Refusal (needs-user) — message to return; frontier status already set.
+    Refused(String),
+}
+
+/// v0.23.0: Post-Codex frontier mutation for `review_checkpoint`. Free fn (explicit
+/// `cwd`) so the post-review effective-approval race re-check + TOCTOU handling are
+/// unit-testable without Codex. Applies all frontier status side-effects.
+fn checkpoint_finalize(
+    cwd: &str,
+    session: &str,
+    reviewed_head: &str,
+    outcome: &CheckpointOutcome,
+) -> CheckpointFinal {
+    match outcome {
+        CheckpointOutcome::Approve => {
+            // Second effective-approval check, right before frontier mutation (TOCTOU
+            // on plan-gate state during the Codex call).
+            if !crate::plan_gate::is_effectively_approved(cwd) {
+                crate::review_frontier::set_status(
+                    cwd,
+                    session,
+                    crate::review_frontier::STATUS_NEEDS_USER,
+                );
+                return CheckpointFinal::Refused(
+                    "AI Bridge: `review_checkpoint` refused: plan-gate approval was \
+                     superseded during review.\nFrontier unchanged."
+                        .to_string(),
+                );
+            }
+            match crate::review_frontier::checkpoint_approved(cwd, session, reviewed_head) {
+                Ok(()) => CheckpointFinal::Advanced,
+                Err(e) => {
+                    crate::review_frontier::set_status(
+                        cwd,
+                        session,
+                        crate::review_frontier::STATUS_NEEDS_USER,
+                    );
+                    CheckpointFinal::Refused(format!(
+                        "AI Bridge: `review_checkpoint`: {e}.\nFrontier unchanged."
+                    ))
+                }
+            }
+        }
+        CheckpointOutcome::RequestChanges => {
+            crate::review_frontier::set_status(
+                cwd,
+                session,
+                crate::review_frontier::STATUS_BLOCKED,
+            );
+            CheckpointFinal::Blocked
+        }
+        CheckpointOutcome::Unparseable => {
+            crate::review_frontier::set_status(
+                cwd,
+                session,
+                crate::review_frontier::STATUS_NEEDS_USER,
+            );
+            CheckpointFinal::Refused(
+                "AI Bridge: `review_checkpoint`: peer review could not complete \
+                 (blocked or unparseable verdict). Frontier unchanged."
+                    .to_string(),
+            )
+        }
+    }
+}
+
+/// v0.23.0: Format the APPROVE output for `review_checkpoint`.
+fn format_checkpoint_approve(
+    reason: &str,
+    session: &str,
+    old_frontier: Option<&crate::review_frontier::Frontier>,
+    new_head: &str,
+    files: &[String],
+    bytes: usize,
+    trace: Option<&str>,
+) -> String {
+    let old_base = match old_frontier.map(|f| &f.base) {
+        Some(crate::review_frontier::BaseKind::Commit(o)) => o.clone(),
+        Some(crate::review_frontier::BaseKind::EmptyTree) => "<empty tree>".to_string(),
+        _ => "<none>".to_string(),
+    };
+    let mut out = String::new();
+    out.push_str("<AI-BRIDGE-CHECKPOINT-APPROVE/>\n");
+    out.push_str(&format!("reason: {reason}\n"));
+    out.push_str(&format!("session: {session}\n"));
+    out.push_str(&format!("frontier: {old_base} -> {new_head}\n"));
+    out.push_str(&format!(
+        "reviewed: {} file(s), {bytes} bytes\n",
+        files.len()
+    ));
+    if !files.is_empty() {
+        out.push_str("files:\n");
+        for f in files {
+            out.push_str(&format!("- {f}\n"));
+        }
+    }
+    if let Some(t) = trace {
+        out.push_str(&format!("trace: {t}\n"));
+    }
+    out.push_str(
+        "Stop hook: next clean Stop should allow without re-reviewing this committed delta.\n",
+    );
+    out
+}
+
+/// v0.23.0: Format the no-op (empty-bundle) approve output.
+fn format_checkpoint_no_op(
+    reason: &str,
+    session: &str,
+    frontier: Option<&crate::review_frontier::Frontier>,
+) -> String {
+    let base = match frontier.map(|f| &f.base) {
+        Some(crate::review_frontier::BaseKind::Commit(o)) => o.clone(),
+        Some(crate::review_frontier::BaseKind::EmptyTree) => "<empty tree>".to_string(),
+        _ => "<none>".to_string(),
+    };
+    format!(
+        "<AI-BRIDGE-CHECKPOINT-APPROVE/>\n\
+         reason: {reason}\n\
+         session: {session}\n\
+         frontier: {base} (unchanged — nothing to review)\n\
+         status: approved (any prior blocked/needs_user cleared)\n"
+    )
+}
+
+/// v0.23.0: Format the REQUEST_CHANGES output for `review_checkpoint`.
+fn format_checkpoint_request_changes(
+    reason: &str,
+    session: &str,
+    frontier: Option<&crate::review_frontier::Frontier>,
+    findings: &str,
+    trace: Option<&str>,
+) -> String {
+    let base = match frontier.map(|f| &f.base) {
+        Some(crate::review_frontier::BaseKind::Commit(o)) => o.clone(),
+        Some(crate::review_frontier::BaseKind::EmptyTree) => "<empty tree>".to_string(),
+        _ => "<none>".to_string(),
+    };
+    let mut out = String::new();
+    out.push_str("<AI-BRIDGE-REQUEST-CHANGES/>\n");
+    out.push_str(&format!("reason: {reason}\n"));
+    out.push_str(&format!("session: {session}\n"));
+    out.push_str("review_checkpoint did not advance the frontier.\n");
+    out.push_str(&format!("frontier remains: {base}\n"));
+    out.push_str("findings:\n");
+    out.push_str(findings);
+    if !findings.ends_with('\n') {
+        out.push('\n');
+    }
+    if let Some(t) = trace {
+        out.push_str(&format!("trace: {t}\n"));
+    }
+    out
 }
 
 /// True when a `codex-reply` came back as a stale-thread notice rather than a real
@@ -1457,9 +1955,28 @@ fn tools() -> Value {
     json!([
         tool_with(
             "review_diff",
-            "Peer-review the current git diff with AI Bridge/Codex. Use when the user asks for \
-             AI Bridge, a Codex review, a second AI review, or a review before shipping.",
+            "Peer-review the current UNCOMMITTED git diff with AI Bridge/Codex. Use when the user \
+             asks for AI Bridge, a Codex review, a second AI review, or a review before shipping. \
+             For multi-PR or cross-task sessions where committed work must be checkpointed for the \
+             Stop hook, use `review_checkpoint` instead — `review_diff` does NOT see \
+             committed-since-frontier work and a per-PR APPROVE is not equivalent to a Stop APPROVE.",
             json!({ "type": "object", "properties": {} })
+        ),
+        tool_with(
+            "review_checkpoint",
+            "Review the EXACT same committed-since-frontier + uncommitted bundle that the Stop \
+             hook would review. On Codex APPROVE, checkpoint current HEAD as the new review base \
+             so later Stop hooks do not re-review already-approved committed work. Use between \
+             PRs/tasks AFTER the working tree is clean and the current plan_gate scope is approved. \
+             Refuses dirty or ambiguous state (no partial checkpoints). Requires a non-empty \
+             `reason` explaining the PR/task/phase being checkpointed.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "reason": { "type": "string", "description": "Short description of the PR/task/phase being checkpointed (recorded in the trace + output)." }
+                },
+                "required": ["reason"]
+            })
         ),
         tool_with(
             "consult",
@@ -1674,6 +2191,619 @@ mod tests {
         assert!(
             !is_context_exhausted(text),
             "session-lost and context-exhausted must be disjoint predicates"
+        );
+    }
+
+    // ───── v0.23.0: review_checkpoint pure-fn coverage ─────
+
+    #[test]
+    fn collect_filenames_from_diff_extracts_paths() {
+        let diff = "diff --git a/src/main.rs b/src/main.rs\n\
+                    @@ -1 +1 @@\n-foo\n+bar\n\
+                    diff --git a/Cargo.toml b/Cargo.toml\n";
+        let files = collect_filenames_from_diff(diff);
+        assert_eq!(files, vec!["src/main.rs", "Cargo.toml"]);
+    }
+
+    #[test]
+    fn collect_filenames_dedupes() {
+        let diff = "diff --git a/x b/x\ndiff --git a/x b/x\n";
+        assert_eq!(collect_filenames_from_diff(diff), vec!["x"]);
+    }
+
+    #[test]
+    fn apply_checkpoint_review_result_approve() {
+        let r = "looks good\n<AI-BRIDGE-APPROVE/>";
+        assert!(matches!(
+            apply_checkpoint_review_result(r),
+            CheckpointOutcome::Approve
+        ));
+    }
+
+    #[test]
+    fn apply_checkpoint_review_result_request_changes() {
+        let r = "issues found\n<AI-BRIDGE-REQUEST-CHANGES/>";
+        assert!(matches!(
+            apply_checkpoint_review_result(r),
+            CheckpointOutcome::RequestChanges
+        ));
+    }
+
+    #[test]
+    fn apply_checkpoint_review_result_blocked_maps_to_unparseable() {
+        let r = "need more info\n<AI-BRIDGE-BLOCKED/>";
+        assert!(matches!(
+            apply_checkpoint_review_result(r),
+            CheckpointOutcome::Unparseable
+        ));
+    }
+
+    #[test]
+    fn apply_checkpoint_review_result_unparseable_text() {
+        // No verdict tag at all → Unparseable variant.
+        let r = "Codex ran out of room in the model's context window. Start a new thread.";
+        assert!(matches!(
+            apply_checkpoint_review_result(r),
+            CheckpointOutcome::Unparseable
+        ));
+    }
+
+    #[test]
+    fn format_checkpoint_approve_contains_required_fields() {
+        let frontier = crate::review_frontier::Frontier {
+            base: crate::review_frontier::BaseKind::Commit("oldsha".into()),
+            status: crate::review_frontier::STATUS_OPEN.into(),
+        };
+        let files = vec!["a.rs".into(), "b.rs".into()];
+        let out = format_checkpoint_approve(
+            "P1.1 done",
+            "session-abc",
+            Some(&frontier),
+            "newsha",
+            &files,
+            1024,
+            Some(".ai-bridge/reviews/123/review.txt"),
+        );
+        assert!(out.contains("<AI-BRIDGE-CHECKPOINT-APPROVE/>"));
+        assert!(out.contains("reason: P1.1 done"));
+        assert!(out.contains("session: session-abc"));
+        assert!(out.contains("frontier: oldsha -> newsha"));
+        assert!(out.contains("2 file(s)"));
+        assert!(out.contains("1024 bytes"));
+        assert!(out.contains("- a.rs"));
+        assert!(out.contains("- b.rs"));
+        assert!(out.contains("trace: .ai-bridge/reviews/123/review.txt"));
+        assert!(out.contains("Stop hook:"));
+    }
+
+    #[test]
+    fn format_checkpoint_approve_handles_empty_tree_base() {
+        let frontier = crate::review_frontier::Frontier {
+            base: crate::review_frontier::BaseKind::EmptyTree,
+            status: crate::review_frontier::STATUS_OPEN.into(),
+        };
+        let out =
+            format_checkpoint_approve("first commit", "s", Some(&frontier), "abc", &[], 0, None);
+        assert!(out.contains("frontier: <empty tree> -> abc"));
+    }
+
+    #[test]
+    fn format_checkpoint_no_op_contains_unchanged_marker() {
+        let frontier = crate::review_frontier::Frontier {
+            base: crate::review_frontier::BaseKind::Commit("c1".into()),
+            status: crate::review_frontier::STATUS_BLOCKED.into(),
+        };
+        let out = format_checkpoint_no_op("between PRs", "s", Some(&frontier));
+        assert!(out.contains("<AI-BRIDGE-CHECKPOINT-APPROVE/>"));
+        assert!(out.contains("reason: between PRs"));
+        assert!(out.contains("frontier: c1 (unchanged"));
+        assert!(out.contains("any prior blocked/needs_user cleared"));
+    }
+
+    #[test]
+    fn format_checkpoint_request_changes_includes_findings_and_unchanged() {
+        let frontier = crate::review_frontier::Frontier {
+            base: crate::review_frontier::BaseKind::Commit("c1".into()),
+            status: crate::review_frontier::STATUS_OPEN.into(),
+        };
+        let out = format_checkpoint_request_changes(
+            "phase 2",
+            "s",
+            Some(&frontier),
+            "FINDINGS:\n- bug in foo.rs",
+            Some(".ai-bridge/reviews/xx/review.txt"),
+        );
+        assert!(out.contains("<AI-BRIDGE-REQUEST-CHANGES/>"));
+        assert!(out.contains("did not advance the frontier"));
+        assert!(out.contains("frontier remains: c1"));
+        assert!(out.contains("FINDINGS:\n- bug in foo.rs"));
+        assert!(out.contains("trace: .ai-bridge/reviews/xx/review.txt"));
+    }
+
+    // ───── checkpoint_prepare / checkpoint_finalize state-machine tests ─────
+    //
+    // These exercise the real refusal/advance state machine (frontier status
+    // side-effects + on_task_start non-advancement), not just enum routing. They
+    // use a real git repo + an approved plan-gate state, and assert what the NEXT
+    // task start would do with the resulting frontier status.
+
+    /// Real git repo + approved plan-gate + recorded frontier at HEAD. Clean tree.
+    fn setup_approved_repo(session: &str) -> String {
+        let cwd = make_repo_with_commit();
+        crate::plan_gate::start_epoch(&cwd, session, "checkpoint task");
+        let epoch = crate::plan_gate::current_epoch(&cwd);
+        assert!(
+            crate::plan_gate::record_resume(&cwd, &epoch, "checkpoint plan", &[]),
+            "test setup: plan-gate approval must record"
+        );
+        assert!(
+            crate::plan_gate::is_effectively_approved(&cwd),
+            "test setup: plan must be effectively approved"
+        );
+        crate::review_frontier::on_task_start(&cwd, session);
+        cwd
+    }
+
+    fn git_in(cwd: &str, args: &[&str]) {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("git");
+    }
+
+    fn frontier_base_oid(cwd: &str, session: &str) -> Option<String> {
+        match crate::review_frontier::read(cwd, session).map(|f| f.base) {
+            Some(crate::review_frontier::BaseKind::Commit(o)) => Some(o),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn checkpoint_prepare_dirty_tree_sets_needs_user_and_preserves_base() {
+        let session = "sess-dirty";
+        let cwd = setup_approved_repo(session);
+        let base_a = crate::git::head_oid(&cwd).unwrap();
+        // Dirty the tree.
+        std::fs::write(std::path::Path::new(&cwd).join("seed.txt"), "edit").unwrap();
+        let prep = checkpoint_prepare(&cwd, "phase A");
+        assert!(
+            matches!(prep, CheckpointPrep::Refuse { ref message, .. } if message.contains("dirty"))
+        );
+        // Status must be NEEDS_USER so a later task start cannot advance the base.
+        let f = crate::review_frontier::read(&cwd, session).unwrap();
+        assert_eq!(f.status, crate::review_frontier::STATUS_NEEDS_USER);
+        // Prove non-advancement: commit, then on_task_start must keep base == A.
+        git_in(&cwd, &["add", "."]);
+        git_in(&cwd, &["commit", "-m", "B"]);
+        crate::review_frontier::on_task_start(&cwd, session);
+        assert_eq!(
+            frontier_base_oid(&cwd, session).as_deref(),
+            Some(base_a.as_str())
+        );
+    }
+
+    #[test]
+    fn checkpoint_prepare_committed_warning_sets_needs_user() {
+        let session = "sess-warn";
+        let cwd = setup_approved_repo(session);
+        let base_a = crate::git::head_oid(&cwd).unwrap();
+        // Amend HEAD so the recorded base A is no longer an ancestor of the new HEAD
+        // → committed_delta returns a warning (ambiguous base).
+        git_in(&cwd, &["commit", "--amend", "-m", "reworded"]);
+        let prep = checkpoint_prepare(&cwd, "phase A");
+        assert!(
+            matches!(prep, CheckpointPrep::Refuse { ref message, .. } if message.contains("ambiguous"))
+        );
+        let f = crate::review_frontier::read(&cwd, session).unwrap();
+        assert_eq!(f.status, crate::review_frontier::STATUS_NEEDS_USER);
+        // base stays A (the recorded oid), not the amended one.
+        assert_eq!(
+            frontier_base_oid(&cwd, session).as_deref(),
+            Some(base_a.as_str())
+        );
+    }
+
+    #[test]
+    fn checkpoint_prepare_no_frontier_refuses_without_status_mutation() {
+        let session = "sess-nofrontier";
+        let cwd = make_repo_with_commit();
+        crate::plan_gate::start_epoch(&cwd, session, "task");
+        let epoch = crate::plan_gate::current_epoch(&cwd);
+        crate::plan_gate::record_resume(&cwd, &epoch, "plan", &[]);
+        // NOTE: no on_task_start → no frontier recorded.
+        let prep = checkpoint_prepare(&cwd, "phase A");
+        assert!(
+            matches!(prep, CheckpointPrep::Refuse { ref message, .. } if message.contains("no Stop-review frontier"))
+        );
+        // No frontier was written (no status side-effect).
+        assert!(crate::review_frontier::read(&cwd, session).is_none());
+    }
+
+    #[test]
+    fn checkpoint_prepare_empty_bundle_sets_approved_even_after_prior_blocked() {
+        let session = "sess-empty";
+        let cwd = setup_approved_repo(session);
+        // Simulate a prior Stop block lingering on the frontier.
+        crate::review_frontier::set_status(&cwd, session, crate::review_frontier::STATUS_BLOCKED);
+        // Clean tree + base == HEAD ⇒ empty bundle ⇒ NoOp + APPROVED.
+        let prep = checkpoint_prepare(&cwd, "between PRs");
+        assert!(matches!(prep, CheckpointPrep::NoOp(ref m) if m.contains("CHECKPOINT-APPROVE")));
+        let f = crate::review_frontier::read(&cwd, session).unwrap();
+        assert_eq!(f.status, crate::review_frontier::STATUS_APPROVED);
+    }
+
+    #[test]
+    fn checkpoint_prepare_proceeds_when_committed_delta_present() {
+        let session = "sess-proceed";
+        let cwd = setup_approved_repo(session);
+        // Commit B so committed-since-base(A) is non-empty.
+        std::fs::write(std::path::Path::new(&cwd).join("new.txt"), "content").unwrap();
+        git_in(&cwd, &["add", "."]);
+        git_in(&cwd, &["commit", "-m", "B"]);
+        let head_b = crate::git::head_oid(&cwd).unwrap();
+        let prep = checkpoint_prepare(&cwd, "phase A");
+        match prep {
+            CheckpointPrep::Proceed {
+                reviewed_head,
+                session: s,
+                ..
+            } => {
+                assert_eq!(reviewed_head, head_b);
+                assert_eq!(s, session);
+            }
+            other => panic!("expected Proceed, got {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[test]
+    fn checkpoint_finalize_approve_advances_when_approved() {
+        let session = "sess-fin-ok";
+        let cwd = setup_approved_repo(session);
+        // Commit B; finalize with reviewed_head == current HEAD.
+        std::fs::write(std::path::Path::new(&cwd).join("b.txt"), "b").unwrap();
+        git_in(&cwd, &["add", "."]);
+        git_in(&cwd, &["commit", "-m", "B"]);
+        let head_b = crate::git::head_oid(&cwd).unwrap();
+        let fin = checkpoint_finalize(&cwd, session, &head_b, &CheckpointOutcome::Approve);
+        assert!(matches!(fin, CheckpointFinal::Advanced));
+        // Base advanced to B, status APPROVED.
+        assert_eq!(
+            frontier_base_oid(&cwd, session).as_deref(),
+            Some(head_b.as_str())
+        );
+        let f = crate::review_frontier::read(&cwd, session).unwrap();
+        assert_eq!(f.status, crate::review_frontier::STATUS_APPROVED);
+    }
+
+    #[test]
+    fn checkpoint_finalize_approve_refuses_when_plan_approval_lost() {
+        let session = "sess-fin-race";
+        let cwd = setup_approved_repo(session);
+        let base_a = crate::git::head_oid(&cwd).unwrap();
+        std::fs::write(std::path::Path::new(&cwd).join("b.txt"), "b").unwrap();
+        git_in(&cwd, &["add", "."]);
+        git_in(&cwd, &["commit", "-m", "B"]);
+        let head_b = crate::git::head_oid(&cwd).unwrap();
+        // Post-review race: a new prompt started a new (pending, NOT approved) epoch.
+        crate::plan_gate::start_epoch(&cwd, session, "a different task");
+        assert!(!crate::plan_gate::is_effectively_approved(&cwd));
+        let fin = checkpoint_finalize(&cwd, session, &head_b, &CheckpointOutcome::Approve);
+        assert!(matches!(fin, CheckpointFinal::Refused(ref m) if m.contains("superseded")));
+        let f = crate::review_frontier::read(&cwd, session).unwrap();
+        assert_eq!(f.status, crate::review_frontier::STATUS_NEEDS_USER);
+        // base must NOT have advanced to B.
+        assert_eq!(
+            frontier_base_oid(&cwd, session).as_deref(),
+            Some(base_a.as_str())
+        );
+    }
+
+    #[test]
+    fn checkpoint_finalize_request_changes_sets_blocked() {
+        let session = "sess-fin-rc";
+        let cwd = setup_approved_repo(session);
+        let base_a = crate::git::head_oid(&cwd).unwrap();
+        let fin = checkpoint_finalize(&cwd, session, &base_a, &CheckpointOutcome::RequestChanges);
+        assert!(matches!(fin, CheckpointFinal::Blocked));
+        let f = crate::review_frontier::read(&cwd, session).unwrap();
+        assert_eq!(f.status, crate::review_frontier::STATUS_BLOCKED);
+        // base unchanged.
+        assert_eq!(
+            frontier_base_oid(&cwd, session).as_deref(),
+            Some(base_a.as_str())
+        );
+    }
+
+    #[test]
+    fn checkpoint_finalize_unparseable_sets_needs_user() {
+        let session = "sess-fin-unp";
+        let cwd = setup_approved_repo(session);
+        let base_a = crate::git::head_oid(&cwd).unwrap();
+        let fin = checkpoint_finalize(&cwd, session, &base_a, &CheckpointOutcome::Unparseable);
+        assert!(matches!(fin, CheckpointFinal::Refused(ref m) if m.contains("unparseable")));
+        let f = crate::review_frontier::read(&cwd, session).unwrap();
+        assert_eq!(f.status, crate::review_frontier::STATUS_NEEDS_USER);
+        assert_eq!(
+            frontier_base_oid(&cwd, session).as_deref(),
+            Some(base_a.as_str())
+        );
+    }
+
+    #[test]
+    fn checkpoint_request_changes_invalidates_disk_receipt() {
+        // R3 Layer 1: a prior Stop receipt must not fast-allow the next Stop after a
+        // checkpoint records BLOCKED debt for the same diff.
+        let session = "sess-rc-receipt";
+        let cwd = setup_approved_repo(session);
+        let base_a = crate::git::head_oid(&cwd).unwrap();
+        crate::review_frontier::set_allowed_hash(&cwd, session, 0x7777, 0x9);
+        crate::review_frontier::set_status(&cwd, session, crate::review_frontier::STATUS_APPROVED);
+        assert_eq!(
+            crate::review_frontier::read_allowed_hash(&cwd, session, 0x9),
+            Some(0x7777),
+            "precondition: receipt honored while approved"
+        );
+        let fin = checkpoint_finalize(&cwd, session, &base_a, &CheckpointOutcome::RequestChanges);
+        assert!(matches!(fin, CheckpointFinal::Blocked));
+        // Disk receipt is now inert (status==BLOCKED), so the next Stop can't fast-allow.
+        assert_eq!(
+            crate::review_frontier::read_allowed_hash(&cwd, session, 0x9),
+            None
+        );
+    }
+
+    #[test]
+    fn checkpoint_dirty_refusal_invalidates_disk_receipt() {
+        // R3 Layer 1 via prepare: dirty-tree refusal sets NEEDS_USER, neutralizing the
+        // receipt.
+        let session = "sess-dirty-receipt";
+        let cwd = setup_approved_repo(session);
+        crate::review_frontier::set_allowed_hash(&cwd, session, 0x5555, 0x3);
+        crate::review_frontier::set_status(&cwd, session, crate::review_frontier::STATUS_APPROVED);
+        assert_eq!(
+            crate::review_frontier::read_allowed_hash(&cwd, session, 0x3),
+            Some(0x5555)
+        );
+        std::fs::write(std::path::Path::new(&cwd).join("seed.txt"), "edit").unwrap();
+        let prep = checkpoint_prepare(&cwd, "phase A");
+        assert!(
+            matches!(prep, CheckpointPrep::Refuse { ref message, .. } if message.contains("dirty"))
+        );
+        assert_eq!(
+            crate::review_frontier::read_allowed_hash(&cwd, session, 0x3),
+            None
+        );
+    }
+
+    #[test]
+    fn invalidate_gate_fastpath_removes_entry() {
+        // R3 Layer 2: the in-memory gate fast-path is dropped so a prior approve's
+        // cached `last_allowed_diff_hash` can't survive checkpoint-recorded debt.
+        let cwd = make_repo_with_commit();
+        let session = "sess-mem";
+        let mut server = Server::new();
+        let key = format!(
+            "{}::{session}",
+            crate::git::repo_root(&cwd).as_deref().unwrap_or(&cwd)
+        );
+        let st = gate::GateState {
+            last_allowed_diff_hash: Some(0xCAFE),
+            ..Default::default()
+        };
+        server.gates.insert(key.clone(), st);
+        assert!(
+            server.gates.contains_key(&key),
+            "precondition: entry present"
+        );
+        server.invalidate_gate_fastpath(&cwd, session);
+        assert!(
+            !server.gates.contains_key(&key),
+            "invalidate must remove the in-memory fast-path entry"
+        );
+    }
+
+    // ───── plan_gate::current_session unit tests ─────
+
+    #[test]
+    fn current_session_extracts_session_from_epoch() {
+        use crate::plan_gate;
+        let cwd_str = mk_tmp_dir("checkpoint-test");
+        plan_gate::start_epoch(&cwd_str, "claude-session-uuid-123", "task one");
+        assert_eq!(
+            plan_gate::current_session(&cwd_str).as_deref(),
+            Some("claude-session-uuid-123")
+        );
+    }
+
+    #[test]
+    fn current_session_returns_none_for_manual() {
+        use crate::plan_gate;
+        let cwd_str = mk_tmp_dir("checkpoint-test");
+        // No start_epoch ever called → current_epoch returns "manual" → current_session=None
+        assert!(plan_gate::current_session(&cwd_str).is_none());
+    }
+
+    #[test]
+    fn current_session_returns_none_when_no_state() {
+        use crate::plan_gate;
+        // Fresh dir with no plan-gate state file at all.
+        let cwd_str = mk_tmp_dir("checkpoint-test");
+        assert!(plan_gate::current_session(&cwd_str).is_none());
+    }
+
+    // ───── review_frontier::checkpoint_approved unit tests ─────
+
+    /// Fresh-per-test scratch directory under the system temp dir. Mirrors the
+    /// pattern used in `plan_gate::tests::tmp` so we don't pull in `tempfile` as
+    /// a new dependency. Caller-owned: leaves the dir behind on test failure for
+    /// inspection (the OS reclaims it).
+    ///
+    /// CRITICAL isolation: drops an empty `.git` marker dir so `plan_gate::root`
+    /// (which walks UP to the first ancestor with `.ai-bridge`/`.git`) resolves to
+    /// THIS tmp dir — not the real `~/.ai-bridge` install, which would let the test
+    /// read or CLOBBER the live session's plan-gate state.
+    fn mk_tmp_dir(prefix: &str) -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!(
+            "aibridge-{prefix}-{}-{}-{}",
+            std::process::id(),
+            n,
+            now_ms()
+        ));
+        std::fs::create_dir_all(p.join(".git")).unwrap();
+        p.display().to_string()
+    }
+
+    fn now_ms() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    }
+
+    /// Build a fresh git repo with one commit. Returns the path.
+    fn make_repo_with_commit() -> String {
+        let path = mk_tmp_dir("checkpoint-repo");
+        let path_buf = std::path::PathBuf::from(&path);
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&path_buf)
+                .output()
+                .expect("git");
+        };
+        run(&["init", "--initial-branch=main"]);
+        run(&["config", "user.email", "test@test.com"]);
+        run(&["config", "user.name", "Test"]);
+        std::fs::write(path_buf.join("seed.txt"), "seed").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-m", "initial"]);
+        path
+    }
+
+    #[test]
+    fn checkpoint_approved_advances_when_clean_and_head_matches() {
+        let cwd = make_repo_with_commit();
+        let session = "sess";
+        // Record an initial frontier at empty_tree
+        crate::review_frontier::on_task_start(&cwd, session);
+        let head = crate::git::head_oid(&cwd).expect("head");
+        let result = crate::review_frontier::checkpoint_approved(&cwd, session, &head);
+        assert!(result.is_ok(), "{result:?}");
+        let f = crate::review_frontier::read(&cwd, session).expect("frontier");
+        assert!(
+            matches!(f.base, crate::review_frontier::BaseKind::Commit(ref o) if o == &head),
+            "frontier base should advance to current HEAD"
+        );
+        assert_eq!(f.status, crate::review_frontier::STATUS_APPROVED);
+    }
+
+    #[test]
+    fn checkpoint_approved_clears_stale_receipt() {
+        // Fix 1: a Stop approval receipt scoped to the OLD base must be removed when
+        // the checkpoint advances the base — otherwise review_stop_inner's fast-path
+        // could false-allow a bundle measured from the old frontier.
+        let cwd = make_repo_with_commit();
+        let session = "sess-receipt";
+        crate::review_frontier::on_task_start(&cwd, session);
+        // Seed a receipt as if a prior Stop approved a diff under some plan scope.
+        // Status must be APPROVED for the receipt to be honored (v0.23 Layer 1).
+        crate::review_frontier::set_allowed_hash(&cwd, session, 0xDEAD_BEEF, 0x1234);
+        crate::review_frontier::set_status(&cwd, session, crate::review_frontier::STATUS_APPROVED);
+        assert_eq!(
+            crate::review_frontier::read_allowed_hash(&cwd, session, 0x1234),
+            Some(0xDEAD_BEEF),
+            "precondition: receipt is present"
+        );
+        let head = crate::git::head_oid(&cwd).unwrap();
+        crate::review_frontier::checkpoint_approved(&cwd, session, &head).unwrap();
+        // After advancing the base, the stale receipt must be gone.
+        assert_eq!(
+            crate::review_frontier::read_allowed_hash(&cwd, session, 0x1234),
+            None,
+            "checkpoint_approved must clear the stale receipt scoped to the old base"
+        );
+    }
+
+    #[test]
+    fn checkpoint_approved_refuses_when_head_changed_during_review() {
+        let cwd = make_repo_with_commit();
+        let session = "sess";
+        crate::review_frontier::on_task_start(&cwd, session);
+        let stale_head = "0000000000000000000000000000000000000000"; // pretend reviewed an old SHA
+        let result = crate::review_frontier::checkpoint_approved(&cwd, session, stale_head);
+        assert!(result.is_err(), "TOCTOU guard must reject HEAD mismatch");
+        let msg = result.unwrap_err();
+        assert!(msg.contains("HEAD advanced"), "msg: {msg}");
+        assert!(msg.contains("frontier unchanged"));
+    }
+
+    #[test]
+    fn checkpoint_approved_refuses_when_tree_becomes_dirty() {
+        let cwd = make_repo_with_commit();
+        let session = "sess";
+        crate::review_frontier::on_task_start(&cwd, session);
+        let head = crate::git::head_oid(&cwd).expect("head");
+        // Dirty the tree AFTER capturing head (simulates mid-review edit)
+        std::fs::write(std::path::Path::new(&cwd).join("seed.txt"), "modified").unwrap();
+        let result = crate::review_frontier::checkpoint_approved(&cwd, session, &head);
+        assert!(result.is_err());
+        let msg = result.unwrap_err();
+        assert!(msg.contains("dirty during review"), "msg: {msg}");
+        assert!(msg.contains("frontier unchanged"));
+    }
+
+    // ───── build_stop_review_bundle integration tests ─────
+
+    #[test]
+    fn build_stop_bundle_returns_clean_bundle_for_clean_repo() {
+        let cwd = make_repo_with_commit();
+        let session = "sess";
+        crate::review_frontier::on_task_start(&cwd, session);
+        let ctx = build_stop_review_bundle(&cwd, session).expect("bundle");
+        assert!(
+            !ctx.uncommitted_dirty,
+            "fresh repo should have no uncommitted changes"
+        );
+        assert!(ctx.frontier.is_some());
+        assert!(ctx.head.is_some());
+    }
+
+    #[test]
+    fn build_stop_bundle_dirty_when_working_tree_modified() {
+        let cwd = make_repo_with_commit();
+        let session = "sess";
+        crate::review_frontier::on_task_start(&cwd, session);
+        std::fs::write(std::path::Path::new(&cwd).join("seed.txt"), "modified").unwrap();
+        let ctx = build_stop_review_bundle(&cwd, session).expect("bundle");
+        assert!(ctx.uncommitted_dirty);
+    }
+
+    #[test]
+    fn build_stop_bundle_no_frontier_returns_none_field() {
+        let cwd = make_repo_with_commit();
+        // Do NOT call on_task_start → no frontier recorded
+        let ctx = build_stop_review_bundle(&cwd, "fresh-session").expect("bundle");
+        assert!(
+            ctx.frontier.is_none(),
+            "no frontier recorded ⇒ ctx.frontier=None"
+        );
+    }
+
+    #[test]
+    fn build_stop_bundle_clean_tree_no_committed_delta_is_empty() {
+        let cwd = make_repo_with_commit();
+        let session = "sess";
+        // Set frontier base TO current HEAD so committed_delta is empty
+        crate::review_frontier::on_task_start(&cwd, session);
+        let ctx = build_stop_review_bundle(&cwd, session).expect("bundle");
+        // Clean tree (no edits) + base==HEAD ⇒ bundle should be empty
+        assert!(
+            ctx.bundle.is_empty,
+            "clean tree + base==HEAD must yield empty bundle"
         );
     }
 

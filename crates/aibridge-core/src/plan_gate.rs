@@ -301,6 +301,44 @@ pub fn current_epoch(cwd: &str) -> String {
         .unwrap_or_else(|| "manual".to_string())
 }
 
+/// v0.23.0: Extract the Claude SESSION id from the current epoch. The epoch is
+/// formatted as `"{session}:{ts}:{prompt_hash:x}"` by [`start_epoch`]; we split on
+/// the first `:` and return the session part. Returns `None` when there is no
+/// plan-gate state, no `UserPromptSubmit` ever ran (epoch is the synthesized
+/// `"manual"` value), or the epoch is empty/malformed.
+///
+/// Caller relies on this to derive the session for review-frontier writes from
+/// `mcp__aibridge__review_checkpoint`; treating "manual" as "no session" prevents
+/// mutating frontier state under an ambiguous identity.
+///
+/// NOTE: assumes session ids do not contain `:`. Current `UserPromptSubmit` payloads
+/// pass UUIDs which never include `:`, so this is safe in practice. A malformed epoch
+/// (missing the `:ts:hash` suffix) returns `None` rather than treating the whole
+/// string as a session — a corrupt-but-"approved" state must NOT derive an unsafe
+/// session id that mutates review-frontier state.
+pub fn current_session(cwd: &str) -> Option<String> {
+    let state = read_state(cwd)?;
+    let epoch = state.get("epoch").and_then(Value::as_str)?;
+    session_from_epoch(epoch)
+}
+
+/// Pure epoch→session parser (no IO) so the malformed-input handling is unit-testable.
+/// Returns the session segment ONLY for a well-formed `{session}:{ts}:{hash}` epoch
+/// with three non-empty parts; `None` for `"manual"` or any malformed shape.
+fn session_from_epoch(epoch: &str) -> Option<String> {
+    if epoch == "manual" {
+        return None;
+    }
+    let parts: Vec<&str> = epoch.split(':').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    if parts[0].is_empty() || parts[1].is_empty() || parts[2].is_empty() {
+        return None;
+    }
+    Some(parts[0].to_string())
+}
+
 /// True when the CURRENT epoch is approved. Approval is bound to the epoch id, so
 /// a stale/partially-written `approved` flag from another task can never carry
 /// over (defense-in-depth on top of atomic writes + per-prompt epoch reset).
@@ -361,6 +399,14 @@ fn effectively_approved(cwd: &str) -> bool {
 /// tool, so `run` (which executes arbitrary shell) can't bypass the hook.
 pub fn blocks_writes(cwd: &str) -> bool {
     is_enabled(cwd) && !bypassed() && !effectively_approved(cwd)
+}
+
+/// v0.23.0: Public wrapper for [`effectively_approved`]. The current epoch is
+/// approved AND no DIFFERENT plan is currently under review. Used by
+/// `mcp__aibridge__review_checkpoint` so a stale approval cannot mutate the
+/// frontier while a changed-plan re-submission is in flight.
+pub fn is_effectively_approved(cwd: &str) -> bool {
+    effectively_approved(cwd)
 }
 
 /// Is this tool one the gate must hold until approval? Includes `mcp__aibridge__run`
@@ -1175,6 +1221,34 @@ mod tests {
             &crate::gate::Verdict::Approve,
             "",
         );
+    }
+
+    #[test]
+    fn session_from_epoch_parses_only_well_formed() {
+        // Well-formed 3-part epoch → session segment.
+        assert_eq!(
+            session_from_epoch("sess-uuid:1234:9abc").as_deref(),
+            Some("sess-uuid")
+        );
+        // "manual" (no prompt started) → None.
+        assert_eq!(session_from_epoch("manual"), None);
+        // Single token (no delimiters) → None (must not treat whole string as session).
+        assert_eq!(session_from_epoch("garbage-no-colons"), None);
+        // Wrong part count → None.
+        assert_eq!(session_from_epoch("a:b"), None);
+        assert_eq!(session_from_epoch("a:b:c:d"), None);
+        // Empty segments → None.
+        assert_eq!(session_from_epoch("sess:123:"), None);
+        assert_eq!(session_from_epoch(":123:abc"), None);
+        assert_eq!(session_from_epoch("sess::abc"), None);
+        assert_eq!(session_from_epoch(""), None);
+    }
+
+    #[test]
+    fn current_session_roundtrips_through_start_epoch() {
+        let cwd = tmp();
+        start_epoch(&cwd, "claude-uuid-xyz", "a task");
+        assert_eq!(current_session(&cwd).as_deref(), Some("claude-uuid-xyz"));
     }
 
     #[test]

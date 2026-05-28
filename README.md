@@ -10,10 +10,11 @@
 | Capability | State |
 |---|---|
 | Cargo workspace · CI (Windows + macOS Apple Silicon + Linux + Intel cross-check) | ✅ working |
-| `aibridge mcp-server` — MCP stdio server, 9-tool surface | ✅ working |
+| `aibridge mcp-server` — MCP stdio server, 10-tool surface | ✅ working |
 | `health` / `capability_status` — real CLI discovery | ✅ working |
 | **Warm Codex peer + `consult`** — on-demand second opinion, with continuous **named topics** that persist across sessions | ✅ working (measured **15.5s cold → 3.1s warm**) |
-| **`review_diff`** — review the current git diff | ✅ working |
+| **`review_diff`** — review the current (uncommitted) git diff | ✅ working |
+| **`review_checkpoint`** — review the **Stop-equivalent** bundle (uncommitted + committed-since-frontier) and, on APPROVE, advance the review frontier so later Stop hooks don't re-review already-approved committed work (for multi-PR / cross-task sessions) | ✅ working |
 | **`implement`** — Codex drafts a unified-diff patch (validated with `git apply --check`) for you to review + apply | ✅ working |
 | **`run`** — structured command/test execution (exit code, duration, capped output, process-tree timeout) | ✅ working |
 | **`plan_gate`** — the **automatic** PRE-execution plan gate (Codex must approve the task's plan before any write/Bash; default-on, mirror of the Stop gate). Approval is **revocable + scope-bound**: a non-APPROVE verdict or a materially-changed plan re-arms it, and an unapproved high-risk command (publish/deploy/migration/destructive shell) is re-gated | ✅ working |
@@ -145,6 +146,7 @@ shipping unreviewed work, never looping forever.
 - *"get a second opinion from Codex"* / *"what does Codex think?"* → **`consult`**
   (always on a `topic <name>` — a continuous, isolated dialogue that persists across sessions)
 - *"review this with Codex"* / *"review before we ship"* → **`review_diff`**
+- *"checkpoint this PR"* / *"approve the committed work so far"* (multi-PR sessions) → **`review_checkpoint`**
 - *"have Codex implement / draft a patch for X"* → **`implement`** (returns a
   validated, untested patch to review + apply)
 - *"run the tests / build and capture the result"* → **`run`** (structured output)
@@ -186,7 +188,8 @@ so the MCP server picks up the new version. Cutting a release: bump the
 
 MCP tools exposed by `mcp-server`: `consult` (named persisted topics),
 `plan_gate` (pre-execution plan review), `implement` (validated patch),
-`run` (structured execution), `review_diff`, `review_stop` (hook-only),
+`run` (structured execution), `review_diff`, `review_checkpoint`
+(Stop-equivalent reviewed checkpoint), `review_stop` (hook-only),
 `health`, `capability_status`, `budget_status` (stub).
 
 ---

@@ -6,6 +6,23 @@ versioning is semver.
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-05-28
+
+### Added
+- **`mcp__aibridge__review_checkpoint(reason)` — Stop-equivalent reviewed checkpoint.** Reviews the EXACT same bundle the Stop hook would review (uncommitted **plus** committed-since-frontier work), and on Codex APPROVE advances the review frontier to the current HEAD so later Stop hooks do not re-review already-approved committed work. This closes a real coverage gap: in multi-PR / cross-task sessions a per-PR `review_diff APPROVE` is **not** equivalent to a Stop APPROVE (`review_diff` only sees the uncommitted diff, while Stop also folds in committed-since-frontier work), so cross-PR issues previously surfaced only at the end-of-session Stop with confusing scope-mismatch artifacts. Use it between PRs/tasks once the working tree is clean and the current `plan_gate` scope is approved.
+
+### Safety
+- `review_checkpoint` refuses (without advancing the base) on: empty `reason`, no effectively-approved plan, underivable session, no recorded Stop-review frontier, a dirty working tree, an ambiguous base (`committed_delta` warning after rebase/amend/gc), and Codex blocked/unparseable/transport errors. Every frontier-known refusal records `BLOCKED`/`NEEDS_USER` so the next task start cannot advance the base over unreviewed work.
+- **TOCTOU guard**: the frontier advances only if HEAD is unchanged and the tree is still clean at write time (a concurrent commit during the minutes-long review can't move the base past an unreviewed commit).
+- **Two-layer stale-approval invalidation**: the persisted approval receipt is now honored only when the frontier status is `approved` (`receipt_allows`), and the in-memory gate fast-path is dropped whenever a checkpoint records debt — so a prior approval can never fast-allow the next Stop over checkpoint-recorded debt. The receipt is also cleared when the base advances.
+
+### Internal
+- Extracted `build_stop_review_bundle` (shared by the Stop gate and `review_checkpoint` so both judge the identical change set).
+- New `plan_gate::current_session` (epoch→session, strict 3-part validation) + `plan_gate::is_effectively_approved` + `review_frontier::checkpoint_approved`.
+
+### Tests
+- +40 unit tests: the full `checkpoint_prepare`/`checkpoint_finalize` refusal/advance state machine (frontier status + `on_task_start` non-advancement), TOCTOU guards, both fast-path invalidation layers, malformed-epoch rejection, and the shared Stop-bundle assembly — all hermetic (no Codex/network).
+
 ## [0.22.1] - 2026-05-28
 
 ### Fixed
