@@ -375,15 +375,35 @@ fn verify_sha256(bin: &Path, sha_file: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Prompt y/N on stdin; non-interactive / EOF / anything but y|yes → false.
+/// Pure consent decision. Non-TTY ALWAYS declines — a piped/redirected stdin must
+/// not be able to auto-consent (callers use `--yes` / `assume_yes` for scripted
+/// flows). On a TTY, only a trimmed `y`/`yes` (case-insensitive) consents; a line
+/// that wasn't read (`None`: EOF/error) declines. Extracted so the decision is
+/// unit-testable without touching real stdin.
+fn confirm_line_is_yes(is_tty: bool, line: Option<&str>) -> bool {
+    if !is_tty {
+        return false;
+    }
+    match line {
+        None => false,
+        Some(l) => matches!(l.trim().to_ascii_lowercase().as_str(), "y" | "yes"),
+    }
+}
+
+/// Prompt y/N on stdin; non-interactive (not a TTY) / EOF / anything but y|yes →
+/// false. v0.24.0: fail closed when stdin is not a terminal BEFORE prompting/reading
+/// — a piped `yes` must not pass the gate (rtk install/update + self-update consent).
 fn confirm(prompt: &str) -> bool {
-    use std::io::Write;
+    use std::io::{IsTerminal, Write};
+    if !std::io::stdin().is_terminal() {
+        return false; // non-interactive → decline (use --yes / assume_yes instead)
+    }
     print!("{prompt}");
     let _ = std::io::stdout().flush();
     let mut line = String::new();
     match std::io::stdin().read_line(&mut line) {
-        Ok(0) | Err(_) => false, // EOF / non-interactive → decline
-        Ok(_) => matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes"),
+        Ok(0) | Err(_) => false, // EOF / read error → decline
+        Ok(_) => confirm_line_is_yes(true, Some(&line)),
     }
 }
 
@@ -983,6 +1003,26 @@ fn write_installed_meta(install_path: &str, version: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── v0.24.0: confirmation must fail closed on non-TTY ───
+    #[test]
+    fn confirm_non_tty_always_declines() {
+        // A piped/redirected stdin must NOT auto-consent, even with "yes".
+        assert!(!confirm_line_is_yes(false, Some("yes")));
+        assert!(!confirm_line_is_yes(false, Some("y")));
+        assert!(!confirm_line_is_yes(false, Some("yes\n")));
+        assert!(!confirm_line_is_yes(false, None));
+    }
+
+    #[test]
+    fn confirm_tty_accepts_y_yes_only() {
+        assert!(confirm_line_is_yes(true, Some("y\n")));
+        assert!(confirm_line_is_yes(true, Some("yes\n")));
+        assert!(confirm_line_is_yes(true, Some("  YES  ")));
+        assert!(!confirm_line_is_yes(true, Some("no\n")));
+        assert!(!confirm_line_is_yes(true, Some("")));
+        assert!(!confirm_line_is_yes(true, None));
+    }
 
     // ─── plan/apply split (v0.20.0 hotfix) ───
 
