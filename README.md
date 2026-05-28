@@ -9,7 +9,7 @@
 
 | Capability | State |
 |---|---|
-| Cargo workspace · CI (Windows + macOS Apple Silicon + Intel cross-check) | ✅ working |
+| Cargo workspace · CI (Windows + macOS Apple Silicon) | ✅ working |
 | `aibridge mcp-server` — MCP stdio server, 10-tool surface | ✅ working |
 | `health` / `capability_status` — real CLI discovery | ✅ working |
 | **Warm Codex peer + `consult`** — on-demand second opinion, with continuous **named topics** that persist across sessions | ✅ working (measured **15.5s cold → 3.1s warm**) |
@@ -206,9 +206,8 @@ MCP tools exposed by `mcp-server`: `consult` (named persisted topics),
 - **rtk** — optional output compressor; wired in safe-mode, opt-in via
   `aibridge init --rtk` (not required). AI Bridge never auto-downloads it;
   `aibridge doctor` prints the OS-specific install command if you want it.
-- Platforms: Windows, macOS (Apple Silicon native; Intel via cross-compile +
-  manual runtime check). Linux builds from source but has no CI coverage and no
-  prebuilt release binary.
+- Platforms: Windows, macOS (Apple Silicon). Intel macOS and Linux build from
+  source but have no CI coverage and no prebuilt release binary.
 
 ---
 
@@ -238,8 +237,8 @@ AmirReza owns the Windows side (`windows.rs`), Mo owns the macOS side
 platform-specific code is isolated to `aibridge-platform` (executable discovery,
 config paths, hook installation, PATH handling, process spawning).
 
-macOS Intel: covered by cross-compile + clippy on the Apple Silicon runner
-(compile/ABI coverage); native Intel runtime is a manual release-time check.
+macOS Intel and Linux: build from source only — no CI coverage and no prebuilt
+release binary.
 
 ---
 

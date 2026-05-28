@@ -11,10 +11,8 @@ env:
 
 jobs:
   # Native build + test on each supported runner (Windows, macOS Apple Silicon).
-  # macOS Intel is covered separately via cross-compile (see below), because
-  # GitHub-hosted Intel runners (macos-13) are being sunset and queue
-  # indefinitely. Linux is not a supported target (no CI, no prebuilt release
-  # binary) — it still builds from source but isn't gated here.
+  # Intel macOS and Linux are NOT supported targets — no CI, no prebuilt release
+  # binary; they still build from source but aren't gated here.
   test:
     name: ${{ matrix.os }} / ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
@@ -41,26 +39,3 @@ jobs:
         run: cargo build --release --workspace
       - name: Test
         run: cargo test --workspace
-
-  # macOS Intel (x86_64-apple-darwin) coverage WITHOUT a macos-13 runner:
-  # cross-compile + lint the Intel target on the Apple Silicon runner. This keeps
-  # Intel build coverage green reliably; runtime verification on real Intel
-  # hardware is a manual step (see MAINTAINERS.md) when needed.
-  macos-intel-crosscheck:
-    name: macOS Intel (x86_64) cross-compile on Apple Silicon
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-          targets: x86_64-apple-darwin
-      - uses: Swatinem/rust-cache@v2
-      - name: Clippy (x86_64-apple-darwin)
-        run: cargo clippy --target x86_64-apple-darwin --all-targets --all-features -- -D warnings
-      - name: Build (x86_64-apple-darwin)
-        run: cargo build --release --target x86_64-apple-darwin --workspace
-      - name: Test compile (x86_64-apple-darwin, no-run)
-        # Catches Intel test-compile errors without claiming runtime coverage;
-        # real Intel runtime is a manual release-time check (see MAINTAINERS.md).
-        run: cargo test --target x86_64-apple-darwin --workspace --no-run

@@ -10,11 +10,11 @@
    `xcode-select --install` before anything else. (`git` is also required at
    runtime: `review_diff` and the gate diff the working tree.)
 
-1. **Install the Rust toolchain.** A prebuilt release asset now exists
-   (`aibridge-aarch64-apple-darwin` / `aibridge-x86_64-apple-darwin`, CI-built —
-   the **build-from-source** path below is the human-verified one on Apple Silicon,
-   so it stays the recommended install; the prebuilt binary is the same source
-   built by CI). To build from source, Rust is the prerequisite:
+1. **Install the Rust toolchain.** A prebuilt release asset now exists for Apple
+   Silicon (`aibridge-aarch64-apple-darwin`, CI-built — the **build-from-source**
+   path below is the human-verified one, so it stays the recommended install; the
+   prebuilt binary is the same source built by CI). Intel macOS has no prebuilt
+   asset — build from source. To build from source, Rust is the prerequisite:
 
    ```bash
    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
@@ -55,8 +55,8 @@
 
 ## Updating
 
-- `aibridge update` downloads the matching release binary (`aibridge-aarch64-apple-darwin`
-  / `aibridge-x86_64-apple-darwin`) via the GitHub CLI (`gh`), verifies its SHA-256,
+- `aibridge update` downloads the matching release binary (`aibridge-aarch64-apple-darwin`;
+  Apple Silicon only — Intel macOS has no prebuilt asset) via the GitHub CLI (`gh`), verifies its SHA-256,
   `chmod +x`es it, and atomically replaces the installed binary; then restart Claude
   Code so the MCP server picks it up. `aibridge update --check` reports without
   changing anything. `aibridge --version` shows version + build provenance.
@@ -66,19 +66,19 @@
 
 ## macOS gotchas
 
-- **Prebuilt assets are CI-built** (arm64 native; x86_64 cross-compiled). The
-  human-verified install is the `cargo install` source build on Apple Silicon, so
-  it stays the recommendation; `aibridge update` / a downloaded asset is fine too.
+- **The prebuilt asset is CI-built** (arm64 native only). The human-verified
+  install is the `cargo install` source build on Apple Silicon, so it stays the
+  recommendation; `aibridge update` / a downloaded asset is fine too.
 - **Gatekeeper quarantine does NOT apply to a `cargo install`-built binary** — it
   only hits a *downloaded* binary. If/when prebuilt assets exist, clear it with
   `xattr -dr com.apple.quarantine ./aibridge`.
 - **Homebrew prefix differs by arch:** `/opt/homebrew` (Apple Silicon) vs
   `/usr/local` (Intel). Verified on Apple Silicon: `codex` resolves to
   `/opt/homebrew/bin/codex`, `claude` to `~/.local/bin/claude`.
-- **Intel (x86_64) is not the verified path.** Per the README and `MAINTAINERS.md`,
-  Intel macOS is covered by cross-compile + clippy plus a *manual* release-time
-  runtime check — the all-green flow above was verified on Apple Silicon. Treat the
-  Intel install as expected-to-work-but-unverified until that manual check runs.
+- **Intel (x86_64) macOS is unsupported.** No CI coverage and no prebuilt release
+  binary — build from source (`cargo install --path crates/aibridge`). The
+  all-green flow above was verified on Apple Silicon; Intel is build-from-source,
+  unverified.
 - **`codex launch mode` is `direct` on macOS** — the Windows npm `.cmd`-shim vs
   `node`-direct hazard does not apply here. `doctor` shows `direct — /…/codex`.
 - **macOS canonicalizes symlinked paths** (e.g. `/tmp` → `/private/tmp`); `init`
