@@ -10,10 +10,11 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  # Native build + test on each available runner (Windows, macOS Apple Silicon,
-  # Linux). macOS Intel is covered separately via cross-compile (see below),
-  # because GitHub-hosted Intel runners (macos-13) are being sunset and queue
-  # indefinitely.
+  # Native build + test on each supported runner (Windows, macOS Apple Silicon).
+  # macOS Intel is covered separately via cross-compile (see below), because
+  # GitHub-hosted Intel runners (macos-13) are being sunset and queue
+  # indefinitely. Linux is not a supported target (no CI, no prebuilt release
+  # binary) — it still builds from source but isn't gated here.
   test:
     name: ${{ matrix.os }} / ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
@@ -25,8 +26,6 @@ jobs:
             target: x86_64-pc-windows-msvc
           - os: macos-latest
             target: aarch64-apple-darwin
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

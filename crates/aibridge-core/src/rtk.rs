@@ -1874,10 +1874,15 @@ mod tests {
 
     fn noop_stage(_s: &str) {}
 
-    // v0.24.0 (Fix 1): brew-upgrade seam fakes.
+    // v0.24.0 (Fix 1): brew-upgrade seam fakes. The consuming tests are
+    // `#[cfg(not(target_os = "linux"))]` (detect_target is Unsupported on Linux),
+    // so these are unused on Linux — silence dead-code there. Linux is build-from-
+    // source only (no CI), but keep local Linux builds clean too.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     struct RecordingBrewUpgrader {
         called: std::sync::atomic::AtomicBool,
     }
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     impl RecordingBrewUpgrader {
         fn new() -> Self {
             Self {
@@ -1891,6 +1896,7 @@ mod tests {
             Ok("rtk upgraded via brew (fake)".to_string())
         }
     }
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     struct PanicBrewUpgrader;
     impl BrewUpgrader for PanicBrewUpgrader {
         fn upgrade_rtk(&self) -> Result<String, String> {
@@ -1899,6 +1905,7 @@ mod tests {
     }
 
     // v0.24.0 (Fix 1): confirmer fakes for install_or_update confirmation tests.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     struct DeclineConfirmer;
     impl crate::update::Confirmer for DeclineConfirmer {
         fn confirm(&self, _: &str) -> bool {
@@ -1908,6 +1915,7 @@ mod tests {
             false
         }
     }
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     struct PanicConfirmer;
     impl crate::update::Confirmer for PanicConfirmer {
         fn confirm(&self, _: &str) -> bool {

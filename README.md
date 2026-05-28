@@ -9,7 +9,7 @@
 
 | Capability | State |
 |---|---|
-| Cargo workspace · CI (Windows + macOS Apple Silicon + Linux + Intel cross-check) | ✅ working |
+| Cargo workspace · CI (Windows + macOS Apple Silicon + Intel cross-check) | ✅ working |
 | `aibridge mcp-server` — MCP stdio server, 10-tool surface | ✅ working |
 | `health` / `capability_status` — real CLI discovery | ✅ working |
 | **Warm Codex peer + `consult`** — on-demand second opinion, with continuous **named topics** that persist across sessions | ✅ working (measured **15.5s cold → 3.1s warm**) |
@@ -184,7 +184,7 @@ via the `gh` CLI, verifies its SHA-256, and replaces the installed binary in pla
 (on Windows even while the MCP server is running it) — then **reload Claude Code**
 so the MCP server picks up the new version. Cutting a release: bump the
 `[workspace.package]` version, then `git tag vX.Y.Z && git push origin vX.Y.Z`
-(CI builds every platform + publishes the assets).
+(CI builds Windows + macOS and publishes the assets).
 
 MCP tools exposed by `mcp-server`: `consult` (named persisted topics),
 `plan_gate` (pre-execution plan review), `implement` (validated patch),
@@ -207,7 +207,8 @@ MCP tools exposed by `mcp-server`: `consult` (named persisted topics),
   `aibridge init --rtk` (not required). AI Bridge never auto-downloads it;
   `aibridge doctor` prints the OS-specific install command if you want it.
 - Platforms: Windows, macOS (Apple Silicon native; Intel via cross-compile +
-  manual runtime check), Linux.
+  manual runtime check). Linux builds from source but has no CI coverage and no
+  prebuilt release binary.
 
 ---
 
