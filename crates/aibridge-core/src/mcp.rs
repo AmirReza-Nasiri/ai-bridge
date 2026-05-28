@@ -778,7 +778,19 @@ impl Server {
                 }
                 return message;
             }
-            CheckpointPrep::NoOp(m) => return m,
+            CheckpointPrep::NoOp {
+                message,
+                session,
+                advanced,
+            } => {
+                // v0.24.0: when the empty-bundle path advanced the base (orphaned-base
+                // squash-merge case), drop the in-memory fast-path too — parity with
+                // CheckpointFinal::Advanced (the old cached allow hash is now stale).
+                if advanced {
+                    self.invalidate_gate_fastpath(&cwd, &session);
+                }
+                return message;
+            }
             CheckpointPrep::Proceed {
                 ctx,
                 session,
@@ -823,6 +835,7 @@ impl Server {
                 &ctx.files_reviewed,
                 ctx.bundle.text.len(),
                 Some(trace.as_str()),
+                ctx.committed_warning.as_deref(),
             ),
             CheckpointFinal::Blocked => format_checkpoint_request_changes(
                 reason,
@@ -830,6 +843,7 @@ impl Server {
                 ctx.frontier.as_ref(),
                 &gate::findings(&review),
                 Some(trace.as_str()),
+                ctx.committed_warning.as_deref(),
             ),
             CheckpointFinal::Refused(m) => m,
         }
@@ -1082,7 +1096,16 @@ enum CheckpointPrep {
         session: Option<String>,
     },
     /// Clean tree + nothing committed-since-base — approve without Codex (message ready).
-    NoOp(String),
+    /// v0.24.0: carries `session` + `advanced`. `advanced == true` when the empty-bundle
+    /// path ALSO advanced the frontier base to HEAD (the squash-merge orphaned-base case:
+    /// warning present + empty net diff). The orchestrator then invalidates the in-memory
+    /// gate fast-path, exactly as the Advanced path does, so a stale cached allow can't
+    /// survive a base move.
+    NoOp {
+        message: String,
+        session: String,
+        advanced: bool,
+    },
     /// Ready for the Codex review.
     Proceed {
         ctx: StopReviewBundle,
@@ -1164,30 +1187,58 @@ fn checkpoint_prepare(cwd: &str, reason: &str) -> CheckpointPrep {
             session: Some(session),
         };
     }
-    if let Some(w) = &ctx.committed_warning {
-        crate::review_frontier::set_status(
-            cwd,
-            &session,
-            crate::review_frontier::STATUS_NEEDS_USER,
-        );
-        return CheckpointPrep::Refuse {
-            message: format!(
-                "AI Bridge: `review_checkpoint` refused: review base is ambiguous after \
-                 branch/rebase/gc: {w}. Stop can review conservatively, but checkpoint \
-                 will not advance this frontier.\nFrontier unchanged."
-            ),
-            session: Some(session),
-        };
-    }
-    // Bundle-empty: clean tree + no committed-since-base. No Codex call needed; set
-    // APPROVED to clear any prior blocked/needs_user since the net diff is empty.
+    // v0.24.0 (Fix 3): a `committed_warning` (base reconstructed after squash-merge/
+    // rebase/gc) is ADVISORY, not a hard refusal. The warning is already embedded in
+    // `ctx.bundle.text` (so the reviewer sees it) and is echoed in the checkpoint
+    // output formatters. Refusing here was the bug: it left squash-merge users with a
+    // permanently stuck orphaned base. We proceed (clean tree still required above).
+    //
+    // Bundle-empty: clean tree + no committed-since-base net diff. No Codex call.
     if ctx.bundle.is_empty {
+        // Squash-merge orphaned-base edge: warning present + empty net diff means the
+        // recorded base is a dead commit whose tree already matches HEAD. Advance the
+        // base to HEAD to CLEAR the orphan (otherwise the dead base lingers and every
+        // later Stop re-reviews conservatively). Only when HEAD is known.
+        if ctx.committed_warning.is_some() {
+            if let Some(head) = ctx.head.as_deref() {
+                match crate::review_frontier::checkpoint_approved(cwd, &session, head) {
+                    Ok(()) => {
+                        return CheckpointPrep::NoOp {
+                            message: format_checkpoint_no_op_advanced(
+                                reason,
+                                &session,
+                                ctx.frontier.as_ref(),
+                                head,
+                                ctx.committed_warning.as_deref(),
+                            ),
+                            session,
+                            advanced: true,
+                        };
+                    }
+                    Err(e) => {
+                        crate::review_frontier::set_status(
+                            cwd,
+                            &session,
+                            crate::review_frontier::STATUS_NEEDS_USER,
+                        );
+                        return CheckpointPrep::Refuse {
+                            message: format!(
+                                "AI Bridge: `review_checkpoint`: {e}.\nFrontier unchanged."
+                            ),
+                            session: Some(session),
+                        };
+                    }
+                }
+            }
+        }
+        // Normal empty case (base is a clean ancestor, nothing committed since): set
+        // APPROVED to clear any prior blocked/needs_user since the net diff is empty.
         crate::review_frontier::set_status(cwd, &session, crate::review_frontier::STATUS_APPROVED);
-        return CheckpointPrep::NoOp(format_checkpoint_no_op(
-            reason,
-            &session,
-            ctx.frontier.as_ref(),
-        ));
+        return CheckpointPrep::NoOp {
+            message: format_checkpoint_no_op(reason, &session, ctx.frontier.as_ref()),
+            session,
+            advanced: false,
+        };
     }
     // Reviewed-head must be present to advance the base later.
     let reviewed_head = match ctx.head.as_deref() {
@@ -1286,6 +1337,25 @@ fn checkpoint_finalize(
 }
 
 /// v0.23.0: Format the APPROVE output for `review_checkpoint`.
+/// v0.24.0: Render the base label for a frontier (commit oid / empty-tree / none).
+fn checkpoint_base_label(frontier: Option<&crate::review_frontier::Frontier>) -> String {
+    match frontier.map(|f| &f.base) {
+        Some(crate::review_frontier::BaseKind::Commit(o)) => o.clone(),
+        Some(crate::review_frontier::BaseKind::EmptyTree) => "<empty tree>".to_string(),
+        _ => "<none>".to_string(),
+    }
+}
+
+/// v0.24.0: Emit the advisory `base-note:` line when the review base was
+/// reconstructed (squash-merge/rebase/gc warning), so the user always sees that
+/// the committed-delta was measured against a reconstructed base.
+fn push_base_note(out: &mut String, base_note: Option<&str>) {
+    if let Some(w) = base_note {
+        out.push_str(&format!("base-note: {w}\n"));
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // distinct display fields for one output block
 fn format_checkpoint_approve(
     reason: &str,
     session: &str,
@@ -1294,17 +1364,15 @@ fn format_checkpoint_approve(
     files: &[String],
     bytes: usize,
     trace: Option<&str>,
+    base_note: Option<&str>,
 ) -> String {
-    let old_base = match old_frontier.map(|f| &f.base) {
-        Some(crate::review_frontier::BaseKind::Commit(o)) => o.clone(),
-        Some(crate::review_frontier::BaseKind::EmptyTree) => "<empty tree>".to_string(),
-        _ => "<none>".to_string(),
-    };
+    let old_base = checkpoint_base_label(old_frontier);
     let mut out = String::new();
     out.push_str("<AI-BRIDGE-CHECKPOINT-APPROVE/>\n");
     out.push_str(&format!("reason: {reason}\n"));
     out.push_str(&format!("session: {session}\n"));
     out.push_str(&format!("frontier: {old_base} -> {new_head}\n"));
+    push_base_note(&mut out, base_note);
     out.push_str(&format!(
         "reviewed: {} file(s), {bytes} bytes\n",
         files.len()
@@ -1330,11 +1398,7 @@ fn format_checkpoint_no_op(
     session: &str,
     frontier: Option<&crate::review_frontier::Frontier>,
 ) -> String {
-    let base = match frontier.map(|f| &f.base) {
-        Some(crate::review_frontier::BaseKind::Commit(o)) => o.clone(),
-        Some(crate::review_frontier::BaseKind::EmptyTree) => "<empty tree>".to_string(),
-        _ => "<none>".to_string(),
-    };
+    let base = checkpoint_base_label(frontier);
     format!(
         "<AI-BRIDGE-CHECKPOINT-APPROVE/>\n\
          reason: {reason}\n\
@@ -1344,6 +1408,29 @@ fn format_checkpoint_no_op(
     )
 }
 
+/// v0.24.0: Format the no-op output when the empty-bundle path ALSO advanced the
+/// base to HEAD (orphaned-base squash-merge case). Shows the base move + the
+/// advisory warning so the user knows the dead base was cleared.
+fn format_checkpoint_no_op_advanced(
+    reason: &str,
+    session: &str,
+    old_frontier: Option<&crate::review_frontier::Frontier>,
+    new_head: &str,
+    base_note: Option<&str>,
+) -> String {
+    let old_base = checkpoint_base_label(old_frontier);
+    let mut out = String::new();
+    out.push_str("<AI-BRIDGE-CHECKPOINT-APPROVE/>\n");
+    out.push_str(&format!("reason: {reason}\n"));
+    out.push_str(&format!("session: {session}\n"));
+    out.push_str(&format!(
+        "frontier: {old_base} -> {new_head} (orphaned base cleared; net diff empty)\n"
+    ));
+    push_base_note(&mut out, base_note);
+    out.push_str("status: approved\n");
+    out
+}
+
 /// v0.23.0: Format the REQUEST_CHANGES output for `review_checkpoint`.
 fn format_checkpoint_request_changes(
     reason: &str,
@@ -1351,18 +1438,16 @@ fn format_checkpoint_request_changes(
     frontier: Option<&crate::review_frontier::Frontier>,
     findings: &str,
     trace: Option<&str>,
+    base_note: Option<&str>,
 ) -> String {
-    let base = match frontier.map(|f| &f.base) {
-        Some(crate::review_frontier::BaseKind::Commit(o)) => o.clone(),
-        Some(crate::review_frontier::BaseKind::EmptyTree) => "<empty tree>".to_string(),
-        _ => "<none>".to_string(),
-    };
+    let base = checkpoint_base_label(frontier);
     let mut out = String::new();
     out.push_str("<AI-BRIDGE-REQUEST-CHANGES/>\n");
     out.push_str(&format!("reason: {reason}\n"));
     out.push_str(&format!("session: {session}\n"));
     out.push_str("review_checkpoint did not advance the frontier.\n");
     out.push_str(&format!("frontier remains: {base}\n"));
+    push_base_note(&mut out, base_note);
     out.push_str("findings:\n");
     out.push_str(findings);
     if !findings.ends_with('\n') {
@@ -2263,6 +2348,7 @@ mod tests {
             &files,
             1024,
             Some(".ai-bridge/reviews/123/review.txt"),
+            None,
         );
         assert!(out.contains("<AI-BRIDGE-CHECKPOINT-APPROVE/>"));
         assert!(out.contains("reason: P1.1 done"));
@@ -2277,14 +2363,60 @@ mod tests {
     }
 
     #[test]
+    fn format_checkpoint_approve_shows_base_note_when_reconstructed() {
+        let frontier = crate::review_frontier::Frontier {
+            base: crate::review_frontier::BaseKind::Commit("oldsha".into()),
+            status: crate::review_frontier::STATUS_OPEN.into(),
+        };
+        let out = format_checkpoint_approve(
+            "post squash-merge",
+            "s",
+            Some(&frontier),
+            "newsha",
+            &[],
+            10,
+            None,
+            Some("review base 25f2e53 is no longer an ancestor of HEAD"),
+        );
+        assert!(out.contains("base-note: review base 25f2e53 is no longer an ancestor"));
+    }
+
+    #[test]
     fn format_checkpoint_approve_handles_empty_tree_base() {
         let frontier = crate::review_frontier::Frontier {
             base: crate::review_frontier::BaseKind::EmptyTree,
             status: crate::review_frontier::STATUS_OPEN.into(),
         };
-        let out =
-            format_checkpoint_approve("first commit", "s", Some(&frontier), "abc", &[], 0, None);
+        let out = format_checkpoint_approve(
+            "first commit",
+            "s",
+            Some(&frontier),
+            "abc",
+            &[],
+            0,
+            None,
+            None,
+        );
         assert!(out.contains("frontier: <empty tree> -> abc"));
+    }
+
+    #[test]
+    fn format_checkpoint_no_op_advanced_shows_orphan_cleared() {
+        let frontier = crate::review_frontier::Frontier {
+            base: crate::review_frontier::BaseKind::Commit("orphan".into()),
+            status: crate::review_frontier::STATUS_BLOCKED.into(),
+        };
+        let out = format_checkpoint_no_op_advanced(
+            "squash cleared",
+            "s",
+            Some(&frontier),
+            "newhead",
+            Some("review base orphan is no longer an ancestor of HEAD"),
+        );
+        assert!(out.contains("<AI-BRIDGE-CHECKPOINT-APPROVE/>"));
+        assert!(out.contains("frontier: orphan -> newhead (orphaned base cleared"));
+        assert!(out.contains("base-note: review base orphan"));
+        assert!(out.contains("status: approved"));
     }
 
     #[test]
@@ -2312,6 +2444,7 @@ mod tests {
             Some(&frontier),
             "FINDINGS:\n- bug in foo.rs",
             Some(".ai-bridge/reviews/xx/review.txt"),
+            None,
         );
         assert!(out.contains("<AI-BRIDGE-REQUEST-CHANGES/>"));
         assert!(out.contains("did not advance the frontier"));
@@ -2384,24 +2517,50 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_prepare_committed_warning_sets_needs_user() {
-        let session = "sess-warn";
+    fn checkpoint_prepare_committed_warning_clean_tree_proceeds() {
+        // v0.24.0 (Fix 3): a reconstructed base (warning) with a NON-empty net diff
+        // and a clean tree now PROCEEDS to review (warning is advisory), instead of
+        // hard-refusing. Amend HEAD WITH a content change so base A is orphaned AND
+        // the net A↔HEAD diff is non-empty.
+        let session = "sess-warn-proceed";
         let cwd = setup_approved_repo(session);
-        let base_a = crate::git::head_oid(&cwd).unwrap();
-        // Amend HEAD so the recorded base A is no longer an ancestor of the new HEAD
-        // → committed_delta returns a warning (ambiguous base).
-        git_in(&cwd, &["commit", "--amend", "-m", "reworded"]);
+        std::fs::write(std::path::Path::new(&cwd).join("amended.txt"), "x").unwrap();
+        git_in(&cwd, &["add", "."]);
+        git_in(&cwd, &["commit", "--amend", "-m", "reworded+content"]);
         let prep = checkpoint_prepare(&cwd, "phase A");
+        match prep {
+            CheckpointPrep::Proceed { ctx, .. } => {
+                assert!(
+                    ctx.committed_warning.is_some(),
+                    "warning must be carried into Proceed for the formatters"
+                );
+            }
+            other => panic!("expected Proceed, got {:?}", std::mem::discriminant(&other)),
+        }
+    }
+
+    #[test]
+    fn checkpoint_prepare_warned_empty_net_advances_and_clears_orphan() {
+        // v0.24.0 (Fix 3): reconstructed base + EMPTY net diff (reword-only amend:
+        // orphaned base, identical tree) + clean tree → NoOp{advanced:true}; the dead
+        // base is cleared by advancing to HEAD.
+        let session = "sess-warn-empty";
+        let cwd = setup_approved_repo(session);
+        // Reword-only amend: base A orphaned, tree unchanged ⇒ empty net diff + warning.
+        git_in(&cwd, &["commit", "--amend", "-m", "reworded only"]);
+        let head = crate::git::head_oid(&cwd).unwrap();
+        let prep = checkpoint_prepare(&cwd, "between PRs");
         assert!(
-            matches!(prep, CheckpointPrep::Refuse { ref message, .. } if message.contains("ambiguous"))
+            matches!(prep, CheckpointPrep::NoOp { advanced: true, ref message, .. } if message.contains("orphaned base cleared")),
+            "warned empty net diff should NoOp-advance and clear the orphan"
         );
-        let f = crate::review_frontier::read(&cwd, session).unwrap();
-        assert_eq!(f.status, crate::review_frontier::STATUS_NEEDS_USER);
-        // base stays A (the recorded oid), not the amended one.
+        // Base advanced to the amended HEAD, status APPROVED.
         assert_eq!(
             frontier_base_oid(&cwd, session).as_deref(),
-            Some(base_a.as_str())
+            Some(head.as_str())
         );
+        let f = crate::review_frontier::read(&cwd, session).unwrap();
+        assert_eq!(f.status, crate::review_frontier::STATUS_APPROVED);
     }
 
     #[test]
@@ -2426,9 +2585,12 @@ mod tests {
         let cwd = setup_approved_repo(session);
         // Simulate a prior Stop block lingering on the frontier.
         crate::review_frontier::set_status(&cwd, session, crate::review_frontier::STATUS_BLOCKED);
-        // Clean tree + base == HEAD ⇒ empty bundle ⇒ NoOp + APPROVED.
+        // Clean tree + base == HEAD ⇒ empty bundle ⇒ NoOp + APPROVED, NOT advanced
+        // (no warning; base is already a clean ancestor at HEAD).
         let prep = checkpoint_prepare(&cwd, "between PRs");
-        assert!(matches!(prep, CheckpointPrep::NoOp(ref m) if m.contains("CHECKPOINT-APPROVE")));
+        assert!(
+            matches!(prep, CheckpointPrep::NoOp { advanced: false, ref message, .. } if message.contains("CHECKPOINT-APPROVE"))
+        );
         let f = crate::review_frontier::read(&cwd, session).unwrap();
         assert_eq!(f.status, crate::review_frontier::STATUS_APPROVED);
     }

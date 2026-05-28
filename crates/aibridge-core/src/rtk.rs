@@ -12,7 +12,7 @@
 //!
 //! The install pipeline (in order):
 //!
-//! 1. Detect target via [`detect_target`] (Brew / NativeBin{writable} / NotInstalled / Unknown).
+//! 1. Detect target via [`detect_target`] (Brew / NativeBin / NotInstalled / Unknown).
 //! 2. Identity-check the EXISTING binary (if any) via [`rtk_identity_check`] — refuse
 //!    to update anything that doesn't pass EITHER (a) `--version` banner contains the
 //!    explicit `rtk-ai` / `Rust Token Killer` marker, OR (b) v0.20.2 fallback: banner
@@ -51,9 +51,11 @@ use crate::cli_update::{CommandRunner, PathResolver};
 pub enum RtkTarget {
     /// Homebrew-managed. Update via `brew upgrade rtk` (no archive handling).
     Brew,
-    /// User-local native binary at `path`. `writable == true` only when the file
-    /// and its parent directory are writable by the current user (probed live).
-    NativeBin { path: PathBuf, writable: bool },
+    /// User-local native binary at `path`. v0.24.0: classification is now
+    /// read-only — the writability probe was split out (it wrote a sentinel file
+    /// BEFORE the user confirmed). Callers probe `FsOps::is_writable_install_path`
+    /// AFTER confirmation, right before mutating.
+    NativeBin { path: PathBuf },
     /// rtk isn't on PATH. `install_to` is the canonical target location for a
     /// fresh install on this platform.
     NotInstalled { install_to: PathBuf },
@@ -142,6 +144,15 @@ pub trait FsOps: Send + Sync {
     fn rename(&self, src: &Path, dst: &Path) -> Result<(), String>;
     fn remove_file(&self, p: &Path) -> Result<(), String>;
     fn copy(&self, src: &Path, dst: &Path) -> Result<(), String>;
+
+    /// v0.24.0: Probe whether `target` (an existing or to-be-created install
+    /// path) is writable by the current user. Routed through `FsOps` — rather
+    /// than calling the free [`is_writable_install_path`] directly — so callers
+    /// can verify (in tests) that the probe runs ONLY after the user confirms
+    /// the install/update (the probe writes a sentinel file, a real FS mutation).
+    fn is_writable_install_path(&self, target: &Path) -> bool {
+        is_writable_install_path(target)
+    }
 }
 
 /// Production FsOps wrapper around `std::fs`.
@@ -330,6 +341,90 @@ pub fn is_writable_install_path(target: &Path) -> bool {
     }
 }
 
+/// v0.24.0 (Fix 2): True when `path` has a Homebrew-shim SHAPE — either it already
+/// contains a brew-prefix substring (a real Cellar binary directly on PATH) OR its
+/// parent is a known Homebrew `bin` dir (`/usr/local/bin` Intel, `/opt/homebrew/bin`
+/// Apple Silicon). The shape only TRIGGERS the ownership probe; it never classifies
+/// as Brew on its own (a native `/usr/local/bin/rtk` is shaped-but-not-owned).
+fn looks_like_brew_rtk_path(path: &Path) -> bool {
+    let pl = path
+        .to_string_lossy()
+        .to_ascii_lowercase()
+        .replace('\\', "/");
+    if pl.contains("/homebrew/") || pl.contains("/usr/local/cellar/") || pl.contains("/linuxbrew/")
+    {
+        return true;
+    }
+    matches!(
+        path.parent()
+            .map(|p| p.to_string_lossy().to_ascii_lowercase().replace('\\', "/")),
+        Some(ref par) if par == "/usr/local/bin" || par == "/opt/homebrew/bin"
+    )
+}
+
+/// v0.24.0 (Fix 2): Lexically join `target` onto `parent` (when `target` is
+/// relative) and resolve `.`/`..` WITHOUT touching the filesystem (`canonicalize`
+/// would require the path to exist and break hermetic tests). An absolute `target`
+/// is returned as-is.
+fn lexical_join(parent: &Path, target: &Path) -> PathBuf {
+    let base = if target.is_absolute() {
+        PathBuf::new()
+    } else {
+        parent.to_path_buf()
+    };
+    let mut out = base;
+    for comp in target.components() {
+        use std::path::Component;
+        match comp {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// v0.24.0 (Fix 2): Prove `path` is the Homebrew-owned `rtk` formula — not merely
+/// shaped like one. Requires BOTH `brew list rtk` membership AND the lexically
+/// resolved path (following one symlink hop for a shim) to live under a KNOWN
+/// Homebrew formula prefix for `rtk` specifically. This rejects:
+/// - a native regular file at `/usr/local/bin/rtk` (no symlink → resolves to itself,
+///   not under a brew prefix) even when an unlinked `rtk` formula makes `brew list`
+///   succeed;
+/// - a shim pointing at another formula's Cellar (`/usr/local/Cellar/other/...`);
+/// - a shim pointing outside any brew prefix (`/tmp/Cellar/rtk/...`).
+fn brew_owns_rtk(runner: &dyn CommandRunner, resolver: &dyn PathResolver, path: &Path) -> bool {
+    match runner.run("brew", &["list", "rtk"], Duration::from_secs(5)) {
+        Ok((true, _)) => {}
+        _ => return false,
+    }
+    let resolved = match resolver.symlink_target(path) {
+        Some(t) => lexical_join(path.parent().unwrap_or(path), &t),
+        None => path.to_path_buf(),
+    };
+    // Normalize separators: `PathBuf::push` emits `\` on Windows, but Homebrew
+    // prefixes are POSIX (`/`). Compare on a forward-slash, lowercased form so the
+    // match is platform-independent (real macOS paths are already `/`).
+    let rl = resolved
+        .to_string_lossy()
+        .to_ascii_lowercase()
+        .replace('\\', "/");
+    const ALLOWED: &[&str] = &[
+        "/usr/local/cellar/rtk/",
+        "/usr/local/opt/rtk/",
+        "/opt/homebrew/cellar/rtk/",
+        "/opt/homebrew/opt/rtk/",
+        // Linux short-circuits to Unsupported before reaching here; kept harmless.
+        "/home/linuxbrew/.linuxbrew/cellar/rtk/",
+        "/home/linuxbrew/.linuxbrew/opt/rtk/",
+    ];
+    // ANCHORED at the start — `contains` would accept `/tmp/usr/local/Cellar/rtk/...`
+    // (a Homebrew-looking segment nested under a non-Homebrew root).
+    ALLOWED.iter().any(|p| rl.starts_with(p))
+}
+
 /// Canonical install location for a fresh `aibridge rtk install` on this
 /// platform. Windows: `%USERPROFILE%\.local\bin\rtk.exe`. macOS:
 /// `$HOME/.local/bin/rtk`. Linux returns the same path BUT is documented as
@@ -475,21 +570,13 @@ pub fn detect_target(runner: &dyn CommandRunner, resolver: &dyn PathResolver) ->
                     ),
                 };
             }
-            // Brew detection: path under brew prefix AND `brew list rtk` confirms.
-            let path_lower = path.to_string_lossy().to_ascii_lowercase();
-            let looks_brew = path_lower.contains("/homebrew/")
-                || path_lower.contains("/usr/local/cellar/")
-                || path_lower.contains("/linuxbrew/");
-            if looks_brew {
-                if let Ok((ok, _)) = runner.run("brew", &["list", "rtk"], Duration::from_secs(5)) {
-                    if ok {
-                        return RtkTarget::Brew;
-                    }
-                }
+            // Brew detection: candidate path shape AND proven Homebrew ownership.
+            // v0.24.0: read-only — no writability probe here (split out; the probe
+            // wrote a sentinel BEFORE the user confirmed). Callers probe after confirm.
+            if looks_like_brew_rtk_path(&path) && brew_owns_rtk(runner, resolver, &path) {
+                return RtkTarget::Brew;
             }
-            // Native binary fallback.
-            let writable = is_writable_install_path(&path);
-            RtkTarget::NativeBin { path, writable }
+            RtkTarget::NativeBin { path }
         }
         Err(_) => {
             // Not installed. Pick the canonical install location.
@@ -751,42 +838,56 @@ pub fn stage_swap_verify(
 // ───────────────────────── orchestrator ─────────────────────────
 
 /// Top-level rtk install/update flow. Wires together all the seams:
-/// detection → download → checksum → extract → stage/swap/identity.
+/// detection → confirm → download → checksum → extract → stage/swap/identity.
+///
+/// v0.24.0 (Fix 1): confirmation is now enforced. Every mutating path (native
+/// install, native update, brew upgrade, fresh install) prompts via `confirmer`
+/// UNLESS `opts.yes`. Classification is read-only; the writability probe + dir
+/// creation + brew upgrade + download all run AFTER confirmation. A non-TTY
+/// without `--yes` fails closed (`RealConfirmer` returns false). The separate
+/// in-TUI path [`install_or_update_native_with_progress`] keeps auto-proceeding
+/// (the `u` keypress is the consent; it must not stdin-prompt in the alt-screen).
+#[allow(clippy::too_many_arguments)] // each seam is a distinct injection point
 pub fn install_or_update(
     runner: &dyn CommandRunner,
     resolver: &dyn PathResolver,
     downloader: &dyn ReleaseDownloader,
     fs: &dyn FsOps,
-    _opts: InstallOpts,
+    opts: InstallOpts,
+    confirmer: &dyn crate::update::Confirmer,
+    brew: &dyn BrewUpgrader,
 ) -> Result<String, String> {
+    // 1. Classify (read-only) + early refusals — no mutation yet.
     let target = detect_target(runner, resolver);
-    let (install_path, brew_path) = match target {
-        RtkTarget::Brew => (None, true),
-        RtkTarget::NativeBin {
-            path,
-            writable: true,
-        } => (Some(path), false),
-        RtkTarget::NativeBin {
-            path,
-            writable: false,
-        } => {
-            return Err(format!(
-                "rtk install path {path:?} is not writable by the current user; \
-                 update manually or fix permissions"
-            ));
+    enum Plan {
+        Brew,
+        Native(PathBuf),
+        Fresh(PathBuf),
+    }
+    let (plan, prompt) = match target {
+        RtkTarget::Brew => (
+            Plan::Brew,
+            "About to update Homebrew-managed rtk via `brew upgrade rtk`. Continue? [y/N] "
+                .to_string(),
+        ),
+        RtkTarget::NativeBin { path } => {
+            let p = format!(
+                "About to update rtk at {} (download + verify + atomic-replace from rtk-ai/rtk). Continue? [y/N] ",
+                path.display()
+            );
+            (Plan::Native(path), p)
         }
         RtkTarget::NotInstalled { install_to } => {
-            if !_opts.allow_fresh_install {
+            if !opts.allow_fresh_install {
                 return Err(format!(
                     "rtk is not installed; run `aibridge rtk install [--yes]` to fetch it to {install_to:?}"
                 ));
             }
-            // Ensure parent dir exists for the fresh install location.
-            if let Some(parent) = install_to.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| format!("can't create install dir {parent:?}: {e}"))?;
-            }
-            (Some(install_to), false)
+            let p = format!(
+                "About to install rtk to {} (download + verify from rtk-ai/rtk). Continue? [y/N] ",
+                install_to.display()
+            );
+            (Plan::Fresh(install_to), p)
         }
         RtkTarget::Unknown { reason } => {
             return Err(format!("rtk auto-update unavailable: {reason}"));
@@ -798,11 +899,34 @@ pub fn install_or_update(
         }
     };
 
-    if brew_path {
-        return run_brew_upgrade(runner);
+    // 2. Confirmation gate — BEFORE any mutation (writable probe, dir creation,
+    // brew upgrade, download). `--yes` skips it; non-TTY without --yes → false.
+    if !opts.yes && !confirmer.confirm(&prompt) {
+        return Err("rtk install/update cancelled; rerun with --yes to auto-confirm".to_string());
     }
 
-    let install_path = install_path.expect("non-brew path guaranteed Some(path)");
+    // 3. Brew path returns immediately after the (now-confirmed) upgrade — it must
+    // NOT fall through into native download/stage/replace.
+    let install_path = match plan {
+        Plan::Brew => return brew.upgrade_rtk(),
+        Plan::Native(path) => {
+            // Writability probe runs ONLY now (post-confirm) — it writes a sentinel.
+            if !fs.is_writable_install_path(&path) {
+                return Err(format!(
+                    "rtk install path {path:?} is not writable by the current user; \
+                     update manually or fix permissions"
+                ));
+            }
+            path
+        }
+        Plan::Fresh(install_to) => {
+            if let Some(parent) = install_to.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("can't create install dir {parent:?}: {e}"))?;
+            }
+            install_to
+        }
+    };
 
     // Resolve target triple + asset.
     let target_triple = crate::update::current_target();
@@ -906,18 +1030,16 @@ pub fn install_or_update_native_with_progress(
                 "not a native install — use install_or_update for brew-managed rtk".to_string(),
             );
         }
-        RtkTarget::NativeBin {
-            path,
-            writable: true,
-        } => path,
-        RtkTarget::NativeBin {
-            path,
-            writable: false,
-        } => {
-            return Err(format!(
-                "rtk install path {path:?} is not writable by the current user; \
-                 update manually or fix permissions"
-            ));
+        RtkTarget::NativeBin { path } => {
+            // v0.24.0: writability probe split out of detect_target; probe here,
+            // right before mutating (the TUI `u` keypress is the consent).
+            if !fs.is_writable_install_path(&path) {
+                return Err(format!(
+                    "rtk install path {path:?} is not writable by the current user; \
+                     update manually or fix permissions"
+                ));
+            }
+            path
         }
         RtkTarget::NotInstalled { install_to } => {
             if !opts.allow_fresh_install {
@@ -1017,7 +1139,7 @@ pub fn install_or_update_native_with_progress(
     Ok(msg)
 }
 
-fn run_brew_upgrade(_runner: &dyn CommandRunner) -> Result<String, String> {
+fn run_brew_upgrade() -> Result<String, String> {
     // Use the inherited-stdio mutation path (same pattern as cli_update::apply_cli_update).
     let argv = vec!["brew".to_string(), "upgrade".to_string(), "rtk".to_string()];
     let code = crate::cli_update::apply_cli_update(&argv)?;
@@ -1025,6 +1147,22 @@ fn run_brew_upgrade(_runner: &dyn CommandRunner) -> Result<String, String> {
         Ok("rtk upgraded via brew".to_string())
     } else {
         Err(format!("brew upgrade rtk exited {code}"))
+    }
+}
+
+/// v0.24.0 (Fix 1): injectable seam for the brew-upgrade mutation so the
+/// `install_or_update` Brew branch is testable WITHOUT invoking real `brew`.
+/// Production [`RealBrewUpgrader`] runs `brew upgrade rtk` via inherited stdio
+/// (live progress); tests substitute a recording fake.
+pub trait BrewUpgrader: Send + Sync {
+    fn upgrade_rtk(&self) -> Result<String, String>;
+}
+
+/// Production brew upgrader — `brew upgrade rtk` with inherited stdio.
+pub struct RealBrewUpgrader;
+impl BrewUpgrader for RealBrewUpgrader {
+    fn upgrade_rtk(&self) -> Result<String, String> {
+        run_brew_upgrade()
     }
 }
 
@@ -1691,6 +1829,11 @@ mod tests {
                 Err(format!("not found: {name}"))
             }
         }
+        // v0.24.0: the Apple-Silicon brew shim symlinks into the Cellar. Required
+        // so `brew_owns_rtk` proves Homebrew ownership (not just a shaped path).
+        fn symlink_target(&self, _path: &std::path::Path) -> Option<PathBuf> {
+            Some(PathBuf::from("../Cellar/rtk/0.42.0/bin/rtk"))
+        }
     }
 
     /// PathResolver that says rtk isn't installed (triggers NotInstalled).
@@ -1722,9 +1865,378 @@ mod tests {
         fn copy(&self, _s: &Path, _d: &Path) -> Result<(), String> {
             panic!("fs must not be called")
         }
+        // v0.24.0: the writable probe must NOT run before the user confirms — a
+        // decline test using this Fs proves it by never panicking here.
+        fn is_writable_install_path(&self, _t: &Path) -> bool {
+            panic!("writable probe must not run before confirmation")
+        }
     }
 
     fn noop_stage(_s: &str) {}
+
+    // v0.24.0 (Fix 1): brew-upgrade seam fakes.
+    struct RecordingBrewUpgrader {
+        called: std::sync::atomic::AtomicBool,
+    }
+    impl RecordingBrewUpgrader {
+        fn new() -> Self {
+            Self {
+                called: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+    }
+    impl BrewUpgrader for RecordingBrewUpgrader {
+        fn upgrade_rtk(&self) -> Result<String, String> {
+            self.called.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok("rtk upgraded via brew (fake)".to_string())
+        }
+    }
+    struct PanicBrewUpgrader;
+    impl BrewUpgrader for PanicBrewUpgrader {
+        fn upgrade_rtk(&self) -> Result<String, String> {
+            panic!("brew upgrade must not run on a declined/native path")
+        }
+    }
+
+    // v0.24.0 (Fix 1): confirmer fakes for install_or_update confirmation tests.
+    struct DeclineConfirmer;
+    impl crate::update::Confirmer for DeclineConfirmer {
+        fn confirm(&self, _: &str) -> bool {
+            false
+        }
+        fn confirm_close_pids(&self, _: &Path, _: &[u32]) -> bool {
+            false
+        }
+    }
+    struct PanicConfirmer;
+    impl crate::update::Confirmer for PanicConfirmer {
+        fn confirm(&self, _: &str) -> bool {
+            panic!("confirmer must not be called when opts.yes is true")
+        }
+        fn confirm_close_pids(&self, _: &Path, _: &[u32]) -> bool {
+            panic!("confirm_close_pids must not be called")
+        }
+    }
+
+    /// PathResolver for a NON-brew native install at an arbitrary writable-looking
+    /// path (so detect_target classifies NativeBin, not Brew/NotInstalled).
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    struct NativePathResolver(PathBuf);
+    impl PathResolver for NativePathResolver {
+        fn find(&self, name: &str) -> Result<PathBuf, String> {
+            if name == "rtk" {
+                Ok(self.0.clone())
+            } else {
+                Err(format!("not found: {name}"))
+            }
+        }
+        // Not a symlink → not brew-owned.
+        fn symlink_target(&self, _p: &std::path::Path) -> Option<PathBuf> {
+            None
+        }
+    }
+
+    /// FsOps that records whether the writable probe ran + returns a fixed verdict.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    struct ProbeFs {
+        writable: bool,
+        probed: std::sync::atomic::AtomicBool,
+    }
+    impl FsOps for ProbeFs {
+        fn exists(&self, _p: &Path) -> bool {
+            false
+        }
+        fn rename(&self, _s: &Path, _d: &Path) -> Result<(), String> {
+            Err("unused".into())
+        }
+        fn remove_file(&self, _p: &Path) -> Result<(), String> {
+            Err("unused".into())
+        }
+        fn copy(&self, _s: &Path, _d: &Path) -> Result<(), String> {
+            Err("unused".into())
+        }
+        fn is_writable_install_path(&self, _t: &Path) -> bool {
+            self.probed.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.writable
+        }
+    }
+
+    // ─── v0.24.0 Fix 1: install_or_update confirmation gate ───
+
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn install_or_update_nativebin_decline_does_no_writable_probe() {
+        // NativeBin target + decline → must return cancelled BEFORE the writable
+        // probe runs (UnreachableFs panics if the probe runs pre-confirm).
+        let mut runner = FakeRunner::new();
+        let path = PathBuf::from("/home/u/.local/bin/rtk");
+        runner.set_path(&path, &["--version"], true, "rtk-ai/rtk 0.42.0\n");
+        let result = install_or_update(
+            &runner,
+            &NativePathResolver(path.clone()),
+            &UnreachableDownloader,
+            &UnreachableFs, // panics if writable probe runs before confirm
+            InstallOpts {
+                yes: false,
+                allow_fresh_install: false,
+            },
+            &DeclineConfirmer,
+            &PanicBrewUpgrader,
+        );
+        let err = result.unwrap_err();
+        assert!(err.contains("cancelled"), "got: {err}");
+    }
+
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn install_or_update_notinstalled_decline_returns_cancelled() {
+        // NotInstalled + decline → cancelled BEFORE create_dir_all (which is now
+        // structurally after the confirm gate).
+        let runner = FakeRunner::new();
+        let result = install_or_update(
+            &runner,
+            &MissingPathResolver,
+            &UnreachableDownloader,
+            &UnreachableFs,
+            InstallOpts {
+                yes: false,
+                allow_fresh_install: true,
+            },
+            &DeclineConfirmer,
+            &PanicBrewUpgrader,
+        );
+        let err = result.unwrap_err();
+        assert!(err.contains("cancelled"), "got: {err}");
+    }
+
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn install_or_update_yes_skips_confirmer() {
+        // opts.yes=true + PanicConfirmer → must get PAST confirmation without calling
+        // it. NativeBin + non-writable Fs → returns "not writable" (proves we reached
+        // the post-confirm writable probe without panicking in the confirmer).
+        let mut runner = FakeRunner::new();
+        let path = PathBuf::from("/home/u/.local/bin/rtk");
+        runner.set_path(&path, &["--version"], true, "rtk-ai/rtk 0.42.0\n");
+        let fs = ProbeFs {
+            writable: false,
+            probed: std::sync::atomic::AtomicBool::new(false),
+        };
+        let result = install_or_update(
+            &runner,
+            &NativePathResolver(path.clone()),
+            &UnreachableDownloader,
+            &fs,
+            InstallOpts {
+                yes: true,
+                allow_fresh_install: false,
+            },
+            &PanicConfirmer,
+            &PanicBrewUpgrader,
+        );
+        let err = result.unwrap_err();
+        assert!(err.contains("not writable"), "got: {err}");
+        assert!(
+            fs.probed.load(std::sync::atomic::Ordering::SeqCst),
+            "writable probe should run after confirmation is skipped"
+        );
+    }
+
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn install_or_update_brew_decline_refuses_before_brew_upgrade() {
+        // Brew target + decline → cancelled, run_brew_upgrade never reached.
+        let mut runner = FakeRunner::new();
+        let path = PathBuf::from("/opt/homebrew/bin/rtk");
+        runner.set_path(&path, &["--version"], true, "rtk-ai/rtk 0.42.0\n");
+        runner.set("brew", &["list", "rtk"], true, "rtk 0.42.0\n");
+        let result = install_or_update(
+            &runner,
+            &BrewLikePathResolver,
+            &UnreachableDownloader,
+            &UnreachableFs,
+            InstallOpts {
+                yes: false,
+                allow_fresh_install: false,
+            },
+            &DeclineConfirmer,
+            &PanicBrewUpgrader, // proves brew upgrade NOT reached on decline
+        );
+        let err = result.unwrap_err();
+        assert!(err.contains("cancelled"), "got: {err}");
+    }
+
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn install_or_update_brew_accepted_calls_brew_upgrade_only() {
+        // R5 (hermetic): confirmed/--yes Brew update takes the brew branch (recorded
+        // via the injected seam) and does NOT fall into native download/stage/replace.
+        // No real `brew` is ever invoked.
+        let mut runner = FakeRunner::new();
+        let path = PathBuf::from("/opt/homebrew/bin/rtk");
+        runner.set_path(&path, &["--version"], true, "rtk-ai/rtk 0.42.0\n");
+        runner.set("brew", &["list", "rtk"], true, "rtk 0.42.0\n");
+        let brew = RecordingBrewUpgrader::new();
+        let result = install_or_update(
+            &runner,
+            &BrewLikePathResolver,
+            &UnreachableDownloader, // panics if native download is reached
+            &UnreachableFs,         // panics if native staging is reached
+            InstallOpts {
+                yes: true,
+                allow_fresh_install: false,
+            },
+            &PanicConfirmer, // proves --yes skipped confirmation
+            &brew,
+        );
+        assert!(result.is_ok(), "brew branch should succeed: {result:?}");
+        assert!(
+            brew.called.load(std::sync::atomic::Ordering::SeqCst),
+            "brew upgrade seam must be invoked exactly on the Brew path"
+        );
+    }
+
+    // ─── v0.24.0 Fix 2: Intel Homebrew shim detection ───
+
+    /// Resolver: rtk at `path`, optional symlink target.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    struct ShimResolver {
+        path: PathBuf,
+        target: Option<PathBuf>,
+    }
+    impl PathResolver for ShimResolver {
+        fn find(&self, name: &str) -> Result<PathBuf, String> {
+            if name == "rtk" {
+                Ok(self.path.clone())
+            } else {
+                Err("nf".into())
+            }
+        }
+        fn symlink_target(&self, _p: &std::path::Path) -> Option<PathBuf> {
+            self.target.clone()
+        }
+    }
+
+    /// Build a FakeRunner with the identity check for `path` passing, and `brew list
+    /// rtk` configured per `brew_ok` (true → success; false → not registered).
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    fn detect_with(path: &str, target: Option<&str>, brew_ok: bool) -> RtkTarget {
+        let resolver = ShimResolver {
+            path: PathBuf::from(path),
+            target: target.map(PathBuf::from),
+        };
+        let mut r = FakeRunner::new();
+        r.set_path(
+            &PathBuf::from(path),
+            &["--version"],
+            true,
+            "rtk-ai/rtk 0.42.0\n",
+        );
+        if brew_ok {
+            r.set("brew", &["list", "rtk"], true, "rtk 0.42.0\n");
+        }
+        detect_target(&r, &resolver)
+    }
+
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn detect_intel_brew_shim_symlinked_into_cellar_is_brew() {
+        let t = detect_with(
+            "/usr/local/bin/rtk",
+            Some("../Cellar/rtk/0.42.0/bin/rtk"),
+            true,
+        );
+        assert!(matches!(t, RtkTarget::Brew), "got {t:?}");
+    }
+
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn detect_apple_silicon_brew_shim_is_brew() {
+        let t = detect_with(
+            "/opt/homebrew/bin/rtk",
+            Some("../Cellar/rtk/0.42.0/bin/rtk"),
+            true,
+        );
+        assert!(matches!(t, RtkTarget::Brew), "got {t:?}");
+    }
+
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn detect_native_regular_file_at_usr_local_bin_is_native() {
+        // R2#2: regular file (no symlink) at /usr/local/bin/rtk + brew list ok must
+        // NOT be classified Brew (an unlinked formula must not capture a native bin).
+        let t = detect_with("/usr/local/bin/rtk", None, true);
+        assert!(matches!(t, RtkTarget::NativeBin { .. }), "got {t:?}");
+    }
+
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn detect_shim_to_other_formula_cellar_is_native() {
+        // R2#2: symlink into ANOTHER formula's Cellar must not classify as rtk-Brew.
+        let t = detect_with(
+            "/usr/local/bin/rtk",
+            Some("../Cellar/other/1.0/bin/rtk"),
+            true,
+        );
+        assert!(matches!(t, RtkTarget::NativeBin { .. }), "got {t:?}");
+    }
+
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn detect_shim_outside_brew_prefix_is_native() {
+        // R3#3: symlink to a Cellar-shaped path OUTSIDE any Homebrew prefix (/tmp).
+        let t = detect_with(
+            "/usr/local/bin/rtk",
+            Some("/tmp/Cellar/rtk/1.0/bin/rtk"),
+            true,
+        );
+        assert!(matches!(t, RtkTarget::NativeBin { .. }), "got {t:?}");
+    }
+
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn detect_shim_nested_under_nonbrew_root_is_native() {
+        // Code-gate #1: a Homebrew-looking segment NESTED under a non-Homebrew root
+        // (`/tmp/usr/local/Cellar/rtk/...`) must NOT match — the prefix is anchored
+        // with starts_with, not contains.
+        let t = detect_with(
+            "/usr/local/bin/rtk",
+            Some("/tmp/usr/local/Cellar/rtk/1.0/bin/rtk"),
+            true,
+        );
+        assert!(matches!(t, RtkTarget::NativeBin { .. }), "got {t:?}");
+    }
+
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn detect_direct_cellar_real_file_is_brew() {
+        // No-regression: rtk resolved directly to its Cellar file (not a shim).
+        let t = detect_with("/usr/local/Cellar/rtk/0.42.0/bin/rtk", None, true);
+        assert!(matches!(t, RtkTarget::Brew), "got {t:?}");
+    }
+
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn detect_unrelated_native_path_is_native_without_brew() {
+        // A clearly-native path should not even need brew fixtures (candidate=false).
+        let t = detect_with("/home/x/.local/bin/rtk", None, false);
+        assert!(matches!(t, RtkTarget::NativeBin { .. }), "got {t:?}");
+    }
+
+    #[test]
+    fn lexical_join_resolves_relative_and_passes_absolute() {
+        assert_eq!(
+            lexical_join(
+                Path::new("/usr/local/bin"),
+                Path::new("../Cellar/rtk/1.0/bin/rtk")
+            ),
+            PathBuf::from("/usr/local/Cellar/rtk/1.0/bin/rtk")
+        );
+        assert_eq!(
+            lexical_join(Path::new("/usr/local/bin"), Path::new("/abs/rtk")),
+            PathBuf::from("/abs/rtk")
+        );
+    }
 
     #[test]
     #[cfg(not(target_os = "linux"))]

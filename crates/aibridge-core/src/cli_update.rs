@@ -230,6 +230,15 @@ pub fn current_exe_path() -> Option<std::path::PathBuf> {
 /// a fake to deterministically simulate installed/not-installed states.
 pub trait PathResolver: Send + Sync {
     fn find(&self, name: &str) -> Result<std::path::PathBuf, String>;
+
+    /// v0.24.0: The immediate symlink target of `path`, if it IS a symlink.
+    /// Used by rtk Homebrew-ownership detection to prove a `/usr/local/bin/rtk`
+    /// shim points into the Homebrew tree (vs a native regular file). Default
+    /// `None` (not a symlink / unknown) keeps existing fakes compiling; only the
+    /// real resolver and the brew-detection tests override it.
+    fn symlink_target(&self, _path: &std::path::Path) -> Option<std::path::PathBuf> {
+        None
+    }
 }
 
 /// Platform-layer-backed resolver.
@@ -238,6 +247,10 @@ pub struct RealPathResolver;
 impl PathResolver for RealPathResolver {
     fn find(&self, name: &str) -> Result<std::path::PathBuf, String> {
         DefaultPlatform::find_executable(name).map_err(|e| e.to_string())
+    }
+
+    fn symlink_target(&self, path: &std::path::Path) -> Option<std::path::PathBuf> {
+        std::fs::read_link(path).ok()
     }
 }
 
@@ -1063,10 +1076,11 @@ pub fn check_rtk_with(runner: &dyn CommandRunner, resolver: &dyn PathResolver) -
             Some("press 'u' to update via brew (TUI exits briefly)".to_string()),
             false,
         ),
-        crate::rtk::RtkTarget::NativeBin {
-            path,
-            writable: true,
-        } => (
+        // v0.24.0: detect_target no longer probes writability (that wrote a sentinel
+        // BEFORE consent). The TUI shows the auto-update affordance for any native
+        // install; a non-writable path surfaces a clear error when the user actually
+        // presses 'u' (install_or_update_native_with_progress → fs.is_writable_install_path).
+        crate::rtk::RtkTarget::NativeBin { path } => (
             InstallSource::NativeInstaller {
                 docs_url: format!("auto-update target {path:?}"),
             },
@@ -1079,20 +1093,6 @@ pub fn check_rtk_with(runner: &dyn CommandRunner, resolver: &dyn PathResolver) -
                 ]
             }),
             Some("press 'u' to download + install (SHA256-verified, atomic-replace)".to_string()),
-            false,
-        ),
-        crate::rtk::RtkTarget::NativeBin {
-            path,
-            writable: false,
-        } => (
-            InstallSource::Unknown {
-                path: path.clone(),
-                reason: "install path not writable; update manually".to_string(),
-            },
-            None,
-            Some(format!(
-                "rtk at {path:?} is not writable by the current user; update manually"
-            )),
             false,
         ),
         crate::rtk::RtkTarget::NotInstalled { install_to } => (

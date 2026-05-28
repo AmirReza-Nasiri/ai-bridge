@@ -436,6 +436,8 @@ fn rtk_cmd(action: RtkAction) -> Result<()> {
                 yes,
                 allow_fresh_install: true,
             },
+            &aibridge_core::update::RealConfirmer,
+            &aibridge_core::rtk::RealBrewUpgrader,
         ) {
             Ok(msg) => {
                 println!("{msg}");
@@ -455,6 +457,8 @@ fn rtk_cmd(action: RtkAction) -> Result<()> {
                 yes,
                 allow_fresh_install: false,
             },
+            &aibridge_core::update::RealConfirmer,
+            &aibridge_core::rtk::RealBrewUpgrader,
         ) {
             Ok(msg) => {
                 println!("{msg}");

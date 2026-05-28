@@ -6,6 +6,23 @@ versioning is semver.
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-05-28
+
+Three fixes — the first two were surfaced by dogfooding the new v0.23.0
+`review_checkpoint` tool against the repo's own accumulated history.
+
+### Fixed
+- **`aibridge rtk install` / `aibridge rtk update` mutated with no confirmation.** The `--yes` flag was documented as auto-accepting a prompt, but `install_or_update` never read it and never prompted — a plain `aibridge rtk install` would create the install dir, download a third-party release, and replace the binary with zero confirmation. There is now a real confirmation gate before ANY mutation (native install, native update, fresh install, and `brew upgrade`): `--yes` skips it; a non-interactive shell without `--yes` fails closed. The in-TUI update path (the `u` keypress, which is itself the consent) is unchanged and still proceeds without a stdin prompt.
+- **Homebrew-managed rtk on Intel macOS was misclassified as a native install.** The Apple-Silicon shim (`/opt/homebrew/bin/rtk`) was detected, but the Intel shim (`/usr/local/bin/rtk`, a symlink into the Cellar) matched none of the brew-prefix substrings, so it fell through to the native updater — which could rename/replace the Homebrew shim. Detection now proves Homebrew *ownership*: `brew list rtk` membership AND the shim's symlink target, lexically resolved, anchored under a known Homebrew formula prefix (`<brew-prefix>/Cellar/rtk/…` or `…/opt/rtk/…`). A native regular file at a brew-shaped path, a shim into another formula's Cellar, or a shim outside any Homebrew prefix all correctly stay native.
+- **`review_checkpoint` could not advance the frontier after a squash-merge.** Squash-merging a PR orphans the recorded review base (it is no longer an ancestor of HEAD), which made `git committed_delta` emit an "ambiguous base" warning — and v0.23.0 hard-refused on that warning, leaving the frontier permanently stuck and every later Stop reviewing the full net diff conservatively. The `committed_warning` is now **advisory** (surfaced as a `base-note:` line, and the warning is embedded in the reviewed bundle): a clean working tree + approved plan still reviews the reconstructed net diff and advances on APPROVE. When the reconstructed net diff is empty (a reword-only orphan), the checkpoint advances the base to HEAD to clear the dead commit. The dirty-tree refusal, plan-gate requirement, explicit `reason`, and TOCTOU re-check are all retained.
+
+### Internal
+- `RtkTarget::NativeBin` no longer carries `writable` — `detect_target` is now read-only (the writability probe wrote a sentinel file *before* the user confirmed). New seams: `FsOps::is_writable_install_path` (probe runs only post-confirm), `PathResolver::symlink_target` (Homebrew-ownership proof; default `None`), `BrewUpgrader` (injectable `brew upgrade` so the Brew branch is hermetically testable).
+- `CheckpointPrep::NoOp { message, session, advanced }` — the empty-net-diff orphan-clear path advances the base and invalidates the in-memory gate fast-path, at parity with the APPROVE path.
+
+### Tests
+- +17 unit tests (461 total), all hermetic (fake runner/resolver/confirmer/brew-upgrader/downloader/fs + real-git-repo tempdirs; no real Codex/network/brew/package-manager mutation).
+
 ## [0.23.0] - 2026-05-28
 
 ### Added
