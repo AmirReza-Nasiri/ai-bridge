@@ -6,6 +6,52 @@ versioning is semver.
 
 ## [Unreleased]
 
+## [0.27.0] - 2026-05-28
+
+Opt-in macOS Homebrew install, straight from the TUI — the missing piece behind the
+v0.26.0 "not installed, no package manager" state. When codex/claude are missing and
+neither Homebrew nor npm exists, there was nothing actionable to press; now there is.
+
+### Added
+- **Install Homebrew from the Update tab (macOS only).** When codex/claude are not
+  installed and no package manager is found, the Update tab shows a `press 'b' to
+  install Homebrew` affordance. A 2-key confirm (first `b` arms, second `b` acts) then
+  hands off to Apple's **Terminal** running the official Homebrew installer.
+  **Security:** this is a deliberate *Terminal-handoff* (chosen over capturing the sudo
+  password in the TUI, per a Codex security review) — you type your Mac password in
+  Apple's Terminal, and AI Bridge never sees or holds it. The handoff script is fixed
+  (no user input → no injection), is written to a private 0700 temp `.command` created
+  with `O_EXCL`, sets up `shellenv` for both the Apple-Silicon (`/opt/homebrew`) and
+  Intel (`/usr/local`) prefixes idempotently, and **fails loudly** (exit 1 + an
+  actionable message) if the install aborts — it prints success only when `brew` is
+  actually present. After it finishes, press `r` to re-check. The affordance is strictly
+  macOS-gated and never appears when a package manager exists or the tool is installed.
+
+### Internal
+- `cli_update`: `should_offer_homebrew_install` / `can_offer_homebrew_install_ui(is_macos, …)`
+  / `homebrew_handoff_script()` (pure, cross-platform-testable).
+- `aibridge-platform`: `open_homebrew_install_terminal(script)` (macOS real / else Err);
+  temp dir created atomically private via `DirBuilder::mode(0o700)`.
+- TUI: injectable `HomebrewOpener` seam + `brew_install_armed` 2-key confirm + `b` key +
+  macOS-gated `homebrew_offer_line`; `handle_homebrew_install(is_macos)` unit-testable
+  on any host.
+
+### Tests
+- +15 (workspace total 537): offer gate (codex + claude, off-macOS never offers, PM
+  present / installed never offers), handoff-script dual-prefix/idempotent/secretless +
+  fail-loudly branch, and the TUI 2-key flow (arm → open, off-macOS no-op, error
+  surfaced, intervening-key cancels).
+
+### Validation
+- Unit-tested: the handoff-script content (curl installer, dual-prefix shellenv,
+  idempotent guard, fail-loudly `exit 1`, `.zprofile`-append warning) and the TUI 2-key
+  flow via a fake opener. Required before tagging: a macOS smoke against the
+  release-candidate must confirm the offer line, the macOS-only gating, and the arm
+  footer on a real Apple Silicon Mac, plus `aibridge selftest` green. The live
+  Terminal-handoff EXECUTION (`open -a Terminal` → `curl … | bash` + sudo) — which the
+  Windows CI cannot exercise — is verified separately under explicit Mac-owner consent;
+  it is intentionally not part of the automated/tag gate.
+
 ## [0.26.0] - 2026-05-28
 
 macOS CLI-detection fixes, diagnosed on a clean Apple Silicon Mac by the macOS side

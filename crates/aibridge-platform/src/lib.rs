@@ -400,3 +400,74 @@ pub fn platform_name() -> &'static str {
         "unix"
     }
 }
+
+// ───────────────────────── Homebrew Terminal handoff (v0.27.0) ─────────────────────────
+
+/// Open macOS Terminal running `script` (the Homebrew-installer handoff).
+///
+/// Terminal-handoff design (chosen over in-TUI sudo-password capture after a
+/// security review): AI Bridge writes the FIXED installer script to a private,
+/// 0700 temp `.command` file and hands it to Apple's Terminal via
+/// `open -a Terminal`. Terminal — not AI Bridge — runs the interactive installer
+/// and prompts for the sudo password, so AI Bridge never sees or holds it.
+///
+/// `script` is caller-provided but FIXED (see `homebrew_handoff_script` in
+/// `aibridge-core`) — no user input flows into it, so there is no injection
+/// surface. The file is created with `create_new` (O_EXCL) in a per-invocation
+/// private dir, both chmod 0700, so no other user can read it or pre-create it to
+/// hijack the run. macOS only.
+#[cfg(target_os = "macos")]
+pub fn open_homebrew_install_terminal(script: &str) -> Result<()> {
+    use anyhow::Context;
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+
+    let dir = std::env::temp_dir().join(format!(
+        "aibridge-brew-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    // Create the dir ATOMICALLY private (mode 0700 at mkdir time, not a follow-up
+    // chmod) so it's never briefly group/other-readable under a permissive umask.
+    // Non-recursive create → errors if the path already exists (no pre-created dir
+    // hijack); 0700 has no group/other bits, so umask can't loosen it.
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&dir)
+        .with_context(|| format!("create temp dir {}", dir.display()))?;
+
+    // `.command` so Terminal runs it as a script in a new window.
+    let path = dir.join("install-homebrew.command");
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true) // O_EXCL: never reuse or follow a pre-existing file
+        .mode(0o700)
+        .open(&path)
+        .with_context(|| format!("create {}", path.display()))?;
+    f.write_all(script.as_bytes())
+        .context("write handoff script")?;
+    f.flush().ok();
+    drop(f);
+
+    let status = Command::new("open")
+        .arg("-a")
+        .arg("Terminal")
+        .arg(&path)
+        .status()
+        .context("spawn `open -a Terminal`")?;
+    if !status.success() {
+        anyhow::bail!("`open -a Terminal` exited with {status}");
+    }
+    Ok(())
+}
+
+/// Non-macOS stub. AI Bridge never offers the Homebrew handoff off macOS
+/// (`can_offer_homebrew_install_ui` gates on `cfg!(target_os = "macos")`), so this
+/// only keeps the symbol available and fails loudly if ever reached.
+#[cfg(not(target_os = "macos"))]
+pub fn open_homebrew_install_terminal(_script: &str) -> Result<()> {
+    anyhow::bail!("Homebrew Terminal handoff is only available on macOS")
+}

@@ -243,6 +243,21 @@ fn production_cli_stream_starter() -> CliStreamStarter {
     })
 }
 
+/// v0.27.0: injectable opener for the macOS Homebrew Terminal-handoff. Production
+/// writes the FIXED `homebrew_handoff_script` to a private 0700 temp `.command` and
+/// hands it to Apple's Terminal via `aibridge_platform::open_homebrew_install_terminal`
+/// — Terminal (not AI Bridge) runs the installer and takes the sudo password. Tests
+/// inject a fake that records the call without spawning Terminal. `Ok(())` ⇒ handed off.
+type HomebrewOpener = std::sync::Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
+
+/// Production Homebrew opener: build the fixed handoff script + open Terminal.
+fn production_homebrew_opener() -> HomebrewOpener {
+    std::sync::Arc::new(|| {
+        let script = aibridge_core::cli_update::homebrew_handoff_script();
+        aibridge_platform::open_homebrew_install_terminal(&script).map_err(|e| e.to_string())
+    })
+}
+
 /// v0.22.0: in-TUI background CLI-update run. Single in-flight per `App`.
 /// `q` is blocked while `finished.is_none()`. On `Done`, the result moves to
 /// `App::last_cli_run_result` and this slot is cleared so the user can press
@@ -357,6 +372,13 @@ struct App {
     /// First `u` arms the tool name; second `u` on the same row starts the in-TUI
     /// stream. Any other key / tab change / different row clears it.
     fresh_install_armed: Option<&'static str>,
+    /// v0.27.0: injectable Homebrew Terminal-handoff opener (macOS only). Production
+    /// opens Apple's Terminal with the fixed installer; tests inject a recording fake.
+    homebrew_opener: HomebrewOpener,
+    /// v0.27.0: 2-key confirm for the `b` (install Homebrew) affordance. First `b`
+    /// arms; second `b` opens Terminal. Any other key clears it (top-of-`handle_key`
+    /// guard), mirroring `fresh_install_armed`.
+    brew_install_armed: bool,
     /// v0.22.0: in-flight in-TUI CLI update (rtk-native only). When `Some` and
     /// `finished.is_none()`, `q` is blocked and `u` is a no-op (single in-flight).
     active_cli_run: Option<ActiveCliRun>,
@@ -517,6 +539,8 @@ impl App {
             cli_update_starter: production_rtk_starter(),
             cli_stream_starter: production_cli_stream_starter(),
             fresh_install_armed: None,
+            homebrew_opener: production_homebrew_opener(),
+            brew_install_armed: false,
             active_cli_run: None,
             last_cli_run_result: None,
             pending_cli_recheck: false,
@@ -1426,6 +1450,48 @@ impl App {
         );
     }
 
+    /// v0.27.0: `b` on the Update tab — the macOS Homebrew Terminal-handoff. Only
+    /// actionable on macOS when codex/claude are missing and no package manager was
+    /// found (`can_offer_homebrew_install_ui`); 2-key confirm (first `b` arms, second
+    /// `b` opens Terminal). The sudo password is entered in Apple's Terminal — AI
+    /// Bridge never sees it. `is_macos` is injected so the gate is unit-testable.
+    fn handle_homebrew_install(&mut self, is_macos: bool) {
+        if !aibridge_core::cli_update::can_offer_homebrew_install_ui(is_macos, &self.cli_checks) {
+            self.brew_install_armed = false;
+            self.message = Some(
+                "Homebrew install is offered only on macOS when codex/claude are missing \
+                 and neither Homebrew nor npm is found."
+                    .into(),
+            );
+            return;
+        }
+        if !self.brew_install_armed {
+            self.brew_install_armed = true;
+            self.message = Some(
+                "Press `b` again to open macOS Terminal and install Homebrew. You'll enter \
+                 your Mac password in Terminal — AI Bridge never sees it."
+                    .into(),
+            );
+            return;
+        }
+        // Second press → hand off to Terminal.
+        self.brew_install_armed = false;
+        match (self.homebrew_opener)() {
+            Ok(()) => {
+                self.message = Some(
+                    "Opened macOS Terminal to install Homebrew. Finish it there (enter your \
+                     password), then come back and press `r` to re-check."
+                        .into(),
+                );
+            }
+            Err(e) => {
+                self.message = Some(format!(
+                    "could not open Terminal for the Homebrew install: {e}"
+                ));
+            }
+        }
+    }
+
     /// v0.25.0: cancel a Waiting/Staged self-update (`x` on the Update tab).
     fn cancel_staged_update(&mut self) {
         match aibridge_core::staged_update::cancel_pending() {
@@ -1812,6 +1878,10 @@ fn handle_key(app: &mut App, code: KeyCode) {
     if !matches!(code, KeyCode::Char('u')) {
         app.fresh_install_armed = None;
     }
+    // v0.27.0: any key other than `b` cancels a pending Homebrew-install 2-key confirm.
+    if !matches!(code, KeyCode::Char('b')) {
+        app.brew_install_armed = false;
+    }
     let in_tools = app.tab == Tab::Mcp && app.mcp_view == McpView::Tools;
     // Any key that ISN'T the matching 2nd press of a Skills mutate-confirm cancels it.
     let is_skills_mutate = app.tab == Tab::Skills
@@ -1944,6 +2014,11 @@ fn handle_key(app: &mut App, code: KeyCode) {
         // v0.25.0: staged self-update controls.
         KeyCode::Char('x') if app.tab == Tab::Update => app.cancel_staged_update(),
         KeyCode::Char('g') if app.tab == Tab::Update => app.retry_staged_update(),
+        // v0.27.0: macOS Homebrew Terminal-handoff (2-key confirm). Real macOS gate
+        // is passed at the call site so the handler stays unit-testable.
+        KeyCode::Char('b') if app.tab == Tab::Update => {
+            app.handle_homebrew_install(cfg!(target_os = "macos"))
+        }
         // Skills tab: sync (s) / migrate (m) MUTATE the filesystem → 2-key confirm.
         KeyCode::Char('s') if app.tab == Tab::Skills => {
             if app.skills_confirm_press('s') {
@@ -2732,6 +2807,23 @@ fn cli_row_status(c: &aibridge_core::cli_update::CliCheck) -> String {
     }
 }
 
+/// v0.27.0: the optional "install Homebrew" affordance line for the Update tab.
+/// `Some` only when [`can_offer_homebrew_install_ui`] holds (macOS + a missing
+/// codex/claude with no package manager). Pure → unit-testable on any host.
+fn homebrew_offer_line(
+    is_macos: bool,
+    checks: &[aibridge_core::cli_update::CliCheck],
+) -> Option<String> {
+    if aibridge_core::cli_update::can_offer_homebrew_install_ui(is_macos, checks) {
+        Some(
+            "  ↳ no package manager found — press 'b' to install Homebrew (opens Terminal)"
+                .to_string(),
+        )
+    } else {
+        None
+    }
+}
+
 fn render_update(f: &mut Frame, app: &App, area: Rect) {
     let mut items: Vec<ListItem> = Vec::new();
     let sel = app.update_sel;
@@ -2798,6 +2890,14 @@ fn render_update(f: &mut Frame, app: &App, area: Rect) {
         }
     }
 
+    // v0.27.0: macOS-only Homebrew install affordance (codex/claude missing, no PM).
+    if let Some(offer) = homebrew_offer_line(cfg!(target_os = "macos"), &app.cli_checks) {
+        items.push(ListItem::new(Line::from(Span::styled(
+            offer,
+            Style::default().fg(Color::Yellow),
+        ))));
+    }
+
     // MCP pins.
     if !app.mcp_pins.is_empty() {
         items.push(ListItem::new(Line::from("")));
@@ -2823,8 +2923,13 @@ fn render_update(f: &mut Frame, app: &App, area: Rect) {
     }
 
     items.push(ListItem::new(Line::from("")));
+    let mut help =
+        "↑/↓ navigate · 'c' check self · 'u' update selected row · 'r' re-check CLIs".to_string();
+    if homebrew_offer_line(cfg!(target_os = "macos"), &app.cli_checks).is_some() {
+        help.push_str(" · 'b' install Homebrew");
+    }
     items.push(ListItem::new(Line::from(Span::styled(
-        "↑/↓ navigate · 'c' check self · 'u' update selected row · 'r' re-check CLIs",
+        help,
         Style::default().fg(Color::DarkGray),
     ))));
 
@@ -2883,6 +2988,10 @@ mod tests {
             cli_update_starter: production_rtk_starter(),
             cli_stream_starter: production_cli_stream_starter(),
             fresh_install_armed: None,
+            // v0.27.0: tests default to an INERT Homebrew opener that records nothing
+            // and never spawns Terminal. Tests exercising the handoff install a fake.
+            homebrew_opener: std::sync::Arc::new(|| Ok(())),
+            brew_install_armed: false,
             active_cli_run: None,
             last_cli_run_result: None,
             pending_cli_recheck: false,
@@ -4470,5 +4579,126 @@ mod tests {
         );
         assert!(s.contains("verifying SHA256"), "active wins: {s}");
         assert!(!s.contains("[ok updated]"), "stale last hidden: {s}");
+    }
+
+    // ───── v0.27.0 Homebrew Terminal-handoff (`b` on the Update tab) ─────
+
+    type HomebrewCallCount = std::sync::Arc<std::sync::atomic::AtomicUsize>;
+
+    /// Fake opener: records call count, returns `result` each time, never spawns
+    /// Terminal.
+    fn fake_homebrew_opener(result: Result<(), String>) -> (HomebrewOpener, HomebrewCallCount) {
+        let count: HomebrewCallCount = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = count.clone();
+        let opener: HomebrewOpener = std::sync::Arc::new(move || {
+            c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            result.clone()
+        });
+        (opener, count)
+    }
+
+    fn codex_missing_no_pm() -> aibridge_core::cli_update::CliCheck {
+        use aibridge_core::cli_update::{CliCheck, InstallSource};
+        CliCheck {
+            tool: "codex",
+            current: None,
+            latest: None,
+            source: InstallSource::Unknown {
+                path: std::path::PathBuf::from("codex"),
+                reason: "neither brew nor npm".into(),
+            },
+            suggested_command: None,
+            manual_note: None,
+            installable: false,
+            auto_confirm: false,
+            installed: false,
+        }
+    }
+
+    #[test]
+    fn homebrew_offer_line_only_on_macos_with_missing_codex_no_pm() {
+        let checks = vec![codex_missing_no_pm()];
+        assert!(
+            super::homebrew_offer_line(true, &checks).is_some(),
+            "macOS offers"
+        );
+        assert!(
+            super::homebrew_offer_line(false, &checks).is_none(),
+            "off-macOS never offers"
+        );
+        // A normal installed tool (package manager present) → no offer even on macOS.
+        let installed = vec![status_check(true, Some("1.0.0"), Some("1.0.0"))];
+        assert!(super::homebrew_offer_line(true, &installed).is_none());
+    }
+
+    #[test]
+    fn homebrew_b_two_key_confirm_opens_terminal() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (opener, count) = fake_homebrew_opener(Ok(()));
+        let mut a = test_app(&[]);
+        a.homebrew_opener = opener;
+        a.tab = Tab::Update;
+        a.cli_checks = vec![codex_missing_no_pm()];
+        // First press arms; the opener is NOT called.
+        a.handle_homebrew_install(true);
+        assert!(a.brew_install_armed, "first b arms");
+        assert_eq!(count.load(SeqCst), 0, "opener not called on first press");
+        // Second press hands off to Terminal.
+        a.handle_homebrew_install(true);
+        assert!(!a.brew_install_armed, "disarmed after open");
+        assert_eq!(count.load(SeqCst), 1, "opener called exactly once");
+        let m = a.message.unwrap_or_default();
+        assert!(m.contains("press `r`"), "footer points at re-check: {m}");
+    }
+
+    #[test]
+    fn homebrew_b_off_macos_does_not_open() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (opener, count) = fake_homebrew_opener(Ok(()));
+        let mut a = test_app(&[]);
+        a.homebrew_opener = opener;
+        a.tab = Tab::Update;
+        a.cli_checks = vec![codex_missing_no_pm()];
+        a.handle_homebrew_install(false);
+        assert!(!a.brew_install_armed, "off-macOS never arms");
+        assert_eq!(count.load(SeqCst), 0, "off-macOS never opens Terminal");
+        let m = a.message.unwrap_or_default();
+        assert!(m.contains("only on macOS"), "footer: {m}");
+    }
+
+    #[test]
+    fn homebrew_b_open_error_surfaces_in_footer() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (opener, count) = fake_homebrew_opener(Err("Terminal not found".into()));
+        let mut a = test_app(&[]);
+        a.homebrew_opener = opener;
+        a.tab = Tab::Update;
+        a.cli_checks = vec![codex_missing_no_pm()];
+        a.handle_homebrew_install(true); // arm
+        a.handle_homebrew_install(true); // open → Err
+        assert_eq!(count.load(SeqCst), 1);
+        assert!(!a.brew_install_armed, "disarmed even on error");
+        let m = a.message.unwrap_or_default();
+        assert!(m.contains("could not open Terminal"), "footer: {m}");
+        assert!(
+            m.contains("Terminal not found"),
+            "error detail surfaced: {m}"
+        );
+    }
+
+    #[test]
+    fn homebrew_arm_cleared_by_intervening_non_b_key() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (opener, count) = fake_homebrew_opener(Ok(()));
+        let mut a = test_app(&[]);
+        a.homebrew_opener = opener;
+        a.tab = Tab::Update;
+        a.cli_checks = vec![codex_missing_no_pm()];
+        a.brew_install_armed = true;
+        // Any non-`b` key cancels the pending confirm (top-of-handle_key guard).
+        handle_key(&mut a, KeyCode::Down);
+        assert!(!a.brew_install_armed, "intervening key cancels the arm");
+        // The opener was never invoked by a navigation key.
+        assert_eq!(count.load(SeqCst), 0);
     }
 }

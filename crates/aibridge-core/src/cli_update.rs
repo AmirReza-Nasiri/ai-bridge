@@ -565,6 +565,59 @@ pub fn decide_action(check: &CliCheck, mode: Mode) -> Action {
     }
 }
 
+/// v0.27.0: true when a missing codex/claude has NO package manager to auto-install
+/// it (`source == Unknown` — neither brew nor npm found). Pure + cross-platform; the
+/// USER-FACING affordance must additionally gate on macOS via
+/// [`can_offer_homebrew_install_ui`]. rtk is excluded (it installs without a PM).
+pub fn should_offer_homebrew_install(checks: &[CliCheck]) -> bool {
+    checks.iter().any(|c| {
+        (c.tool == "codex" || c.tool == "claude")
+            && c.not_installed()
+            && matches!(c.source, InstallSource::Unknown { .. })
+    })
+}
+
+/// v0.27.0: the in-TUI "install Homebrew" affordance is shown/actioned ONLY on macOS
+/// AND when [`should_offer_homebrew_install`] holds. `is_macos` is passed by the caller
+/// (production: `cfg!(target_os = "macos")`) so this gate is unit-testable on any host
+/// — Windows/Linux must never offer Homebrew for a missing codex/claude.
+pub fn can_offer_homebrew_install_ui(is_macos: bool, checks: &[CliCheck]) -> bool {
+    is_macos && should_offer_homebrew_install(checks)
+}
+
+/// v0.27.0: the bash script handed to macOS Terminal to install Homebrew. FIXED
+/// content (no user input → no injection). Interactive by design: Terminal handles
+/// the installer's RETURN prompt + the sudo password — AI Bridge never sees the
+/// password. Handles both Homebrew prefixes (Apple-Silicon `/opt/homebrew`, Intel
+/// `/usr/local`) and appends `shellenv` to `~/.zprofile` idempotently.
+///
+/// Fails loudly (exit 1 + actionable message) when no `brew` exists after the
+/// installer runs — covers a failed `curl`, a declined sudo, or an aborted install.
+/// The installer is launched via `/bin/bash -c "$(curl …)"`, where a `curl` failure
+/// yields an empty (exit-0) command substitution, so `set -e` can't catch it; the
+/// post-install brew-existence probe is the authoritative success signal instead.
+pub fn homebrew_handoff_script() -> String {
+    r#"#!/bin/bash
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+BREW=""
+for B in /opt/homebrew/bin/brew /usr/local/bin/brew; do
+  if [ -x "$B" ]; then BREW="$B"; break; fi
+done
+if [ -z "$BREW" ]; then
+  echo "Homebrew install did not complete (no brew in /opt/homebrew/bin or /usr/local/bin)."
+  echo "Re-run this, or install manually from https://brew.sh, then return to AI Bridge."
+  exit 1
+fi
+LINE="eval \"\$($BREW shellenv)\""
+if ! grep -qF "$LINE" "$HOME/.zprofile" 2>/dev/null; then
+  echo "$LINE" >> "$HOME/.zprofile" || echo "warning: could not update ~/.zprofile; brew still works via AI Bridge's PATH fallback."
+fi
+eval "$($BREW shellenv)"
+echo "Homebrew step done -- go back to AI Bridge and press 'r' to re-check."
+"#
+    .to_string()
+}
+
 /// Pure prompt parser. Default-no: only an explicit yes accepts. Used by both
 /// CLI and TUI-after-exit code paths so default safety is consistent.
 pub fn prompt_parse(line: &str) -> bool {
@@ -1833,6 +1886,186 @@ mod tests {
         assert!(
             note.contains("Homebrew") || note.contains("npm"),
             "note: {note}"
+        );
+    }
+
+    // ─── v0.27.0 Homebrew install offer (Terminal-handoff) ───
+    fn codex_check(installed: bool, source: InstallSource) -> CliCheck {
+        CliCheck {
+            tool: "codex",
+            current: if installed {
+                parse_version("0.1.0")
+            } else {
+                None
+            },
+            latest: None,
+            source,
+            suggested_command: None,
+            manual_note: None,
+            installable: false,
+            auto_confirm: false,
+            installed,
+        }
+    }
+
+    #[test]
+    fn should_offer_homebrew_when_codex_missing_no_pm() {
+        let checks = vec![codex_check(
+            false,
+            InstallSource::Unknown {
+                path: PathBuf::from("codex"),
+                reason: "no pm".into(),
+            },
+        )];
+        assert!(should_offer_homebrew_install(&checks));
+    }
+
+    #[test]
+    fn should_offer_homebrew_when_claude_missing_no_pm() {
+        // Codex code-gate: the predicate covers `claude` too — guard against future
+        // narrowing to codex-only.
+        let checks = vec![CliCheck {
+            tool: "claude",
+            current: None,
+            latest: None,
+            source: InstallSource::Unknown {
+                path: PathBuf::from("claude"),
+                reason: "no pm".into(),
+            },
+            suggested_command: None,
+            manual_note: None,
+            installable: false,
+            auto_confirm: false,
+            installed: false,
+        }];
+        assert!(should_offer_homebrew_install(&checks));
+        assert!(can_offer_homebrew_install_ui(true, &checks));
+        assert!(!can_offer_homebrew_install_ui(false, &checks));
+    }
+
+    #[test]
+    fn should_not_offer_homebrew_for_rtk_only_missing() {
+        let checks = vec![CliCheck {
+            tool: "rtk",
+            current: None,
+            latest: parse_version("0.42.0"),
+            source: InstallSource::Unknown {
+                path: PathBuf::from("rtk"),
+                reason: "not installed".into(),
+            },
+            suggested_command: Some(vec!["x".into()]),
+            manual_note: None,
+            installable: true,
+            auto_confirm: false,
+            installed: false,
+        }];
+        assert!(!should_offer_homebrew_install(&checks));
+    }
+
+    #[test]
+    fn should_not_offer_homebrew_when_codex_installed_but_unknown_source() {
+        let checks = vec![codex_check(
+            true,
+            InstallSource::Unknown {
+                path: PathBuf::from("/usr/local/bin/codex"),
+                reason: "on PATH but unclassified".into(),
+            },
+        )];
+        assert!(!should_offer_homebrew_install(&checks));
+    }
+
+    #[test]
+    fn should_not_offer_homebrew_when_codex_fresh_install_pm_exists() {
+        let checks = vec![codex_check(
+            false,
+            InstallSource::FreshInstall {
+                method: FreshInstallMethod::Npm {
+                    package: "@openai/codex".into(),
+                },
+            },
+        )];
+        assert!(!should_offer_homebrew_install(&checks));
+    }
+
+    #[test]
+    fn should_not_offer_homebrew_when_all_installed() {
+        let checks = vec![codex_check(true, InstallSource::Cargo)];
+        assert!(!should_offer_homebrew_install(&checks));
+    }
+
+    #[test]
+    fn can_offer_ui_is_false_off_macos_even_when_should_offer() {
+        let checks = vec![codex_check(
+            false,
+            InstallSource::Unknown {
+                path: PathBuf::from("codex"),
+                reason: "no pm".into(),
+            },
+        )];
+        assert!(should_offer_homebrew_install(&checks));
+        assert!(
+            !can_offer_homebrew_install_ui(false, &checks),
+            "off-macOS must never offer"
+        );
+        assert!(can_offer_homebrew_install_ui(true, &checks), "macOS offers");
+    }
+
+    #[test]
+    fn can_offer_ui_false_on_macos_when_pm_exists() {
+        let checks = vec![codex_check(
+            false,
+            InstallSource::FreshInstall {
+                method: FreshInstallMethod::Brew {
+                    package: "codex".into(),
+                    is_cask: true,
+                },
+            },
+        )];
+        assert!(!can_offer_homebrew_install_ui(true, &checks));
+    }
+
+    #[test]
+    fn homebrew_handoff_script_is_dual_prefix_idempotent_and_secretless() {
+        let s = homebrew_handoff_script();
+        assert!(s.contains("raw.githubusercontent.com/Homebrew/install/HEAD/install.sh"));
+        assert!(s.contains("/opt/homebrew/bin/brew"), "Apple Silicon prefix");
+        assert!(s.contains("/usr/local/bin/brew"), "Intel prefix");
+        assert!(s.contains("grep -qF"), "idempotent .zprofile guard");
+        assert!(s.contains("press 'r' to re-check"));
+        // no secret / no password / no NONINTERACTIVE (Terminal is interactive)
+        assert!(!s.to_lowercase().contains("password"));
+        assert!(!s.contains("NONINTERACTIVE"));
+    }
+
+    #[test]
+    fn homebrew_handoff_script_fails_loudly_when_brew_missing() {
+        // Codex code-gate: a failed curl / declined sudo / aborted install must NOT
+        // print the success line. The script probes for brew and `exit 1`s if absent.
+        let s = homebrew_handoff_script();
+        assert!(s.contains("exit 1"), "must abort when brew is missing");
+        assert!(
+            s.contains("did not complete"),
+            "must surface an actionable failure message"
+        );
+        // The failure branch is gated on the brew-existence probe, not unconditional.
+        assert!(
+            s.contains("if [ -z \"$BREW\" ]"),
+            "failure is conditional on no brew"
+        );
+    }
+
+    #[test]
+    fn homebrew_handoff_script_warns_on_zprofile_append_failure() {
+        // Codex code-gate: a FAILED ~/.zprofile append must not be silent under a
+        // printed "success" line — the append carries a `|| echo warning` fallback.
+        let s = homebrew_handoff_script();
+        assert!(
+            s.contains(">> \"$HOME/.zprofile\" || echo"),
+            "append failure must fall through to a warning"
+        );
+        assert!(
+            s.contains("could not update ~/.zprofile"),
+            "warning text must be actionable"
         );
     }
 
