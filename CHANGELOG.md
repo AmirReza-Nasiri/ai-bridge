@@ -6,6 +6,50 @@ versioning is semver.
 
 ## [Unreleased]
 
+## [0.26.0] - 2026-05-28
+
+macOS CLI-detection fixes, diagnosed on a clean Apple Silicon Mac by the macOS side
+(see `docs/macos-cli-detection.md`).
+
+### Fixed
+- **A not-installed CLI was reported as "up-to-date" on macOS.** With codex/claude not
+  installed and no Homebrew/npm, the Update tab and `update --check` showed
+  `[codex] up-to-date (?)` while `doctor` correctly said "not found". Detection now
+  uses a typed `CliStatus` (NotInstalled / VersionUnknown / UpToDate / Outdated) as the
+  single source of truth for both the label and the update decision: a missing tool
+  reads "not installed" (with an actionable Homebrew/npm note), and an installed tool
+  whose `--version` is unreadable reads "installed (version unknown)" — and is NEVER
+  auto-updated (it can't be compared) nor mislabeled "up-to-date". Both the CLI
+  (`decide_action`) and the TUI (`u` key) gate on this status. Missing-but-installable
+  tools (rtk, or codex/claude when brew/npm exist) stay actionable (install).
+
+### Added
+- **macOS launchd-PATH fallback for executable detection.** Claude Code is a GUI app;
+  on macOS it spawns the MCP server with the minimal launchd PATH
+  (`/usr/bin:/bin:/usr/sbin:/sbin`), not the user's interactive shell PATH — so tools
+  in `/opt/homebrew/bin`, `~/.local/bin`, `~/.cargo/bin`, or an npm global bin were
+  invisible to the server even when on the user's terminal PATH. `find_executable` now
+  retries those directories (arch-aware: Homebrew's Apple-Silicon prefix first) on a
+  PATH miss. Normal PATH resolution always wins (additive on miss, never shadows a real
+  hit); bare names only; macOS-only (Linux unchanged). The pure resolution helpers are
+  unit-tested cross-platform; the live GUI-spawn behavior should be smoke-tested on a
+  Mac by the platform owner.
+
+### Internal
+- `cli_update`: `CliStatus` enum + `CliCheck::{status, installed, not_installed}`;
+  `decide_action` restructured around `status()`; `not_installed_note` helper.
+- `aibridge-platform`: pure `is_bare_name` / `fallback_dirs_for_arch` / `find_in_dirs`
+  / `resolve_with_fallback` helpers (cross-platform tested) + `UnixPlatform::find_executable` wiring.
+- TUI: `cli_row_status` pure formatter; `handle_update_action` status gate.
+
+### Tests
+- +19 (workspace total 522): not-installed vs version-unknown status + action matrix
+  (Check/InteractiveTty/YesAuto), rtk mapping, cli_row_status, and the launchd-PATH
+  resolution helpers (bare-name guard incl. backslash, arch ordering, primary-wins).
+
+### Credit
+- macOS diagnosis + the Bug-1 fix design: the macOS maintainer (`macos-fix` branch).
+
 ## [0.25.0] - 2026-05-28
 
 Everything-in-TUI updates: the dashboard no longer drops you to a shell for ANY

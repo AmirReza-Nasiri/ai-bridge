@@ -10,7 +10,14 @@ pub struct UnixPlatform;
 
 impl Platform for UnixPlatform {
     fn find_executable(name: &str) -> Result<PathBuf> {
-        which::which(name).with_context(|| format!("executable '{name}' not on PATH"))
+        // Normal PATH resolution ALWAYS wins. On macOS, a GUI-launched MCP server
+        // (Claude Code) inherits the minimal launchd PATH (/usr/bin:/bin:…), so tools
+        // in /opt/homebrew/bin, ~/.local/bin, ~/.cargo/bin, or an npm global bin are
+        // invisible to `which`. On a miss we retry the common macOS bin dirs (bare
+        // names only; additive — never shadows a real PATH hit). v0.26.0.
+        let fallback = macos_fallback_dirs();
+        crate::resolve_with_fallback(name, |n| which::which(n).ok(), &fallback)
+            .with_context(|| format!("executable '{name}' not on PATH"))
     }
 
     fn config_dir() -> Result<PathBuf> {
@@ -30,5 +37,21 @@ impl Platform for UnixPlatform {
             SpawnKind::Direct,
             exe.display().to_string(),
         )
+    }
+}
+
+/// macOS launchd-PATH fallback dirs (arch-aware via `cfg!(target_arch)`), HOME
+/// expanded. Empty on non-macOS unix (Linux keeps plain `which` behavior). v0.26.0.
+fn macos_fallback_dirs() -> Vec<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        match directories::BaseDirs::new() {
+            Some(b) => crate::fallback_dirs_for_arch(b.home_dir(), cfg!(target_arch = "aarch64")),
+            None => Vec::new(),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Vec::new()
     }
 }

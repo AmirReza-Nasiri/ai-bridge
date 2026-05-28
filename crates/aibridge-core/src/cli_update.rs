@@ -121,6 +121,29 @@ pub struct CliCheck {
     /// `FreshInstall` — first installs always require an explicit prompt.
     /// Default: false (preserves existing prompt-always behavior for batch flows).
     pub auto_confirm: bool,
+    /// v0.26.0: whether the tool is actually present on the system (resolved on PATH
+    /// for codex/claude; a non-`NotInstalled` rtk target for rtk). The AUTHORITATIVE
+    /// missing-vs-installed signal — distinct from `current` (which is also `None`
+    /// when an installed tool's `--version` is unparsable) and from the ambiguous
+    /// `InstallSource::Unknown`. Drives [`CliStatus`].
+    pub installed: bool,
+}
+
+/// v0.26.0: the user-facing state of a CLI row. Single source of truth for both the
+/// label (TUI/CLI) and the mutation decision, so "installed but version unknown" can
+/// never be mislabeled "up to date" nor auto-updated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CliStatus {
+    /// Not present on the system. May still be actionable (install) when a safe
+    /// `suggested_command` exists (FreshInstall / rtk install).
+    NotInstalled,
+    /// Present, but `--version` could not be read/parsed. No safe auto-action — we
+    /// can't tell if it's outdated, so never prompt/run; never claim "up to date".
+    VersionUnknown,
+    /// Present and either at/above latest, or latest is unknown (untrusted channel).
+    UpToDate,
+    /// Present and a newer version is known. Actionable (update) when safe.
+    Outdated,
 }
 
 /// v0.22.0: typed intent passed from the TUI to the rtk-native worker — `Update`
@@ -133,17 +156,38 @@ pub enum RtkNativeAction {
 }
 
 impl CliCheck {
-    pub fn up_to_date(&self) -> bool {
-        if self.installable {
-            // Missing-installable is NOT up-to-date — it needs action.
-            return false;
+    /// v0.26.0: the single source of truth for label + mutation decisions.
+    pub fn status(&self) -> CliStatus {
+        if !self.installed {
+            return CliStatus::NotInstalled;
         }
         match (&self.current, &self.latest) {
-            (Some(c), Some(l)) => c >= l,
-            // If either side is unknown, we can't claim up-to-date OR outdated;
-            // render as "unknown".
-            _ => true,
+            // Present but `--version` unreadable → version unknown (no safe action).
+            (None, _) => CliStatus::VersionUnknown,
+            // Present, upstream channel unknown/untrusted → can't claim outdated.
+            (Some(_), None) => CliStatus::UpToDate,
+            (Some(c), Some(l)) => {
+                if c >= l {
+                    CliStatus::UpToDate
+                } else {
+                    CliStatus::Outdated
+                }
+            }
         }
+    }
+
+    /// `true` ONLY when the tool is present AND known to be at/above latest (or its
+    /// upstream channel is untrusted). `VersionUnknown` and `NotInstalled` are NOT
+    /// up-to-date — they must never be labeled or treated as such.
+    pub fn up_to_date(&self) -> bool {
+        matches!(self.status(), CliStatus::UpToDate)
+    }
+
+    /// `true` when the tool is not present on the system (drives the "not installed"
+    /// label instead of a misleading version comparison). Distinct from
+    /// `VersionUnknown` (present, version unreadable).
+    pub fn not_installed(&self) -> bool {
+        matches!(self.status(), CliStatus::NotInstalled)
     }
 
     /// `true` only when AI Bridge is willing to auto-run `suggested_command`
@@ -446,15 +490,35 @@ pub fn effective_mode(check: bool, yes: bool, is_tty: bool) -> Mode {
 
 /// Decide what to do for one [`CliCheck`] under the given [`Mode`]. Pure.
 pub fn decide_action(check: &CliCheck, mode: Mode) -> Action {
-    if check.up_to_date() {
-        return Action::Skip {
-            reason: format!("{} is up to date", check.tool),
-        };
+    match check.status() {
+        CliStatus::UpToDate => {
+            return Action::Skip {
+                reason: format!("{} is up to date", check.tool),
+            };
+        }
+        // Present but version unreadable: NEVER auto-update (can't tell if outdated)
+        // and NEVER call it "up to date".
+        CliStatus::VersionUnknown => {
+            return Action::Skip {
+                reason: format!(
+                    "{}: installed but version unknown — not auto-updating",
+                    check.tool
+                ),
+            };
+        }
+        // NotInstalled (may be installable) | Outdated → fall through to the
+        // command/mode logic below.
+        CliStatus::NotInstalled | CliStatus::Outdated => {}
     }
     let Some(argv) = &check.suggested_command else {
+        let lead = if check.not_installed() {
+            "not installed"
+        } else {
+            "manual update"
+        };
         return Action::Skip {
             reason: format!(
-                "{}: manual update — {}",
+                "{}: {lead} — {}",
                 check.tool,
                 check.manual_note.as_deref().unwrap_or("see docs")
             ),
@@ -956,6 +1020,11 @@ pub fn check_codex_with(runner: &dyn CommandRunner, resolver: &dyn PathResolver)
             (None, Some(argv), Some(note), true)
         }
     };
+    // v0.26.0: when codex is NOT on PATH and no package manager was available to
+    // auto-install (source stayed Unknown), replace the generic "unknown source …"
+    // note with an actionable not-installed message. `Some(...).or(note)` makes the
+    // missing-tool note WIN over the generic one.
+    let note = not_installed_note(tool_path.is_some(), &source, "codex").or(note);
     CliCheck {
         tool: "codex",
         current,
@@ -965,6 +1034,24 @@ pub fn check_codex_with(runner: &dyn CommandRunner, resolver: &dyn PathResolver)
         manual_note: note,
         installable,
         auto_confirm: false,
+        installed: tool_path.is_some(),
+    }
+}
+
+/// v0.26.0: build a clear not-installed note when a CLI is missing (not on PATH) AND
+/// no package manager was found to auto-install it (`source` stayed `Unknown`).
+/// Returns `None` in every other case so the caller keeps its existing note. Because
+/// callers apply it as `not_installed_note(...).or(existing)`, a `Some` here WINS
+/// over the generic "unknown source …; update manually" wrapper.
+fn not_installed_note(installed: bool, source: &InstallSource, tool: &str) -> Option<String> {
+    if !installed && matches!(source, InstallSource::Unknown { .. }) {
+        Some(format!(
+            "{tool} is not installed, and neither Homebrew nor npm was found to \
+             auto-install it. Install Homebrew (https://brew.sh) or Node.js/npm, \
+             then press 'u'; or install {tool} manually."
+        ))
+    } else {
+        None
     }
 }
 
@@ -1094,6 +1181,7 @@ pub fn check_claude_with(runner: &dyn CommandRunner, resolver: &dyn PathResolver
             (None, Some(argv), Some(note), true)
         }
     };
+    let note = not_installed_note(tool_path.is_some(), &source, "claude").or(note);
     CliCheck {
         tool: "claude",
         current,
@@ -1103,6 +1191,7 @@ pub fn check_claude_with(runner: &dyn CommandRunner, resolver: &dyn PathResolver
         manual_note: note,
         installable,
         auto_confirm: false,
+        installed: tool_path.is_some(),
     }
 }
 
@@ -1203,6 +1292,10 @@ pub fn check_rtk_with(runner: &dyn CommandRunner, resolver: &dyn PathResolver) -
         manual_note: note,
         installable,
         auto_confirm: false,
+        // v0.26.0: only `NotInstalled` is genuinely absent; Brew/NativeBin/Unknown/
+        // Unsupported all mean rtk is present (or ambiguously present) → never render
+        // "not installed" for those.
+        installed: !matches!(target, crate::rtk::RtkTarget::NotInstalled { .. }),
     }
 }
 
@@ -1549,6 +1642,7 @@ mod tests {
             manual_note: Some("brew upgrade codex".into()),
             installable: false,
             auto_confirm: false,
+            installed: true,
         }
     }
     fn check_outdated_native() -> CliCheck {
@@ -1563,6 +1657,7 @@ mod tests {
             manual_note: Some("see https://claude.com/download".into()),
             installable: false,
             auto_confirm: false,
+            installed: true,
         }
     }
 
@@ -1612,6 +1707,135 @@ mod tests {
             _ => panic!(),
         }
     }
+    // ─── v0.26.0 macOS: not-installed vs version-unknown status ───
+    fn missing_no_pm(tool: &'static str) -> CliCheck {
+        CliCheck {
+            tool,
+            current: None,
+            latest: None,
+            source: InstallSource::Unknown {
+                path: PathBuf::from(tool),
+                reason: format!("{tool} not on PATH and no package manager (brew/npm) available"),
+            },
+            suggested_command: None,
+            manual_note: Some(format!("{tool} is not installed…")),
+            installable: false,
+            auto_confirm: false,
+            installed: false,
+        }
+    }
+
+    #[test]
+    fn not_installed_is_never_up_to_date() {
+        let c = missing_no_pm("codex");
+        assert_eq!(c.status(), CliStatus::NotInstalled);
+        assert!(!c.up_to_date(), "a missing tool must not be up-to-date");
+        assert!(c.not_installed());
+    }
+
+    #[test]
+    fn not_installed_action_leads_with_not_installed_in_all_modes() {
+        let c = missing_no_pm("codex");
+        for mode in [Mode::Check, Mode::InteractiveTty, Mode::YesAuto] {
+            match decide_action(&c, mode) {
+                Action::Skip { reason } => {
+                    assert!(reason.contains("not installed"), "{mode:?}: `{reason}`");
+                    assert!(!reason.contains("manual update"), "{mode:?}: `{reason}`");
+                    assert!(!reason.contains("up to date"), "{mode:?}: `{reason}`");
+                }
+                other => panic!("{mode:?}: expected Skip, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn installed_version_unknown_is_not_up_to_date_and_never_runs() {
+        // Installed (on PATH) Brew tool whose `--version` is unparsable: current=None,
+        // latest=Some, suggested=Some. Must be VersionUnknown → Skip in EVERY mode,
+        // and must NOT say "up to date".
+        let c = CliCheck {
+            tool: "codex",
+            current: None,
+            latest: parse_version("0.132.0"),
+            source: InstallSource::Brew {
+                package: "codex".into(),
+            },
+            suggested_command: Some(vec!["brew".into(), "upgrade".into(), "codex".into()]),
+            manual_note: None,
+            installable: false,
+            auto_confirm: false,
+            installed: true,
+        };
+        assert_eq!(c.status(), CliStatus::VersionUnknown);
+        assert!(!c.up_to_date(), "version-unknown is not up-to-date");
+        assert!(
+            !c.not_installed(),
+            "version-unknown is installed, not missing"
+        );
+        for mode in [Mode::Check, Mode::InteractiveTty, Mode::YesAuto] {
+            match decide_action(&c, mode) {
+                Action::Skip { reason } => {
+                    assert!(reason.contains("version unknown"), "{mode:?}: `{reason}`");
+                    assert!(!reason.contains("up to date"), "{mode:?}: `{reason}`");
+                }
+                other => panic!("{mode:?}: must NOT run a version-unknown tool: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn on_path_unknown_source_is_not_not_installed() {
+        // Installed (installed=true) but source couldn't be classified + version
+        // unreadable → VersionUnknown, NOT NotInstalled (no false "not installed").
+        let c = CliCheck {
+            tool: "codex",
+            current: None,
+            latest: None,
+            source: InstallSource::Unknown {
+                path: PathBuf::from("/usr/local/bin/codex"),
+                reason: "on PATH but unclassified".into(),
+            },
+            suggested_command: None,
+            manual_note: None,
+            installable: false,
+            auto_confirm: false,
+            installed: true,
+        };
+        assert_eq!(c.status(), CliStatus::VersionUnknown);
+        assert!(!c.not_installed());
+    }
+
+    #[test]
+    fn check_codex_missing_no_pm_has_clear_not_installed_note() {
+        let r = FakeCommandRunner::new();
+        r.set("codex", &["--version"], false, "");
+        let resolver = FakePathResolver::new();
+        let c = check_codex_with(&r, &resolver);
+        assert!(c.not_installed());
+        assert!(!c.up_to_date());
+        let note = c.manual_note.expect("note present");
+        assert!(note.contains("not installed"), "note: {note}");
+        assert!(
+            note.contains("Homebrew") || note.contains("npm"),
+            "note should point at brew/npm: {note}"
+        );
+    }
+
+    #[test]
+    fn check_claude_missing_no_pm_has_clear_not_installed_note() {
+        let r = FakeCommandRunner::new();
+        r.set("claude", &["--version"], false, "");
+        let resolver = FakePathResolver::new();
+        let c = check_claude_with(&r, &resolver);
+        assert!(c.not_installed());
+        let note = c.manual_note.expect("note present");
+        assert!(note.contains("not installed"), "note: {note}");
+        assert!(
+            note.contains("Homebrew") || note.contains("npm"),
+            "note: {note}"
+        );
+    }
+
     #[test]
     fn string_compare_trap_regression() {
         // Lexicographically, "0.10.0" < "0.9.9" — but as semver, "0.10.0" > "0.9.9".
@@ -1627,6 +1851,7 @@ mod tests {
             manual_note: None,
             installable: false,
             auto_confirm: false,
+            installed: true,
         };
         assert!(c.up_to_date(), "0.10.0 must be >= 0.9.9");
     }
@@ -1642,6 +1867,7 @@ mod tests {
             manual_note: None,
             installable: false,
             auto_confirm: false,
+            installed: true,
         };
         assert!(c.up_to_date());
         assert!(matches!(
@@ -1935,6 +2161,7 @@ mod tests {
             manual_note: None,
             installable: true,
             auto_confirm: false,
+            installed: false,
         }
     }
     #[test]

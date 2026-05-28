@@ -85,6 +85,233 @@ impl SpawnPlan {
     }
 }
 
+// ───────────────────────── executable-resolution helpers (v0.26.0) ─────────────────────────
+//
+// Pure, cross-platform helpers for the macOS launchd-PATH fallback (see `unix.rs`).
+// They live here (not in the unix-only module) so they compile + unit-test on EVERY
+// platform — the macOS GUI-spawn (launchd) failure class can't be reproduced from a
+// Windows dev box, so thorough cross-platform unit tests are the primary safety net.
+
+/// True only for a SIMPLE executable name (e.g. `codex`, `brew`) — exactly one normal
+/// path component, no separators, not absolute, no `.`/`..`. Fallback-directory search
+/// applies ONLY to bare names; an absolute path or a name with separators is left to
+/// the normal resolver (which already handles those) so we never silently redirect a
+/// caller's explicit path to a fallback dir.
+///
+/// Used in production only on macOS (via `unix.rs`); cross-platform-tested. Allowed
+/// dead on non-unix where `unix.rs` (the sole production caller) isn't compiled.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn is_bare_name(name: &str) -> bool {
+    use std::path::Component;
+    // Reject separators explicitly: on Unix `\` is NOT a path separator, so a name
+    // like `dir\codex` would otherwise parse as one Normal component and slip through.
+    if name.is_empty() || name.contains('/') || name.contains('\\') {
+        return false;
+    }
+    let p = std::path::Path::new(name);
+    let mut comps = p.components();
+    matches!(
+        (comps.next(), comps.next()),
+        (Some(Component::Normal(_)), None)
+    )
+}
+
+/// macOS fallback bin directories, arch-aware. `apple_silicon` picks Homebrew's
+/// Apple-Silicon prefix (`/opt/homebrew/bin`) first; Intel puts `/usr/local/bin`
+/// first. `home` is expanded by the caller (never a literal `~`). Pure → both
+/// orderings are unit-testable regardless of the host architecture.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn fallback_dirs_for_arch(home: &std::path::Path, apple_silicon: bool) -> Vec<PathBuf> {
+    let brew_silicon = PathBuf::from("/opt/homebrew/bin");
+    let brew_intel = PathBuf::from("/usr/local/bin");
+    let user = [
+        home.join(".local/bin"),
+        home.join(".cargo/bin"),
+        home.join(".npm-global/bin"),
+    ];
+    let mut dirs = Vec::with_capacity(5);
+    if apple_silicon {
+        dirs.push(brew_silicon);
+        dirs.push(brew_intel);
+    } else {
+        dirs.push(brew_intel);
+        dirs.push(brew_silicon);
+    }
+    dirs.extend(user);
+    dirs
+}
+
+/// First directory in `dirs` that holds an executable regular file named `name`.
+/// Returns `None` for a non-bare `name` (see [`is_bare_name`]). On Unix, requires the
+/// owner/group/other execute bit; elsewhere a regular file is enough.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn find_in_dirs(name: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
+    if !is_bare_name(name) {
+        return None;
+    }
+    for dir in dirs {
+        let candidate = dir.join(name);
+        let Ok(meta) = std::fs::metadata(&candidate) else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if meta.permissions().mode() & 0o111 == 0 {
+                continue; // not executable
+            }
+        }
+        return Some(candidate);
+    }
+    None
+}
+
+/// Resolve `name` via `primary` FIRST (the normal PATH lookup); only on a miss try the
+/// `fallback` directories. This guarantees normal-PATH resolution always wins — the
+/// fallback can never shadow or reorder a result the OS PATH already provides.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn resolve_with_fallback(
+    name: &str,
+    primary: impl Fn(&str) -> Option<PathBuf>,
+    fallback: &[PathBuf],
+) -> Option<PathBuf> {
+    if let Some(p) = primary(name) {
+        return Some(p);
+    }
+    find_in_dirs(name, fallback)
+}
+
+#[cfg(test)]
+mod resolve_tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn is_bare_name_accepts_simple_names() {
+        assert!(is_bare_name("codex"));
+        assert!(is_bare_name("brew"));
+        assert!(is_bare_name("aibridge.exe"));
+    }
+
+    #[test]
+    fn is_bare_name_rejects_absolute_and_separators_and_dotdot() {
+        assert!(!is_bare_name("/usr/local/bin/codex"));
+        assert!(!is_bare_name("dir/codex"));
+        assert!(!is_bare_name("..")); // CurDir/ParentDir are not Normal
+        assert!(!is_bare_name("."));
+        assert!(!is_bare_name(""));
+    }
+
+    #[test]
+    fn is_bare_name_rejects_backslash_on_all_platforms() {
+        // On Unix `\` is not a path separator, but a spawn primitive must still
+        // refuse to reinterpret a separator-containing command into a fallback dir.
+        assert!(!is_bare_name("dir\\codex"));
+        assert!(!is_bare_name("C:\\codex.exe"));
+    }
+
+    #[test]
+    fn fallback_dirs_apple_silicon_homebrew_first() {
+        let home = Path::new("/Users/x");
+        let d = fallback_dirs_for_arch(home, true);
+        assert_eq!(d[0], PathBuf::from("/opt/homebrew/bin"));
+        assert_eq!(d[1], PathBuf::from("/usr/local/bin"));
+        assert!(d.contains(&home.join(".cargo/bin")));
+        assert!(d.contains(&home.join(".local/bin")));
+        assert!(d.contains(&home.join(".npm-global/bin")));
+    }
+
+    #[test]
+    fn fallback_dirs_intel_usrlocal_first() {
+        let d = fallback_dirs_for_arch(Path::new("/Users/x"), false);
+        assert_eq!(d[0], PathBuf::from("/usr/local/bin"));
+        assert_eq!(d[1], PathBuf::from("/opt/homebrew/bin"));
+    }
+
+    #[test]
+    fn fallback_dirs_expand_home_not_tilde() {
+        let d = fallback_dirs_for_arch(Path::new("/Users/amir"), true);
+        assert!(d.iter().all(|p| !p.to_string_lossy().contains('~')));
+        assert!(d.contains(&PathBuf::from("/Users/amir/.cargo/bin")));
+    }
+
+    #[test]
+    fn find_in_dirs_rejects_non_bare_name() {
+        let tmp = std::env::temp_dir();
+        assert!(find_in_dirs("/abs/codex", std::slice::from_ref(&tmp)).is_none());
+        assert!(find_in_dirs("dir/codex", &[tmp]).is_none());
+    }
+
+    #[test]
+    fn find_in_dirs_first_match_wins_and_skips_missing() {
+        let base = std::env::temp_dir().join(format!(
+            "aibridge-findtest-{}-{}",
+            std::process::id(),
+            now_nanos()
+        ));
+        let d1 = base.join("d1");
+        let d2 = base.join("d2");
+        std::fs::create_dir_all(&d1).unwrap();
+        std::fs::create_dir_all(&d2).unwrap();
+        // Tool only in d2 → found there; d1 (missing) skipped.
+        write_exec(&d2.join(exe_name("tool")));
+        let got = find_in_dirs(&exe_name("tool"), &[d1.clone(), d2.clone()]);
+        assert_eq!(got, Some(d2.join(exe_name("tool"))));
+        // Now also in d1 → first dir wins.
+        write_exec(&d1.join(exe_name("tool")));
+        let got2 = find_in_dirs(&exe_name("tool"), &[d1.clone(), d2.clone()]);
+        assert_eq!(got2, Some(d1.join(exe_name("tool"))));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn resolve_primary_wins_even_when_fallback_has_competing() {
+        let primary_hit = PathBuf::from("/from/path/codex");
+        let fb = vec![std::env::temp_dir()];
+        // Even if a fallback file existed, primary's Some short-circuits before lookup.
+        let got = resolve_with_fallback("codex", |_| Some(primary_hit.clone()), &fb);
+        assert_eq!(got, Some(primary_hit));
+    }
+
+    #[test]
+    fn resolve_uses_fallback_only_on_primary_miss() {
+        let base = std::env::temp_dir().join(format!(
+            "aibridge-resolvetest-{}-{}",
+            std::process::id(),
+            now_nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        write_exec(&base.join(exe_name("mytool")));
+        let got = resolve_with_fallback(&exe_name("mytool"), |_| None, std::slice::from_ref(&base));
+        assert_eq!(got, Some(base.join(exe_name("mytool"))));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ---- helpers ----
+    fn now_nanos() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    }
+    fn exe_name(stem: &str) -> String {
+        // The test creates a real file; on Windows our find_in_dirs only checks
+        // is_file (no extension requirement), so a bare stem works on all platforms.
+        stem.to_string()
+    }
+    fn write_exec(path: &Path) {
+        std::fs::write(path, b"#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+}
+
 mod clipboard_helper;
 
 #[cfg(unix)]

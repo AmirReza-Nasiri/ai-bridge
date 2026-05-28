@@ -1302,17 +1302,38 @@ impl App {
         let cli_idx = idx - 1;
         if cli_idx < self.cli_checks.len() {
             let c = &self.cli_checks[cli_idx];
-            if c.up_to_date() {
-                self.message = Some(format!("{} is up to date — nothing to do.", c.tool));
-                return;
+            // v0.26.0: gate on the typed status BEFORE any mutation path, so an
+            // installed-but-version-unknown tool can never auto-update (and is never
+            // mislabeled "up to date"). NotInstalled/Outdated fall through to the
+            // existing install/update logic.
+            use aibridge_core::cli_update::CliStatus;
+            match c.status() {
+                CliStatus::UpToDate => {
+                    self.message = Some(format!("{} is up to date — nothing to do.", c.tool));
+                    return;
+                }
+                CliStatus::VersionUnknown => {
+                    self.message = Some(format!(
+                        "{}: installed but version unknown — not auto-updating \
+                         (re-check after fixing its --version).",
+                        c.tool
+                    ));
+                    return;
+                }
+                CliStatus::NotInstalled | CliStatus::Outdated => {}
             }
             // v0.20.0 R7 B3: use `safe_to_auto_run` so the trusted internal
             // `aibridge rtk install/update --yes` form is also accepted (and a
             // stale-PATH "aibridge" path is rejected).
             if c.suggested_command.is_none() || !c.safe_to_auto_run() {
                 // Manual-only / unknown — show the hint, no mutation.
+                let lead = if c.not_installed() {
+                    "not installed"
+                } else {
+                    "manual update"
+                };
                 self.message = Some(format!(
-                    "{}: manual update — {}",
+                    "{}: {lead} — {}",
                     c.tool,
                     c.manual_note.as_deref().unwrap_or("see docs")
                 ));
@@ -2684,6 +2705,33 @@ fn staged_status_line(st: &aibridge_core::staged_update::UpdateStatus) -> Option
     })
 }
 
+/// v0.26.0: pure status text for a CLI-update row. Single source of truth for the
+/// label, driven by `CliCheck::status()` so a missing tool reads "not installed" and
+/// an installed-but-unparsable tool reads "installed (version unknown)" — never a
+/// misleading "up-to-date (?)" / "? → ?".
+fn cli_row_status(c: &aibridge_core::cli_update::CliCheck) -> String {
+    use aibridge_core::cli_update::CliStatus;
+    let cur = c
+        .current
+        .as_ref()
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "?".into());
+    let latest = c
+        .latest
+        .as_ref()
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "?".into());
+    match c.status() {
+        CliStatus::NotInstalled => match &c.latest {
+            Some(l) => format!("not installed  (latest {l})"),
+            None => "not installed".to_string(),
+        },
+        CliStatus::VersionUnknown => "installed  (version unknown)".to_string(),
+        CliStatus::UpToDate => format!("up-to-date  ({cur})"),
+        CliStatus::Outdated => format!("{cur} → {latest}"),
+    }
+}
+
 fn render_update(f: &mut Frame, app: &App, area: Rect) {
     let mut items: Vec<ListItem> = Vec::new();
     let sel = app.update_sel;
@@ -2721,21 +2769,7 @@ fn render_update(f: &mut Frame, app: &App, area: Rect) {
     }
     for (i, c) in app.cli_checks.iter().enumerate() {
         let row_idx = 1 + i;
-        let cur = c
-            .current
-            .as_ref()
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "?".into());
-        let latest = c
-            .latest
-            .as_ref()
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "?".into());
-        let status = if c.up_to_date() {
-            format!("up-to-date  ({cur})")
-        } else {
-            format!("{cur} → {latest}")
-        };
+        let status = cli_row_status(c);
         // v0.22.0 (Codex code-gate B4 R2): row decoration extracted to a pure
         // helper for unit testing of all 6 active/last branches.
         let active_args = app
@@ -3244,6 +3278,7 @@ mod tests {
             manual_note: Some("see https://claude.com/download".into()),
             installable: false,
             auto_confirm: false,
+            installed: true,
         }];
         a.update_sel = 1; // first CLI row
         a.handle_update_action();
@@ -3278,6 +3313,7 @@ mod tests {
             manual_note: None,
             installable: false,
             auto_confirm: false,
+            installed: true,
         }];
         a.update_sel = 1;
         a.handle_update_action();
@@ -3614,6 +3650,8 @@ mod tests {
             manual_note: Some("press 'u' …".into()),
             installable,
             auto_confirm: false,
+            // installable rtk = NotInstalled (missing); else native/brew install present.
+            installed: !installable,
         }
     }
 
@@ -3685,6 +3723,7 @@ mod tests {
             manual_note: None,
             installable: false,
             auto_confirm: false,
+            installed: true,
         }];
         a.update_sel = 1;
         a.handle_update_action();
@@ -3714,6 +3753,7 @@ mod tests {
             manual_note: None,
             installable: false,
             auto_confirm: false,
+            installed: true,
         }];
         a.update_sel = 1;
         a.handle_update_action();
@@ -3746,6 +3786,7 @@ mod tests {
             manual_note: None,
             installable: false,
             auto_confirm: false,
+            installed: true,
         }];
         a.update_sel = 1;
         a.handle_update_action();
@@ -3782,6 +3823,7 @@ mod tests {
             manual_note: None,
             installable: true,
             auto_confirm: false,
+            installed: false,
         }];
         a.update_sel = 1;
         // First press → arms, does NOT run.
@@ -3825,6 +3867,7 @@ mod tests {
             manual_note: None,
             installable: true,
             auto_confirm: false,
+            installed: false,
         }];
         a.update_sel = 1;
         a.handle_update_action();
@@ -3869,6 +3912,7 @@ mod tests {
                 manual_note: None,
                 installable: true,
                 auto_confirm: false,
+                installed: false,
             }];
             a.update_sel = 1;
             // First `u` arms.
@@ -3921,12 +3965,128 @@ mod tests {
             manual_note: Some("manual update — test".into()),
             installable: false,
             auto_confirm: false,
+            installed: true,
         }];
         a.update_sel = 1;
         a.handle_update_action();
         assert!(!a.quit);
         assert!(a.active_cli_run.is_none());
         assert!(recorded.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn update_u_on_version_unknown_does_not_mutate() {
+        // v0.26.0: installed-but-version-unknown (current=None, latest=Some, Brew,
+        // safe suggested_command) must NOT auto-run and must NOT say "up to date".
+        use aibridge_core::cli_update::{CliCheck, InstallSource};
+        use aibridge_core::update::parse_version;
+        let (stream, recorded) = fake_stream_starter();
+        let mut a = test_app(&[]);
+        a.cli_stream_starter = stream;
+        a.tab = Tab::Update;
+        a.cli_checks = vec![CliCheck {
+            tool: "codex",
+            current: None,
+            latest: parse_version("0.132.0"),
+            source: InstallSource::Brew {
+                package: "codex".into(),
+            },
+            suggested_command: Some(vec!["brew".into(), "upgrade".into(), "codex".into()]),
+            manual_note: None,
+            installable: false,
+            auto_confirm: false,
+            installed: true,
+        }];
+        a.update_sel = 1;
+        a.handle_update_action();
+        assert!(
+            a.active_cli_run.is_none(),
+            "version-unknown must not start a run"
+        );
+        assert!(
+            recorded.lock().unwrap().is_none(),
+            "stream starter not called"
+        );
+        assert!(!a.quit);
+        let m = a.message.unwrap_or_default();
+        assert!(m.contains("version unknown"), "footer: {m}");
+        assert!(!m.contains("up to date"), "must not say up to date: {m}");
+    }
+
+    #[test]
+    fn update_u_on_up_to_date_says_nothing_to_do() {
+        use aibridge_core::cli_update::{CliCheck, InstallSource};
+        use aibridge_core::update::parse_version;
+        let (stream, recorded) = fake_stream_starter();
+        let mut a = test_app(&[]);
+        a.cli_stream_starter = stream;
+        a.tab = Tab::Update;
+        a.cli_checks = vec![CliCheck {
+            tool: "codex",
+            current: parse_version("0.132.0"),
+            latest: parse_version("0.132.0"),
+            source: InstallSource::Brew {
+                package: "codex".into(),
+            },
+            suggested_command: Some(vec!["brew".into(), "upgrade".into(), "codex".into()]),
+            manual_note: None,
+            installable: false,
+            auto_confirm: false,
+            installed: true,
+        }];
+        a.update_sel = 1;
+        a.handle_update_action();
+        assert!(a.active_cli_run.is_none());
+        assert!(recorded.lock().unwrap().is_none());
+        let m = a.message.unwrap_or_default();
+        assert!(m.contains("up to date"), "footer: {m}");
+    }
+
+    // ─── v0.26.0 cli_row_status (pure formatter) ───
+    fn status_check(
+        installed: bool,
+        cur: Option<&str>,
+        latest: Option<&str>,
+    ) -> aibridge_core::cli_update::CliCheck {
+        use aibridge_core::cli_update::{CliCheck, InstallSource};
+        use aibridge_core::update::parse_version;
+        CliCheck {
+            tool: "x",
+            current: cur.and_then(parse_version),
+            latest: latest.and_then(parse_version),
+            source: InstallSource::Brew {
+                package: "x".into(),
+            },
+            suggested_command: None,
+            manual_note: None,
+            installable: false,
+            auto_confirm: false,
+            installed,
+        }
+    }
+
+    #[test]
+    fn cli_row_status_renders_all_states() {
+        assert_eq!(
+            super::cli_row_status(&status_check(false, None, None)),
+            "not installed"
+        );
+        assert_eq!(
+            super::cli_row_status(&status_check(false, None, Some("0.42.0"))),
+            "not installed  (latest 0.42.0)"
+        );
+        assert_eq!(
+            super::cli_row_status(&status_check(true, None, None)),
+            "installed  (version unknown)"
+        );
+        assert_eq!(
+            super::cli_row_status(&status_check(true, Some("1.0.0"), Some("1.0.0"))),
+            "up-to-date  (1.0.0)"
+        );
+        assert_eq!(
+            super::cli_row_status(&status_check(true, Some("1.0.0"), Some("1.1.0"))),
+            "1.0.0 → 1.1.0"
+        );
     }
 
     #[test]
