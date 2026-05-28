@@ -125,6 +125,14 @@ enum Commands {
         #[command(subcommand)]
         action: RtkAction,
     },
+    /// Hidden: the detached self-update helper. Spawned by the TUI staged-update
+    /// flow as `aibridge __apply-staged-update <spec>`; waits for all aibridge
+    /// processes to release the target binary, then swaps it. Not for manual use.
+    #[command(name = "__apply-staged-update", hide = true)]
+    ApplyStagedUpdate {
+        /// Path to the staged-update spec.json.
+        spec: std::path::PathBuf,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -402,6 +410,15 @@ fn main() -> Result<()> {
             Ok(())
         }
         Commands::Rtk { action } => rtk_cmd(action),
+        Commands::ApplyStagedUpdate { spec } => {
+            match aibridge_core::staged_update::apply_staged_update_from_spec_real(&spec) {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    eprintln!("aibridge __apply-staged-update: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
     }
 }
 

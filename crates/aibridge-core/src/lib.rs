@@ -23,6 +23,7 @@ pub mod review_frontier;
 pub mod review_mcp;
 pub mod rtk;
 pub mod skills;
+pub mod staged_update;
 pub mod tool_discovery;
 pub mod topics;
 pub mod update;

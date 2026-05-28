@@ -367,6 +367,66 @@ pub fn apply_cli_update(argv: &[String]) -> Result<i32, String> {
     Ok(status.code().unwrap_or(-1))
 }
 
+/// v0.25.0: spawn a mutating package-manager command with PIPED stdout/stderr and a
+/// NULL stdin, streaming every output line to `on_line` LIVE (so the TUI can show
+/// progress without dropping to a shell). stdin=null means an interactive prompt
+/// gets EOF and the tool fails cleanly instead of hanging — the caller surfaces an
+/// in-TUI "run it manually" message (the documented no-PTY hard limit). stdout +
+/// stderr are drained CONCURRENTLY (one reader thread each → a single channel) so a
+/// chatty stderr never deadlocks the pipe nor buffers unbounded. Returns the exit code.
+pub fn apply_cli_update_streaming(
+    argv: &[String],
+    mut on_line: impl FnMut(String),
+) -> Result<i32, String> {
+    use std::io::{BufRead, BufReader};
+    if argv.is_empty() {
+        return Err("empty argv".to_string());
+    }
+    let bin = &argv[0];
+    let exe = if std::path::Path::new(bin).is_absolute() && std::path::Path::new(bin).exists() {
+        std::path::PathBuf::from(bin)
+    } else {
+        DefaultPlatform::find_executable(bin).map_err(|e| format!("{bin} not on PATH: {e}"))?
+    };
+    let mut cmd = DefaultPlatform::command_for(&exe);
+    cmd.args(&argv[1..])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to spawn {bin}: {e}"))?;
+    let stdout = child.stdout.take().ok_or("no stdout pipe")?;
+    let stderr = child.stderr.take().ok_or("no stderr pipe")?;
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let tx_err = tx.clone();
+    let h_out = std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let h_err = std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            if tx_err.send(format!("[stderr] {line}")).is_err() {
+                break;
+            }
+        }
+    });
+    // Both senders are owned by the two threads; the channel closes once both finish,
+    // ending this loop. Lines surface LIVE (bounded to one in flight).
+    for line in rx {
+        on_line(line);
+    }
+    let _ = h_out.join();
+    let _ = h_err.join();
+    let status = child
+        .wait()
+        .map_err(|e| format!("failed waiting on {bin}: {e}"))?;
+    Ok(status.code().unwrap_or(-1))
+}
+
 // ───────────────────────── pure parsers ─────────────────────────
 
 /// Compute the final [`Mode`] from flag combinations + TTY state. Pure.
@@ -1207,6 +1267,77 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::sync::Mutex;
+
+    // ───────── v0.25.0 apply_cli_update_streaming (cross-platform subprocess) ─────────
+
+    /// Build an argv that runs `script` through the platform shell builtin (cmd on
+    /// Windows, sh elsewhere) — deterministic, no network / package managers.
+    fn shell_argv(script: &str) -> Vec<String> {
+        if cfg!(windows) {
+            vec!["cmd".into(), "/c".into(), script.into()]
+        } else {
+            vec!["sh".into(), "-c".into(), script.into()]
+        }
+    }
+
+    #[test]
+    fn streaming_empty_argv_errors() {
+        let err = apply_cli_update_streaming(&[], |_| {}).unwrap_err();
+        assert!(err.contains("empty argv"), "got: {err}");
+    }
+
+    #[test]
+    fn streaming_forwards_stdout_lines() {
+        let argv = shell_argv("echo out1 && echo out2");
+        let mut lines: Vec<String> = Vec::new();
+        let code = apply_cli_update_streaming(&argv, |l| lines.push(l)).unwrap();
+        assert_eq!(code, 0);
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("out1") && joined.contains("out2"),
+            "lines: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn streaming_forwards_stderr_lines() {
+        // write to stderr (fd 2)
+        let argv = shell_argv("echo err1 1>&2");
+        let mut lines: Vec<String> = Vec::new();
+        let _ = apply_cli_update_streaming(&argv, |l| lines.push(l)).unwrap();
+        let joined = lines.join("\n");
+        assert!(
+            joined.contains("[stderr]") && joined.contains("err1"),
+            "lines: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn streaming_returns_nonzero_exit() {
+        let argv = if cfg!(windows) {
+            vec!["cmd".into(), "/c".into(), "exit 3".into()]
+        } else {
+            vec!["sh".into(), "-c".into(), "exit 3".into()]
+        };
+        let code = apply_cli_update_streaming(&argv, |_| {}).unwrap();
+        assert_eq!(code, 3);
+    }
+
+    #[test]
+    fn streaming_no_deadlock_on_high_volume() {
+        // Write ~500 lines to BOTH stdout and stderr — far exceeds a pipe buffer; the
+        // concurrent drain must complete without hanging.
+        let script = if cfg!(windows) {
+            "for /L %i in (1,1,500) do (echo o%i & echo e%i 1>&2)".to_string()
+        } else {
+            "i=0; while [ $i -lt 500 ]; do echo o$i; echo e$i 1>&2; i=$((i+1)); done".to_string()
+        };
+        let argv = shell_argv(&script);
+        let mut count = 0usize;
+        let code = apply_cli_update_streaming(&argv, |_| count += 1).unwrap();
+        assert_eq!(code, 0);
+        assert!(count >= 900, "expected ~1000 lines drained, got {count}");
+    }
 
     /// Test-only fake runner backed by a fixture table.
     pub struct FakeCommandRunner {

@@ -277,7 +277,7 @@ pub fn check_report(timeout: Duration) -> String {
 // binary was installed so a later `update` replaces the RIGHT file. Optional: every
 // reader falls back to `current_exe()` when it's missing (Codex-vetted chain).
 
-fn global_dir() -> Option<PathBuf> {
+pub(crate) fn global_dir() -> Option<PathBuf> {
     let home = std::env::var("USERPROFILE")
         .or_else(|_| std::env::var("HOME"))
         .ok()?;
@@ -355,7 +355,7 @@ fn hex_lower(bytes: &[u8]) -> String {
 
 /// Verify a downloaded file against its `<name>.sha256` sidecar (the first token is
 /// the hex digest, GNU coreutils format). Rejects empty files / malformed sums.
-fn verify_sha256(bin: &Path, sha_file: &Path) -> Result<(), String> {
+pub(crate) fn verify_sha256(bin: &Path, sha_file: &Path) -> Result<(), String> {
     use sha2::{Digest, Sha256};
     let bytes = std::fs::read(bin).map_err(|e| format!("can't read download: {e}"))?;
     if bytes.is_empty() {
@@ -373,6 +373,60 @@ fn verify_sha256(bin: &Path, sha_file: &Path) -> Result<(), String> {
         return Err(format!("checksum mismatch (got {got}, expected {want})"));
     }
     Ok(())
+}
+
+/// v0.25.0: Download the release `asset` + its `.sha256` for `tag` into `dst_dir`
+/// via `gh release download`, verify the checksum, and return the verified binary
+/// path. Shared by the existing CLI apply path's sibling AND the staged-update flow
+/// (`staged_update.rs`) so both fetch + verify identically. Does NOT stage/replace.
+pub(crate) fn download_and_verify_asset(tag: &str, dst_dir: &Path) -> Result<PathBuf, String> {
+    let asset = asset_name();
+    let sha_asset = format!("{asset}.sha256");
+    let slug = repo_slug();
+    let dl = run_with_timeout(
+        "gh",
+        &[
+            "release",
+            "download",
+            tag,
+            "--repo",
+            slug,
+            "--pattern",
+            &asset,
+            "--pattern",
+            &sha_asset,
+            "--dir",
+            &dst_dir.display().to_string(),
+        ],
+        Duration::from_secs(180),
+    );
+    match dl {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => {
+            let why = String::from_utf8_lossy(&o.stderr);
+            let why = why
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("gh download failed");
+            return Err(format!(
+                "downloading {asset} from {tag} failed: {}",
+                why.trim()
+            ));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err("update needs the GitHub CLI (`gh`).".to_string());
+        }
+        Err(e) => return Err(format!("download failed: {e}")),
+    }
+    let dl_bin = dst_dir.join(&asset);
+    let dl_sha = dst_dir.join(&sha_asset);
+    if !dl_bin.exists() || !dl_sha.exists() {
+        return Err(format!(
+            "download incomplete (missing {asset} or its .sha256)"
+        ));
+    }
+    verify_sha256(&dl_bin, &dl_sha).map_err(|e| format!("refusing to install — {e}"))?;
+    Ok(dl_bin)
 }
 
 /// Pure consent decision. Non-TTY ALWAYS declines — a piped/redirected stdin must
@@ -445,7 +499,7 @@ impl Drop for TempDirGuard {
 /// old inode. Windows: rename the in-use exe aside (allowed for open-for-execute
 /// files), move the new one into place, best-effort delete the `.old`. On any
 /// failure the staged file is LEFT in place (never a half-written install).
-fn replace_binary(install: &Path, staged: &Path) -> Result<String, String> {
+pub(crate) fn replace_binary(install: &Path, staged: &Path) -> Result<String, String> {
     #[cfg(windows)]
     {
         // UNIQUE backup name (pid+nanos): a previous `.old` may still be locked by a
@@ -983,7 +1037,7 @@ fn asset_filename(install: &Path) -> String {
 
 /// Update install metadata after a successful replace: record the INSTALLED tag
 /// version (not the running/old binary's), don't carry the old git SHA.
-fn write_installed_meta(install_path: &str, version: &str) {
+pub(crate) fn write_installed_meta(install_path: &str, version: &str) {
     let Some(dir) = global_dir() else { return };
     if std::fs::create_dir_all(&dir).is_err() {
         return;

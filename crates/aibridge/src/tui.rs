@@ -118,10 +118,13 @@ enum SelfUpdateState {
     /// Probe returned `Skip { reason }` — already on latest, no release published, etc.
     UpToDate { reason: String },
     /// Probe returned `Apply(PlannedUpdate)` — newer release is available + valid.
+    /// Carries the full `PlannedUpdate` so the staged-update flow has the target
+    /// path + tag without re-planning (v0.25.0).
     Newer {
         from: String,
         to: String,
         summary: String,
+        planned: aibridge_core::update::PlannedUpdate,
     },
     /// Probe failed (network, gh auth, missing asset, version parse). NOT updatable.
     Error { detail: String },
@@ -136,6 +139,32 @@ type SelfUpdateProbeResult = Result<aibridge_core::update::UpdateDecision, Strin
 type Planner = std::sync::Arc<
     dyn Fn(&aibridge_core::update::ApplyOptions) -> SelfUpdateProbeResult + Send + Sync,
 >;
+
+/// v0.25.0: injectable starter for the in-TUI self-update STAGING worker. Given the
+/// planned update, it spawns the work (download+verify+stage+spawn detached helper)
+/// on a background thread and returns a channel that yields the final `Result`.
+/// Production wires the real `staged_update` flow; tests inject a fake.
+type SelfStageStarter = std::sync::Arc<
+    dyn Fn(aibridge_core::update::PlannedUpdate) -> std::sync::mpsc::Receiver<Result<(), String>>
+        + Send
+        + Sync,
+>;
+
+/// Production staging starter: stage + spawn the detached helper on a worker thread.
+fn production_self_stage_starter() -> SelfStageStarter {
+    std::sync::Arc::new(|planned: aibridge_core::update::PlannedUpdate| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let res = (|| {
+                let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+                let staged = aibridge_core::staged_update::stage_planned_update(&planned, &exe)?;
+                aibridge_core::staged_update::spawn_detached_staged_updater(&staged)
+            })();
+            let _ = tx.send(res);
+        });
+        rx
+    })
+}
 
 /// A finished Claude-side discovery: (server name, tools or error). Same shape as the
 /// codex `DiscoverResult` but kept separate so a late codex-tab message can't poison
@@ -175,6 +204,44 @@ type CliUpdateStarter = std::sync::Arc<
         ) + Send
         + Sync,
 >;
+
+/// v0.25.0: injectable starter for a GENERIC in-TUI CLI update — streams a
+/// package-manager command's output (codex/claude/brew/npm, and brew-rtk) into the
+/// dashboard instead of dropping to a shell. Production runs
+/// `cli_update::apply_cli_update_streaming` on a worker thread; tests inject a fake.
+type CliStreamStarter = std::sync::Arc<
+    dyn Fn(
+            &'static str,
+            Vec<String>,
+        ) -> (
+            std::sync::mpsc::Receiver<CliUpdateEvent>,
+            std::thread::JoinHandle<()>,
+        ) + Send
+        + Sync,
+>;
+
+/// Production generic CLI-stream starter: spawns a thread that streams `argv`'s
+/// output line-by-line as `Stage` events, then a terminal `Done` keyed on exit code.
+fn production_cli_stream_starter() -> CliStreamStarter {
+    std::sync::Arc::new(|tool: &'static str, argv: Vec<String>| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let _ = tx.send(CliUpdateEvent::Started);
+            let tx_line = tx.clone();
+            let on_line = move |line: String| {
+                let _ = tx_line.send(CliUpdateEvent::Stage(line));
+            };
+            let result = match aibridge_core::cli_update::apply_cli_update_streaming(&argv, on_line)
+            {
+                Ok(0) => Ok(format!("{tool} updated")),
+                Ok(code) => Err(format!("{tool} exited with code {code}")),
+                Err(e) => Err(format!("{tool} update failed: {e}")),
+            };
+            let _ = tx.send(CliUpdateEvent::Done(result));
+        });
+        (rx, handle)
+    })
+}
 
 /// v0.22.0: in-TUI background CLI-update run. Single in-flight per `App`.
 /// `q` is blocked while `finished.is_none()`. On `Done`, the result moves to
@@ -239,11 +306,21 @@ struct App {
     discover_rx: Option<std::sync::mpsc::Receiver<DiscoverResult>>,
     discovering: Option<String>,
     /// Update tab: the current display line (version + last check/result) and an
-    /// in-flight check (background thread → channel). The actual self-replace runs
-    /// AFTER the TUI exits (clean terminal + real output), gated by `update_on_exit`.
+    /// in-flight check (background thread → channel). v0.25.0: the self-update no
+    /// longer exits the TUI — it STAGES the new binary and a detached helper applies
+    /// it once all aibridge processes exit (see `self_stage_*`).
     update_line: String,
     update_rx: Option<std::sync::mpsc::Receiver<SelfUpdateProbeResult>>,
-    update_on_exit: bool,
+    /// v0.25.0: in-flight self-update STAGING (stage + spawn detached helper) on a
+    /// background thread → channel. `Some` while staging is running.
+    self_stage_rx: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
+    /// v0.25.0: injectable starter for the staging worker. Production stages + spawns
+    /// the detached helper; tests inject a fake that pre-fills the channel.
+    self_stage_starter: SelfStageStarter,
+    /// v0.25.0: cached staged-update status (refreshed on the poll tick) so the
+    /// Update tab can show staged/waiting/✓/⚠ + offer cancel (Waiting) / retry (Failed)
+    /// without a file read every frame.
+    staged_status: Option<aibridge_core::staged_update::UpdateStatus>,
     /// v0.20.1 (Codex R3 B1+B6): typed self-update state machine driving the
     /// `u` keypress on row 0. Only `Newer` lets the TUI exit + apply; every
     /// other state shows a footer message without quitting (fixes the UX where
@@ -270,12 +347,16 @@ struct App {
     /// Selected row on the Update tab. Index space is: 0=SelfAibridge, 1..=cli,
     /// remaining=MCP pins.
     update_sel: usize,
-    /// Mutating CLI commands queued by `u` on a CLI row; drained AFTER the TUI
-    /// exits (mirrors `update_on_exit` for the aibridge self-update).
-    pending_cli_updates: Vec<aibridge_core::cli_update::CliCheck>,
     /// v0.22.0: starter for in-TUI rtk-native updates (Update or Install). Production
     /// spawns a real worker thread; tests inject a fake that pre-fills events.
     cli_update_starter: CliUpdateStarter,
+    /// v0.25.0: generic in-TUI CLI-stream starter (codex/claude/brew/npm, brew-rtk).
+    /// Streams the package-manager command's output into the dashboard — no shell drop.
+    cli_stream_starter: CliStreamStarter,
+    /// v0.25.0: 2-key confirm for a FreshInstall CLI row (first global install).
+    /// First `u` arms the tool name; second `u` on the same row starts the in-TUI
+    /// stream. Any other key / tab change / different row clears it.
+    fresh_install_armed: Option<&'static str>,
     /// v0.22.0: in-flight in-TUI CLI update (rtk-native only). When `Some` and
     /// `finished.is_none()`, `q` is blocked and `u` is a no-op (single in-flight).
     active_cli_run: Option<ActiveCliRun>,
@@ -422,7 +503,9 @@ impl App {
             discovering: None,
             update_line: "Press 'c' to check for a newer release.".to_string(),
             update_rx: None,
-            update_on_exit: false,
+            self_stage_rx: None,
+            self_stage_starter: production_self_stage_starter(),
+            staged_status: None,
             self_update_state: SelfUpdateState::Unprobed,
             update_check_kicked: false,
             clipboard: aibridge_platform::real_clipboard(),
@@ -431,8 +514,9 @@ impl App {
             cli_checks_rx: None,
             mcp_pins: Vec::new(),
             update_sel: 0,
-            pending_cli_updates: Vec::new(),
             cli_update_starter: production_rtk_starter(),
+            cli_stream_starter: production_cli_stream_starter(),
+            fresh_install_armed: None,
             active_cli_run: None,
             last_cli_run_result: None,
             pending_cli_recheck: false,
@@ -959,7 +1043,12 @@ impl App {
                         let to = p.to.to_string();
                         let summary = format!("Newer release available: {from} → {to}");
                         self.update_line = summary.clone();
-                        SelfUpdateState::Newer { from, to, summary }
+                        SelfUpdateState::Newer {
+                            from,
+                            to,
+                            summary,
+                            planned: p,
+                        }
                     }
                     Err(detail) => {
                         self.update_line = format!("Self-update check failed: {detail}");
@@ -969,6 +1058,29 @@ impl App {
                 self.update_rx = None;
             }
         }
+        // v0.25.0: drain the self-update STAGING worker.
+        if let Some(rx) = &self.self_stage_rx {
+            if let Ok(result) = rx.try_recv() {
+                match result {
+                    Ok(()) => {
+                        self.update_line =
+                            "Update staged ✓ — applies when all aibridge processes exit.".into();
+                        self.message = Some(
+                            "update staged ✓ — restart Claude Code (and close any aibridge \
+                             processes) to apply it"
+                                .into(),
+                        );
+                    }
+                    Err(e) => {
+                        self.update_line = format!("Staging failed: {e}");
+                        self.message = Some(format!("staging failed: {e}"));
+                    }
+                }
+                self.self_stage_rx = None;
+            }
+        }
+        // v0.25.0: refresh the cached staged-update status for the Update tab.
+        self.staged_status = aibridge_core::staged_update::read_update_status();
         if let Some(rx) = &self.cli_checks_rx {
             if let Ok(checks) = rx.try_recv() {
                 self.cli_checks = checks;
@@ -1142,15 +1254,26 @@ impl App {
     fn handle_update_action(&mut self) {
         let idx = self.update_sel;
         if idx == 0 {
-            // v0.20.1 R3 B1: dispatch on the TYPED self-update state. Only Newer
-            // exits the TUI; every other state shows a footer message and stays
-            // in the dashboard. Fixes the v0.20.0 bug where pressing `u` while
-            // already on the latest release dumped the user to the shell.
+            // v0.25.0: dispatch on the TYPED self-update state. `Newer` STAGES the
+            // update in-TUI (no shell drop); a detached helper applies it once all
+            // aibridge processes exit. Every other state shows a footer + stays put.
             match &self.self_update_state {
-                SelfUpdateState::Newer { from, to, .. } => {
-                    self.update_line = format!("Applying update: {from} → {to}...");
-                    self.update_on_exit = true;
-                    self.quit = true;
+                SelfUpdateState::Newer {
+                    from, to, planned, ..
+                } => {
+                    if self.self_stage_rx.is_some() {
+                        self.message = Some("update is already staging — please wait".into());
+                    } else {
+                        let rx = (self.self_stage_starter)(planned.clone());
+                        self.self_stage_rx = Some(rx);
+                        self.update_line = format!("Staging update {from} → {to}…");
+                        self.message = Some(
+                            "staging update — it applies automatically when all aibridge \
+                             processes (incl. Claude Code MCP servers) exit; this dashboard \
+                             keeps the current version until then"
+                                .into(),
+                        );
+                    }
                 }
                 SelfUpdateState::UpToDate { reason } => {
                     self.message = Some(format!("aibridge is up to date — {reason}"));
@@ -1205,20 +1328,17 @@ impl App {
                 self.message = Some("update in progress; please wait until it completes".into());
                 return;
             }
-            // v0.22.0: rtk-native paths get in-TUI background execution with
-            // live progress. Brew-managed rtk falls through to the existing
-            // exit-and-apply path so `brew upgrade rtk` runs in the restored
-            // terminal (per code-gate scope: brew + alt-screen don't mix).
+            // v0.22.0: rtk-native paths get a DEDICATED in-TUI worker (it does the
+            // rtk download/verify/atomic install with progress). rtk-via-brew falls
+            // through to the generic streaming path below.
+            use aibridge_core::cli_update::{InstallSource, RtkNativeAction};
             if c.tool == "rtk" {
-                use aibridge_core::cli_update::{InstallSource, RtkNativeAction};
                 let action = match (&c.source, c.installable) {
                     (InstallSource::NativeInstaller { .. }, _) => Some(RtkNativeAction::Update),
                     (InstallSource::Unknown { .. }, true) => Some(RtkNativeAction::Install),
-                    _ => None, // Brew or other → falls through
+                    _ => None, // Brew or other → generic streaming path
                 };
                 if let Some(action) = action {
-                    // Clear any stale prior result for rtk so the inline
-                    // decoration doesn't keep showing the OLD outcome.
                     if self
                         .last_cli_run_result
                         .as_ref()
@@ -1238,19 +1358,45 @@ impl App {
                     self.message = Some("rtk update started — staying in TUI".into());
                     return;
                 }
-                // Brew rtk: fall through to enqueue+quit below.
             }
-            // v0.22.0: verified Brew/Npm sources auto-confirm the post-exit
-            // [y/N] prompt — user already pressed `u` once = consent.
-            // FreshInstall keeps the prompt (first installs warrant friction).
-            use aibridge_core::cli_update::InstallSource;
-            let mut enqueued = c.clone();
-            enqueued.auto_confirm = matches!(
-                c.source,
-                InstallSource::Brew { .. } | InstallSource::Npm { .. }
-            );
-            self.pending_cli_updates.push(enqueued);
-            self.quit = true;
+            // v0.25.0: ALL other safe CLI updates stream IN-TUI (no shell drop). A
+            // FreshInstall (first global install) requires a 2-key confirm; verified
+            // updates start on a single `u`.
+            let Some(argv) = c.suggested_command.clone() else {
+                self.message = Some(format!("{}: no update command available", c.tool));
+                return;
+            };
+            let tool = c.tool;
+            let is_fresh = matches!(c.source, InstallSource::FreshInstall { .. });
+            if is_fresh && self.fresh_install_armed != Some(tool) {
+                // First press on a FreshInstall row → arm; do not run yet.
+                self.fresh_install_armed = Some(tool);
+                self.message = Some(format!(
+                    "{tool}: first install — press `u` again to run `{}`",
+                    argv.join(" ")
+                ));
+                return;
+            }
+            // Either a verified update (single press) or the armed FreshInstall's
+            // second press → start the in-TUI stream.
+            self.fresh_install_armed = None;
+            if self
+                .last_cli_run_result
+                .as_ref()
+                .is_some_and(|r| r.tool == tool)
+            {
+                self.last_cli_run_result = None;
+            }
+            let (rx, handle) = (self.cli_stream_starter)(tool, argv);
+            self.active_cli_run = Some(ActiveCliRun {
+                tool,
+                rx,
+                latest_stage: "starting…".to_string(),
+                started_at: Instant::now(),
+                finished: None,
+                handle: Some(handle),
+            });
+            self.message = Some(format!("{tool} update started — staying in TUI"));
             return;
         }
         // Otherwise it's an MCP-pin row — read-only.
@@ -1259,10 +1405,35 @@ impl App {
         );
     }
 
+    /// v0.25.0: cancel a Waiting/Staged self-update (`x` on the Update tab).
+    fn cancel_staged_update(&mut self) {
+        match aibridge_core::staged_update::cancel_pending() {
+            Ok(()) => {
+                self.staged_status = aibridge_core::staged_update::read_update_status();
+                self.message = Some("staged update cancelled.".into());
+            }
+            Err(e) => self.message = Some(format!("cancel: {e}")),
+        }
+    }
+
+    /// v0.25.0: retry a Failed self-update (`g` on the Update tab).
+    fn retry_staged_update(&mut self) {
+        match aibridge_core::staged_update::retry_failed_update() {
+            Ok(()) => {
+                self.staged_status = aibridge_core::staged_update::read_update_status();
+                self.message = Some("retrying staged update…".into());
+            }
+            Err(e) => self.message = Some(format!("retry: {e}")),
+        }
+    }
+
     /// Full refresh (startup + `r`): runs the doctor checks (no network), reloads the
     /// review status, and re-reads the MCP policies (codex + claude). Not called on
     /// the fast input tick.
     fn refresh_all(&mut self) {
+        // v0.25.0: sweep crashed staged-update waiters + stale dirs, then cache status.
+        aibridge_core::staged_update::sweep_stale_staged();
+        self.staged_status = aibridge_core::staged_update::read_update_status();
         self.checks = doctor::run(std::path::Path::new(&self.cwd), false, false).checks;
         self.refresh_review();
         self.refresh_mcp();
@@ -1309,12 +1480,15 @@ impl App {
 
     // --- pure navigation (unit-tested) ---
     fn next_tab(&mut self) {
+        self.fresh_install_armed = None; // leaving the row cancels a pending fresh-install confirm
         self.tab = Tab::ALL[(self.tab.index() + 1) % Tab::ALL.len()];
     }
     fn prev_tab(&mut self) {
+        self.fresh_install_armed = None;
         self.tab = Tab::ALL[(self.tab.index() + Tab::ALL.len() - 1) % Tab::ALL.len()];
     }
     fn move_down(&mut self) {
+        self.fresh_install_armed = None; // changing the selected row cancels a pending confirm
         match self.tab {
             Tab::Mcp => match self.mcp_view {
                 McpView::Servers => {
@@ -1359,6 +1533,7 @@ impl App {
         }
     }
     fn move_up(&mut self) {
+        self.fresh_install_armed = None;
         match self.tab {
             Tab::Mcp => match self.mcp_view {
                 McpView::Servers => self.mcp_sel = self.mcp_sel.saturating_sub(1),
@@ -1557,96 +1732,10 @@ pub fn run() -> Result<()> {
     let mut app = App::new(cwd);
     let res = run_loop(&mut terminal, &mut app);
     ratatui::restore();
-    // The actual update runs HERE — after the terminal is restored — so its output
-    // shows normally and replacing the running binary can't corrupt the dashboard.
-    // Only if the loop ended cleanly (don't self-update on top of a loop error).
-    if res.is_ok() && app.update_on_exit {
-        use aibridge_core::process_cleanup::{RealProcessEnumerator, RealProcessKiller};
-        use aibridge_core::update::{
-            apply_planned_update, orchestrate_update, plan_update, ApplyOptions, CleanupMode,
-            OrchestrationOpts, RealConfirmer,
-        };
-        println!("AI Bridge {}\n", aibridge_core::VERSION_FULL);
-        // v0.20.0 hotfix: plan_update first, then orchestrate cleanup+apply in
-        // the restored terminal. User pressed `u` → update_already_confirmed=true.
-        // Cleanup mode is Prompt — pressing `u` consents to UPDATE only; killing
-        // other same-path aibridge processes (MCP servers, other TUIs) requires
-        // a separate explicit [y/N].
-        let opts = ApplyOptions {
-            assume_yes: true,
-            from_source: false,
-            target_path: None,
-        };
-        match plan_update(&opts) {
-            Ok(decision) => {
-                let orch = OrchestrationOpts {
-                    update_already_confirmed: true,
-                    cleanup_mode: CleanupMode::Prompt,
-                };
-                match orchestrate_update(
-                    decision,
-                    orch,
-                    &RealProcessEnumerator,
-                    &RealProcessKiller,
-                    &RealConfirmer,
-                    &apply_planned_update,
-                ) {
-                    Ok(m) => println!("{m}"),
-                    Err(e) => eprintln!("AI Bridge update: {e}"),
-                }
-            }
-            Err(e) => eprintln!("AI Bridge update: {e}"),
-        }
-    }
-    // Codex Stop-gate R6: mutating CLI commands run in the RESTORED terminal so
-    // brew/npm progress + prompts are visible. Each pending row gets a default-no
-    // confirmation; the user can cancel any single row without aborting the batch.
-    if res.is_ok() && !app.pending_cli_updates.is_empty() {
-        use aibridge_core::cli_update::{apply_cli_update, prompt_parse};
-        use std::io::{BufRead, IsTerminal, Write};
-        println!("\nApplying selected CLI updates:");
-        let is_tty = std::io::stdin().is_terminal();
-        for c in &app.pending_cli_updates {
-            let Some(argv) = &c.suggested_command else {
-                continue;
-            };
-            // v0.22.0: when `auto_confirm` is set (single-press `u` on a
-            // verified Brew/Npm row), skip the [y/N] prompt — user already
-            // consented by pressing `u`. FreshInstall never sets auto_confirm.
-            let accept = if c.auto_confirm {
-                println!(
-                    "  [{tool}] auto-confirmed by `u` press: {cmd}",
-                    tool = c.tool,
-                    cmd = argv.join(" ")
-                );
-                true
-            } else {
-                print!(
-                    "  [{tool}] run `{cmd}` ? [y/N] ",
-                    tool = c.tool,
-                    cmd = argv.join(" ")
-                );
-                let _ = std::io::stdout().flush();
-                if is_tty {
-                    let mut line = String::new();
-                    let _ = std::io::stdin().lock().read_line(&mut line);
-                    prompt_parse(&line)
-                } else {
-                    println!("(non-tty — declined)");
-                    false
-                }
-            };
-            if !accept {
-                println!("    declined.");
-                continue;
-            }
-            match apply_cli_update(argv) {
-                Ok(0) => println!("    [{tool}] success.", tool = c.tool),
-                Ok(code) => eprintln!("    [{tool}] exited with code {code}", tool = c.tool),
-                Err(e) => eprintln!("    [{tool}] failed: {e}", tool = c.tool),
-            }
-        }
-    }
+    // v0.25.0: nothing runs after the TUI exits anymore. The aibridge SELF-update
+    // STAGES in-TUI + a detached helper applies it (see `staged_update`); codex /
+    // claude / brew / npm / rtk updates STREAM in-TUI via `cli_stream_starter` /
+    // `cli_update_starter`. No shell drop, no after-exit prompts.
     res
 }
 
@@ -1696,6 +1785,12 @@ fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
 }
 
 fn handle_key(app: &mut App, code: KeyCode) {
+    // v0.25.0: any key other than `u` cancels a pending FreshInstall 2-key confirm —
+    // so an intervening action (c/r/x/g/…) that may change the visible command forces
+    // a fresh first press before a first global install can run.
+    if !matches!(code, KeyCode::Char('u')) {
+        app.fresh_install_armed = None;
+    }
     let in_tools = app.tab == Tab::Mcp && app.mcp_view == McpView::Tools;
     // Any key that ISN'T the matching 2nd press of a Skills mutate-confirm cancels it.
     let is_skills_mutate = app.tab == Tab::Skills
@@ -1822,9 +1917,12 @@ fn handle_key(app: &mut App, code: KeyCode) {
         }
         KeyCode::Char('u') if app.tab == Tab::Update => {
             // Per-row dispatch: self vs verified-pkg-manager CLI vs manual-only.
-            // Mutation (any case) defers to after-TUI-exit per Codex Stop-gate R6.
+            // Self-update STAGES in-TUI (v0.25.0); CLI rows defer to after-exit.
             app.handle_update_action();
         }
+        // v0.25.0: staged self-update controls.
+        KeyCode::Char('x') if app.tab == Tab::Update => app.cancel_staged_update(),
+        KeyCode::Char('g') if app.tab == Tab::Update => app.retry_staged_update(),
         // Skills tab: sync (s) / migrate (m) MUTATE the filesystem → 2-key confirm.
         KeyCode::Char('s') if app.tab == Tab::Skills => {
             if app.skills_confirm_press('s') {
@@ -2048,7 +2146,7 @@ fn ui(f: &mut Frame, app: &App) {
         }
         Tab::Review => "Tab/Left/Right: tabs | r: refresh | q: quit (auto-refreshes ~1s)",
         Tab::Update => {
-            "↑/↓: select | c: check self | u: update selected | r: re-check CLIs | q: quit"
+            "↑/↓: select | c: check self | u: update/stage | x: cancel staged | g: retry staged | r: re-check | q: quit"
         }
         Tab::Debug => {
             "Tab/Left/Right: tabs | Up/Down: scroll | y: copy all to clipboard | r: rebuild | q: quit"
@@ -2566,6 +2664,26 @@ fn rtk_row_decoration(
     String::new()
 }
 
+/// v0.25.0: one-line summary of the staged self-update for the Update tab. Pure
+/// (unit-tested). Returns `None` for a Superseded record (nothing useful to show).
+fn staged_status_line(st: &aibridge_core::staged_update::UpdateStatus) -> Option<String> {
+    use aibridge_core::staged_update::StagedState;
+    let vers = format!("{} → {}", st.from, st.to);
+    Some(match st.state {
+        StagedState::Staged => format!("staged update {vers} — starting updater…"),
+        StagedState::Waiting => {
+            format!("staged update {vers} — waiting for aibridge processes to exit ('x' to cancel)")
+        }
+        StagedState::Applying => format!("staged update {vers} — applying now…"),
+        StagedState::Succeeded => format!("updated to {} ✓ (restart to use it)", st.to),
+        StagedState::Failed => {
+            let why = st.error.as_deref().unwrap_or("unknown error");
+            format!("staged update {vers} FAILED: {why} ('g' to retry)")
+        }
+        StagedState::Superseded => return None,
+    })
+}
+
 fn render_update(f: &mut Frame, app: &App, area: Rect) {
     let mut items: Vec<ListItem> = Vec::new();
     let sel = app.update_sel;
@@ -2578,6 +2696,15 @@ fn render_update(f: &mut Frame, app: &App, area: Rect) {
             format!("              {}", app.update_line),
             Style::default().fg(Color::DarkGray),
         ))));
+    }
+    // v0.25.0: staged-update status (in-TUI self-update; applied by the detached helper).
+    if let Some(st) = &app.staged_status {
+        if let Some(line) = staged_status_line(st) {
+            items.push(ListItem::new(Line::from(Span::styled(
+                format!("              {line}"),
+                Style::default().fg(Color::Cyan),
+            ))));
+        }
     }
 
     // CLI checks.
@@ -2708,7 +2835,9 @@ mod tests {
             discovering: None,
             update_line: String::new(),
             update_rx: None,
-            update_on_exit: false,
+            self_stage_rx: None,
+            self_stage_starter: production_self_stage_starter(),
+            staged_status: None,
             self_update_state: SelfUpdateState::Unprobed,
             update_check_kicked: false,
             clipboard: aibridge_platform::real_clipboard(),
@@ -2717,8 +2846,9 @@ mod tests {
             cli_checks_rx: None,
             mcp_pins: Vec::new(),
             update_sel: 0,
-            pending_cli_updates: Vec::new(),
             cli_update_starter: production_rtk_starter(),
+            cli_stream_starter: production_cli_stream_starter(),
+            fresh_install_armed: None,
             active_cli_run: None,
             last_cli_run_result: None,
             pending_cli_recheck: false,
@@ -2810,21 +2940,86 @@ mod tests {
     }
 
     #[test]
-    fn update_u_on_self_row_with_newer_state_sets_update_on_exit() {
-        // v0.20.1 R3 B5: Updated for the typed-state behavior. Only `Newer` quits;
-        // `Unprobed` (the old default) now shows a footer message and stays in TUI.
+    fn update_u_on_self_row_with_newer_state_stages_in_tui() {
+        // v0.25.0: pressing `u` on the self row with a `Newer` state STAGES the
+        // update in-TUI (invokes the staging starter) and does NOT exit the TUI.
         let mut a = test_app(&[]);
         a.tab = Tab::Update;
         a.update_sel = 0;
+        let invoked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = invoked.clone();
+        a.self_stage_starter = std::sync::Arc::new(move |_planned| {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            let (tx, rx) = std::sync::mpsc::channel();
+            let _ = tx.send(Ok(()));
+            rx
+        });
         a.self_update_state = SelfUpdateState::Newer {
             from: "0.20.0".into(),
             to: "0.21.0".into(),
             summary: "test".into(),
+            planned: aibridge_core::update::PlannedUpdate {
+                install_path: std::path::PathBuf::from("/x/aibridge"),
+                tag: "v0.21.0".into(),
+                from: None,
+                to: aibridge_core::update::parse_version("0.21.0").unwrap(),
+            },
         };
         a.handle_update_action();
-        assert!(a.update_on_exit);
-        assert!(a.quit);
-        assert!(a.pending_cli_updates.is_empty());
+        assert!(
+            invoked.load(std::sync::atomic::Ordering::SeqCst),
+            "staging starter must be invoked"
+        );
+        assert!(!a.quit, "v0.25.0: self-update no longer exits the TUI");
+        assert!(a.self_stage_rx.is_some(), "staging is in flight");
+    }
+
+    // ─── v0.25.0 staged self-update status line ───
+    fn fake_status(
+        state: aibridge_core::staged_update::StagedState,
+    ) -> aibridge_core::staged_update::UpdateStatus {
+        aibridge_core::staged_update::UpdateStatus {
+            id: "id".into(),
+            from: "0.24.0".into(),
+            to: "0.25.0".into(),
+            tag: "v0.25.0".into(),
+            target: "/x/aibridge".into(),
+            payload: "/x/.aibridge-staged-id".into(),
+            state,
+            error: Some("swap boom".into()),
+            updated_ms: 0,
+            heartbeat_ms: 0,
+            helper_pid: None,
+            helper_started_ms: None,
+            spawn_attempted_ms: None,
+            spawn_error: None,
+        }
+    }
+
+    #[test]
+    fn staged_status_line_waiting_mentions_cancel() {
+        use aibridge_core::staged_update::StagedState;
+        let line = super::staged_status_line(&fake_status(StagedState::Waiting)).unwrap();
+        assert!(
+            line.contains("waiting") && line.contains("'x' to cancel"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn staged_status_line_failed_mentions_retry_and_reason() {
+        use aibridge_core::staged_update::StagedState;
+        let line = super::staged_status_line(&fake_status(StagedState::Failed)).unwrap();
+        assert!(
+            line.contains("FAILED") && line.contains("swap boom") && line.contains("'g' to retry"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn staged_status_line_superseded_is_hidden() {
+        use aibridge_core::staged_update::StagedState;
+        assert!(super::staged_status_line(&fake_status(StagedState::Superseded)).is_none());
     }
 
     // ─── v0.20.1 typed SelfUpdateState dispatch tests ───
@@ -2838,7 +3033,6 @@ mod tests {
         };
         a.handle_update_action();
         assert!(!a.quit, "must NOT exit TUI when already on latest");
-        assert!(!a.update_on_exit);
         let msg = a.message.unwrap_or_default();
         assert!(
             msg.contains("up to date"),
@@ -3053,9 +3247,9 @@ mod tests {
         }];
         a.update_sel = 1; // first CLI row
         a.handle_update_action();
-        // No mutation queued, no exit triggered.
-        assert!(a.pending_cli_updates.is_empty());
+        // No mutation started, no exit triggered.
         assert!(!a.quit);
+        assert!(a.active_cli_run.is_none());
         // But the user gets a footer message pointing at the docs URL.
         let m = a.message.unwrap_or_default();
         assert!(
@@ -3065,10 +3259,13 @@ mod tests {
     }
 
     #[test]
-    fn update_u_on_cli_row_with_verified_source_enqueues_and_exits() {
+    fn update_u_on_cli_row_with_verified_source_streams_in_tui() {
+        // v0.25.0: a verified update streams in-TUI (no exit, no enqueue).
         use aibridge_core::cli_update::{CliCheck, InstallSource};
         use aibridge_core::update::parse_version;
+        let (stream, recorded) = fake_stream_starter();
         let mut a = test_app(&[]);
+        a.cli_stream_starter = stream;
         a.tab = Tab::Update;
         a.cli_checks = vec![CliCheck {
             tool: "codex",
@@ -3084,9 +3281,9 @@ mod tests {
         }];
         a.update_sel = 1;
         a.handle_update_action();
-        assert!(a.quit, "should exit TUI so brew runs in restored terminal");
-        assert_eq!(a.pending_cli_updates.len(), 1);
-        assert_eq!(a.pending_cli_updates[0].tool, "codex");
+        assert!(!a.quit, "v0.25.0: no shell drop");
+        assert!(a.active_cli_run.is_some());
+        assert_eq!(recorded.lock().unwrap().as_ref().unwrap().0, "codex");
     }
 
     #[test]
@@ -3102,8 +3299,8 @@ mod tests {
         }];
         a.update_sel = 1; // first MCP-pin row (cli_checks is empty here)
         a.handle_update_action();
-        assert!(a.pending_cli_updates.is_empty());
         assert!(!a.quit);
+        assert!(a.active_cli_run.is_none());
         let m = a.message.unwrap_or_default();
         assert!(
             m.contains("read-only"),
@@ -3351,6 +3548,21 @@ mod tests {
         (starter, recorded_action, saved_tx)
     }
 
+    /// v0.25.0: records the (tool, argv) a generic CLI-stream starter was invoked
+    /// with, returning a pre-filled receiver. NEVER shells out.
+    type RecordedStream = std::sync::Arc<std::sync::Mutex<Option<(&'static str, Vec<String>)>>>;
+    fn fake_stream_starter() -> (CliStreamStarter, RecordedStream) {
+        let recorded: RecordedStream = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let rec = recorded.clone();
+        let starter: CliStreamStarter = std::sync::Arc::new(move |tool, argv| {
+            *rec.lock().unwrap() = Some((tool, argv));
+            let (_tx, rx) = std::sync::mpsc::channel();
+            let handle = std::thread::spawn(|| {});
+            (rx, handle)
+        });
+        (starter, recorded)
+    }
+
     type ChecksStarterCallCount = std::sync::Arc<std::sync::atomic::AtomicUsize>;
     type SavedChecksTx = std::sync::Arc<
         std::sync::Mutex<Option<std::sync::mpsc::Sender<Vec<aibridge_core::cli_update::CliCheck>>>>,
@@ -3425,10 +3637,6 @@ mod tests {
             "starter should populate active_cli_run"
         );
         assert!(!a.quit, "in-TUI rtk update must NOT exit");
-        assert!(
-            a.pending_cli_updates.is_empty(),
-            "in-TUI rtk update must NOT enqueue"
-        );
         assert_eq!(
             *recorded.lock().unwrap(),
             Some(RtkNativeAction::Update),
@@ -3458,16 +3666,14 @@ mod tests {
     }
 
     #[test]
-    fn update_u_on_rtk_brew_enqueues_with_auto_confirm() {
+    fn update_u_on_rtk_brew_streams_in_tui() {
+        // v0.25.0: brew-rtk no longer exits; it streams in-TUI via cli_stream_starter.
         use aibridge_core::cli_update::{CliCheck, InstallSource};
         use aibridge_core::update::parse_version;
-        let (starter, recorded, _saved_tx) = fake_starter();
+        let (stream, recorded) = fake_stream_starter();
         let mut a = test_app(&[]);
-        a.cli_update_starter = starter;
+        a.cli_stream_starter = stream;
         a.tab = Tab::Update;
-        let exe = aibridge_core::cli_update::current_exe_path().unwrap();
-        // Brew rtk: source=Brew, suggested_command IS the aibridge rtk update
-        // form (per check_rtk for Brew target).
         a.cli_checks = vec![CliCheck {
             tool: "rtk",
             current: parse_version("0.40.0"),
@@ -3475,39 +3681,27 @@ mod tests {
             source: InstallSource::Brew {
                 package: "rtk".into(),
             },
-            suggested_command: Some(vec![
-                exe.display().to_string(),
-                "rtk".into(),
-                "update".into(),
-                "--yes".into(),
-            ]),
+            suggested_command: Some(vec!["brew".into(), "upgrade".into(), "rtk".into()]),
             manual_note: None,
             installable: false,
             auto_confirm: false,
         }];
         a.update_sel = 1;
         a.handle_update_action();
-        assert!(
-            a.active_cli_run.is_none(),
-            "brew rtk must NOT take in-TUI path"
-        );
-        assert!(
-            recorded.lock().unwrap().is_none(),
-            "starter must NOT be called"
-        );
-        assert!(a.quit, "brew rtk takes exit-and-apply path");
-        assert_eq!(a.pending_cli_updates.len(), 1);
-        assert!(
-            a.pending_cli_updates[0].auto_confirm,
-            "brew row must auto-confirm post-exit"
-        );
+        assert!(!a.quit, "v0.25.0: brew rtk streams in-TUI, no exit");
+        assert!(a.active_cli_run.is_some(), "in-TUI stream started");
+        let rec = recorded.lock().unwrap();
+        assert_eq!(rec.as_ref().unwrap().0, "rtk");
+        assert_eq!(rec.as_ref().unwrap().1, vec!["brew", "upgrade", "rtk"]);
     }
 
     #[test]
-    fn update_u_on_codex_brew_enqueues_with_auto_confirm() {
+    fn update_u_on_codex_brew_streams_in_tui() {
         use aibridge_core::cli_update::{CliCheck, InstallSource};
         use aibridge_core::update::parse_version;
+        let (stream, recorded) = fake_stream_starter();
         let mut a = test_app(&[]);
+        a.cli_stream_starter = stream;
         a.tab = Tab::Update;
         a.cli_checks = vec![CliCheck {
             tool: "codex",
@@ -3523,16 +3717,18 @@ mod tests {
         }];
         a.update_sel = 1;
         a.handle_update_action();
-        assert!(a.quit);
-        assert_eq!(a.pending_cli_updates.len(), 1);
-        assert!(a.pending_cli_updates[0].auto_confirm);
+        assert!(!a.quit, "codex/brew update streams in-TUI on single u");
+        assert!(a.active_cli_run.is_some());
+        assert_eq!(recorded.lock().unwrap().as_ref().unwrap().0, "codex");
     }
 
     #[test]
-    fn update_u_on_codex_npm_enqueues_with_auto_confirm() {
+    fn update_u_on_codex_npm_streams_in_tui() {
         use aibridge_core::cli_update::{CliCheck, InstallSource};
         use aibridge_core::update::parse_version;
+        let (stream, recorded) = fake_stream_starter();
         let mut a = test_app(&[]);
+        a.cli_stream_starter = stream;
         a.tab = Tab::Update;
         a.cli_checks = vec![CliCheck {
             tool: "codex",
@@ -3553,15 +3749,19 @@ mod tests {
         }];
         a.update_sel = 1;
         a.handle_update_action();
-        assert!(a.quit);
-        assert_eq!(a.pending_cli_updates.len(), 1);
-        assert!(a.pending_cli_updates[0].auto_confirm);
+        assert!(!a.quit);
+        assert!(a.active_cli_run.is_some());
+        assert!(recorded.lock().unwrap().is_some());
     }
 
     #[test]
-    fn update_u_on_codex_fresh_install_brew_does_not_auto_confirm() {
+    fn update_u_on_codex_fresh_install_brew_requires_two_keys() {
+        // v0.25.0: FreshInstall keeps first-install friction via a 2-key confirm
+        // (no shell drop). First `u` arms; second `u` starts the in-TUI stream.
         use aibridge_core::cli_update::{CliCheck, FreshInstallMethod, InstallSource};
+        let (stream, recorded) = fake_stream_starter();
         let mut a = test_app(&[]);
+        a.cli_stream_starter = stream;
         a.tab = Tab::Update;
         a.cli_checks = vec![CliCheck {
             tool: "codex",
@@ -3584,19 +3784,28 @@ mod tests {
             auto_confirm: false,
         }];
         a.update_sel = 1;
+        // First press → arms, does NOT run.
         a.handle_update_action();
-        assert!(a.quit);
-        assert_eq!(a.pending_cli_updates.len(), 1);
         assert!(
-            !a.pending_cli_updates[0].auto_confirm,
-            "FreshInstall must NEVER auto-confirm — first install needs prompt"
+            a.active_cli_run.is_none(),
+            "first u must NOT run a fresh install"
         );
+        assert_eq!(a.fresh_install_armed, Some("codex"));
+        assert!(recorded.lock().unwrap().is_none());
+        // Second press → starts the in-TUI stream.
+        a.handle_update_action();
+        assert!(a.active_cli_run.is_some(), "second u starts the install");
+        assert_eq!(a.fresh_install_armed, None);
+        assert_eq!(recorded.lock().unwrap().as_ref().unwrap().0, "codex");
+        assert!(!a.quit);
     }
 
     #[test]
-    fn update_u_on_codex_fresh_install_npm_does_not_auto_confirm() {
+    fn update_u_on_codex_fresh_install_npm_requires_two_keys() {
         use aibridge_core::cli_update::{CliCheck, FreshInstallMethod, InstallSource};
+        let (stream, recorded) = fake_stream_starter();
         let mut a = test_app(&[]);
+        a.cli_stream_starter = stream;
         a.tab = Tab::Update;
         a.cli_checks = vec![CliCheck {
             tool: "codex",
@@ -3619,8 +3828,74 @@ mod tests {
         }];
         a.update_sel = 1;
         a.handle_update_action();
-        assert!(a.quit);
-        assert!(!a.pending_cli_updates[0].auto_confirm);
+        assert!(a.active_cli_run.is_none());
+        assert_eq!(a.fresh_install_armed, Some("codex"));
+        a.handle_update_action();
+        assert!(a.active_cli_run.is_some());
+        assert!(recorded.lock().unwrap().is_some());
+    }
+
+    #[test]
+    fn fresh_install_arm_cancelled_by_any_other_key() {
+        // v0.25.0 code-gate fix: an intervening non-`u` key (c/r/x/g) cancels the
+        // FreshInstall arm so the next `u` is a fresh FIRST press (re-arms, no run).
+        use aibridge_core::cli_update::{CliCheck, FreshInstallMethod, InstallSource};
+        for cancel_key in ['c', 'r', 'x', 'g'] {
+            let (stream, recorded) = fake_stream_starter();
+            let mut a = test_app(&[]);
+            a.cli_stream_starter = stream;
+            // Avoid network: make `c` (self-update probe) a no-op planner.
+            a.planner = std::sync::Arc::new(|_| {
+                Ok(aibridge_core::update::UpdateDecision::Skip {
+                    reason: "test".into(),
+                })
+            });
+            a.tab = Tab::Update;
+            a.cli_checks = vec![CliCheck {
+                tool: "codex",
+                current: None,
+                latest: None,
+                source: InstallSource::FreshInstall {
+                    method: FreshInstallMethod::Npm {
+                        package: "@openai/codex".into(),
+                    },
+                },
+                suggested_command: Some(vec![
+                    "npm".into(),
+                    "install".into(),
+                    "-g".into(),
+                    "@openai/codex".into(),
+                ]),
+                manual_note: None,
+                installable: true,
+                auto_confirm: false,
+            }];
+            a.update_sel = 1;
+            // First `u` arms.
+            super::handle_key(&mut a, ratatui::crossterm::event::KeyCode::Char('u'));
+            assert_eq!(
+                a.fresh_install_armed,
+                Some("codex"),
+                "key {cancel_key}: armed"
+            );
+            // Intervening key cancels the arm.
+            super::handle_key(&mut a, ratatui::crossterm::event::KeyCode::Char(cancel_key));
+            assert_eq!(
+                a.fresh_install_armed, None,
+                "key {cancel_key}: arm must be cancelled"
+            );
+            // The next `u` must NOT immediately run a first install (the arm is gone,
+            // so it's treated as a fresh first press → re-arm, never an instant run).
+            super::handle_key(&mut a, ratatui::crossterm::event::KeyCode::Char('u'));
+            assert!(
+                a.active_cli_run.is_none(),
+                "key {cancel_key}: must not start an install after a cancelled arm"
+            );
+            assert!(
+                recorded.lock().unwrap().is_none(),
+                "key {cancel_key}: no stream"
+            );
+        }
     }
 
     #[test]
@@ -3649,7 +3924,6 @@ mod tests {
         }];
         a.update_sel = 1;
         a.handle_update_action();
-        assert!(a.pending_cli_updates.is_empty());
         assert!(!a.quit);
         assert!(a.active_cli_run.is_none());
         assert!(recorded.lock().unwrap().is_none());

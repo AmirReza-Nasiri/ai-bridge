@@ -6,6 +6,49 @@ versioning is semver.
 
 ## [Unreleased]
 
+## [0.25.0] - 2026-05-28
+
+Everything-in-TUI updates: the dashboard no longer drops you to a shell for ANY
+update. Both the aibridge self-update and the CLI updates (codex / claude / brew /
+npm) now run inside `aibridge tui`. Architecture chosen via two Codex design
+consults (detached helper + piped streaming); a full embedded PTY was deliberately
+deferred as over-engineering + high Windows-ConPTY risk for an infrequent flow — the
+rare interactive case fails cleanly in-TUI with a "run it manually" message.
+
+### Added
+- **In-TUI detached self-updater.** Pressing `u` on the aibridge self row no longer
+  exits the TUI and no longer kills your running MCP servers. It STAGES the verified
+  new binary next to the target and spawns a DETACHED helper that waits until every
+  aibridge process has released the binary, then atomically swaps it. The dashboard
+  keeps running the old version until you restart Claude Code. The Update tab shows
+  staged / waiting / applied / failed, with `x` to cancel a pending update and `g` to
+  retry a failed one. No shell drop, no `[y/N]` stale-process prompts, no startup
+  binary mutation.
+- **In-TUI streaming CLI updates.** codex / claude / brew / npm (and brew-managed rtk)
+  now stream their output live into the dashboard instead of dropping to a shell.
+  A verified update starts on a single `u`; a first global install (FreshInstall)
+  keeps first-install friction via a 2-key in-TUI confirm (cancelled by any other
+  key). An update that needs an interactive terminal (e.g. a sudo password) fails
+  cleanly in-TUI and names the command to run manually.
+
+### Internal
+- New `aibridge-core::staged_update` module: ownership-token lock (release only on
+  token match; steal only a proven-dead holder; 60s grace for a crashed-mid-write
+  lock), a global status file that survives staged-dir cleanup, a persistent wait
+  loop with heartbeat, an exclusive `Applying` claim gated by id+state under the lock
+  (never by process liveness → PID reuse can't cause a wrong-binary apply), retry,
+  and a startup sweep. std-only detached spawn (no new dependencies).
+- New `cli_update::apply_cli_update_streaming` — pipes stdout+stderr (drained
+  concurrently to avoid deadlock), null stdin, forwards each line live.
+- New hidden `aibridge __apply-staged-update <spec>` subcommand (the detached helper).
+- Removed the after-TUI-exit self-update + CLI-apply blocks (the last shell-drop path).
+
+### Tests
+- +40 tests (workspace total 503): staged-update lock/lifecycle/apply/retry/sweep
+  (hermetic via injected clock / liveness / enumerator / swap / download seams),
+  cross-platform streaming subprocess coverage, and the in-TUI dispatch + FreshInstall
+  2-key confirm.
+
 ## [0.24.0] - 2026-05-28
 
 Three fixes — the first two were surfaced by dogfooding the new v0.23.0
