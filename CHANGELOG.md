@@ -6,6 +6,18 @@ versioning is semver.
 
 ## [Unreleased]
 
+## [0.22.1] - 2026-05-28
+
+### Fixed
+- **Stop-hook "peer review could not complete (blocked or unparseable verdict)" when Codex's review thread context window fills up.** The reserved review thread (`TopicKey::Gate`) is shared across automatic Stop-gate runs and manual `review_diff`; over a long session its accumulated context can exhaust Codex's window. In that state Codex returns the plain-text reply `"Codex ran out of room in the model's context window. Start a new thread or clear earlier history before retrying."` rather than a JSON-RPC error. Prior to v0.22.1, `ask_topic`'s `is_session_lost` check only matched `"Session not found"`, so the exhausted-text was returned verbatim as a review reply; `gate::parse_verdict` then saw the last line `"...before retrying."` (no verdict tag) and returned `Verdict::Unparseable`, surfacing the misleading "peer review could not complete" block.
+
+### Internal
+- **`mcp::is_context_exhausted` (new pure-fn helper)**: strict conjunction of two distinctive substrings (`"ran out of room"` AND `"context window"`, case-insensitive). Conjunction prevents false positives on user content that mentions either phrase alone.
+- **`mcp::ask_topic` warm-thread reply arm (new)**: checks `is_context_exhausted` BEFORE the existing `is_session_lost` arm. On match, drops the warm thread (same recovery path as session-lost) and falls through to the existing cold-reopen block — next `ask_topic` call gets a fresh thread with empty context.
+
+### Tests
+- +4 unit tests in `mcp::tests`: detects exact Codex string; case-insensitive variants; rejects single-substring text and the deliberately-rejected `"start a new thread"` phrase alone; disjoint from `is_session_lost`.
+
 ## [0.22.0] - 2026-05-27
 
 ### Added

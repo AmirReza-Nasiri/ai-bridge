@@ -186,6 +186,12 @@ impl Server {
                 (r, elicit)
             };
             match reply {
+                // v0.22.1: context-exhausted check MUST come FIRST so the
+                // "everything-not-session-lost is a real reply" arm below
+                // doesn't accidentally return the exhausted-text as a review.
+                Ok(text) if is_context_exhausted(&text) => {
+                    self.threads.remove(&key); // context full → drop, reopen cold below
+                }
                 Ok(text) if !is_session_lost(&text) => return Ok(append_elicit(text, elicit)),
                 Ok(_) => {
                     self.threads.remove(&key); // stale thread → reopen below
@@ -876,6 +882,21 @@ impl Server {
 fn is_session_lost(text: &str) -> bool {
     let t = text.trim_start();
     t.starts_with("Session not found") || t.contains("Session not found for thread_id")
+}
+
+/// v0.22.1: True when Codex returned a "context window exhausted" plain-text
+/// reply rather than a real review. Codex sends this as normal result TEXT
+/// (not a JSON-RPC error) when the warm thread's context has filled up, e.g.:
+/// "Codex ran out of room in the model's context window. Start a new thread
+/// or clear earlier history before retrying."
+///
+/// Predicate is a strict CONJUNCTION of two distinctive substrings so legitimate
+/// review/consult content that mentions either phrase alone is NOT mis-detected.
+/// When true, [`MyServer::ask_topic`] drops the warm thread and reopens cold —
+/// same recovery path as the session-lost case.
+fn is_context_exhausted(text: &str) -> bool {
+    let t = text.to_lowercase();
+    t.contains("ran out of room") && t.contains("context window")
 }
 
 /// Normalize + validate a consult topic. A topic is REQUIRED (blank is rejected) —
@@ -1601,6 +1622,59 @@ mod tests {
         assert!(!is_session_lost(
             "secret-alpha = LION; I do not know secret-beta."
         ));
+    }
+
+    // ───── v0.22.1: context-exhausted detector ─────
+
+    #[test]
+    fn is_context_exhausted_detects_exact_codex_text() {
+        // Exact verbatim string Codex returns when the warm thread is full.
+        let text = "Codex ran out of room in the model's context window. \
+                    Start a new thread or clear earlier history before retrying.";
+        assert!(is_context_exhausted(text));
+    }
+
+    #[test]
+    fn is_context_exhausted_case_insensitive() {
+        assert!(is_context_exhausted(
+            "CODEX RAN OUT OF ROOM in the model's CONTEXT WINDOW."
+        ));
+        assert!(is_context_exhausted(
+            "We Ran Out Of Room in the Context Window of the model."
+        ));
+    }
+
+    #[test]
+    fn is_context_exhausted_rejects_unrelated_text() {
+        // Only ONE substring present → must NOT trigger (strict conjunction).
+        assert!(
+            !is_context_exhausted("Discussion of the model's context window for review."),
+            "single substring 'context window' alone must not trigger"
+        );
+        assert!(
+            !is_context_exhausted("The car ran out of room in the driveway."),
+            "single substring 'ran out of room' alone must not trigger"
+        );
+        assert!(
+            !is_context_exhausted("Please start a new thread for the next topic."),
+            "the deliberately-rejected R1 phrase must NEVER trigger alone"
+        );
+        // Empty + neutral content
+        assert!(!is_context_exhausted(""));
+        assert!(!is_context_exhausted("approved — looks good"));
+    }
+
+    #[test]
+    fn is_context_exhausted_rejects_session_not_found() {
+        // The two detectors must be DISJOINT — a session-lost text must NOT
+        // also trigger context-exhausted (or the ask_topic arm ordering would
+        // be ambiguous).
+        let text = "Session not found for thread_id: 019e5051-9606-7870";
+        assert!(is_session_lost(text));
+        assert!(
+            !is_context_exhausted(text),
+            "session-lost and context-exhausted must be disjoint predicates"
+        );
     }
 
     #[test]
