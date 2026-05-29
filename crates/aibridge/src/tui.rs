@@ -2779,7 +2779,16 @@ fn rtk_row_decoration(
 
 /// v0.25.0: one-line summary of the staged self-update for the Update tab. Pure
 /// (unit-tested). Returns `None` for a Superseded record (nothing useful to show).
-fn staged_status_line(st: &aibridge_core::staged_update::UpdateStatus) -> Option<String> {
+/// v0.29 (B2): `running_version` is the plain semver of the BINARY currently running
+/// this TUI (`aibridge_core::version()`). For a `Succeeded` update, once the running
+/// binary is already at/above the staged `to`, the update is LIVE → we hide the
+/// "restart to use it" nag (it persisted as a stale status even after the restart).
+/// Fail-safe: if either version is unparseable we KEEP the nag (never hide a genuinely
+/// pending restart on uncertainty).
+fn staged_status_line(
+    st: &aibridge_core::staged_update::UpdateStatus,
+    running_version: &str,
+) -> Option<String> {
     use aibridge_core::staged_update::StagedState;
     let vers = format!("{} → {}", st.from, st.to);
     Some(match st.state {
@@ -2788,7 +2797,17 @@ fn staged_status_line(st: &aibridge_core::staged_update::UpdateStatus) -> Option
             format!("staged update {vers} — waiting for aibridge processes to exit ('x' to cancel)")
         }
         StagedState::Applying => format!("staged update {vers} — applying now…"),
-        StagedState::Succeeded => format!("updated to {} ✓ (restart to use it)", st.to),
+        StagedState::Succeeded => {
+            use aibridge_core::update::parse_version;
+            let live = matches!(
+                (parse_version(running_version), parse_version(&st.to)),
+                (Some(running), Some(to)) if running >= to
+            );
+            if live {
+                return None; // update already in effect — no restart needed
+            }
+            format!("updated to {} ✓ (restart to use it)", st.to)
+        }
         StagedState::Failed => {
             let why = st.error.as_deref().unwrap_or("unknown error");
             format!("staged update {vers} FAILED: {why} ('g' to retry)")
@@ -2856,7 +2875,7 @@ fn render_update(f: &mut Frame, app: &App, area: Rect) {
     }
     // v0.25.0: staged-update status (in-TUI self-update; applied by the detached helper).
     if let Some(st) = &app.staged_status {
-        if let Some(line) = staged_status_line(st) {
+        if let Some(line) = staged_status_line(st, aibridge_core::version()) {
             items.push(ListItem::new(Line::from(Span::styled(
                 format!("              {line}"),
                 Style::default().fg(Color::Cyan),
@@ -3159,7 +3178,7 @@ mod tests {
     #[test]
     fn staged_status_line_waiting_mentions_cancel() {
         use aibridge_core::staged_update::StagedState;
-        let line = super::staged_status_line(&fake_status(StagedState::Waiting)).unwrap();
+        let line = super::staged_status_line(&fake_status(StagedState::Waiting), "0.0.0").unwrap();
         assert!(
             line.contains("waiting") && line.contains("'x' to cancel"),
             "{line}"
@@ -3169,7 +3188,7 @@ mod tests {
     #[test]
     fn staged_status_line_failed_mentions_retry_and_reason() {
         use aibridge_core::staged_update::StagedState;
-        let line = super::staged_status_line(&fake_status(StagedState::Failed)).unwrap();
+        let line = super::staged_status_line(&fake_status(StagedState::Failed), "0.0.0").unwrap();
         assert!(
             line.contains("FAILED") && line.contains("swap boom") && line.contains("'g' to retry"),
             "{line}"
@@ -3179,7 +3198,56 @@ mod tests {
     #[test]
     fn staged_status_line_superseded_is_hidden() {
         use aibridge_core::staged_update::StagedState;
-        assert!(super::staged_status_line(&fake_status(StagedState::Superseded)).is_none());
+        assert!(
+            super::staged_status_line(&fake_status(StagedState::Superseded), "0.0.0").is_none()
+        );
+    }
+
+    // ─── v0.29 (B2): Succeeded nag hides once the running version IS the applied one ───
+    #[test]
+    fn staged_status_line_succeeded_shows_nag_when_not_yet_running_new_version() {
+        use aibridge_core::staged_update::StagedState;
+        // running 0.24.0 < to 0.25.0 → update not live yet → show "restart to use it"
+        let line =
+            super::staged_status_line(&fake_status(StagedState::Succeeded), "0.24.0").unwrap();
+        assert!(line.contains("restart to use it"), "{line}");
+    }
+
+    #[test]
+    fn staged_status_line_succeeded_hidden_when_running_equals_target() {
+        use aibridge_core::staged_update::StagedState;
+        // running == to (0.25.0) → live → no nag
+        assert!(
+            super::staged_status_line(&fake_status(StagedState::Succeeded), "0.25.0").is_none()
+        );
+    }
+
+    #[test]
+    fn staged_status_line_succeeded_hidden_when_running_newer_than_target() {
+        use aibridge_core::staged_update::StagedState;
+        // running 0.26.0 > to 0.25.0 → live → no nag
+        assert!(
+            super::staged_status_line(&fake_status(StagedState::Succeeded), "0.26.0").is_none()
+        );
+    }
+
+    #[test]
+    fn staged_status_line_succeeded_shows_nag_when_running_version_unparseable() {
+        use aibridge_core::staged_update::StagedState;
+        // can't confirm the update is live → fail-safe: keep the nag
+        let line = super::staged_status_line(&fake_status(StagedState::Succeeded), "not-a-version")
+            .unwrap();
+        assert!(line.contains("restart to use it"), "{line}");
+    }
+
+    #[test]
+    fn staged_status_line_succeeded_shows_nag_when_target_unparseable() {
+        use aibridge_core::staged_update::StagedState;
+        // `to` itself can't be parsed → can't confirm live → fail-safe: keep the nag
+        let mut st = fake_status(StagedState::Succeeded);
+        st.to = "weird-build".into();
+        let line = super::staged_status_line(&st, "0.25.0").unwrap();
+        assert!(line.contains("restart to use it"), "{line}");
     }
 
     // ─── v0.20.1 typed SelfUpdateState dispatch tests ───
