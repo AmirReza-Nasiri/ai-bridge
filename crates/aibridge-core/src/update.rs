@@ -288,10 +288,11 @@ fn metadata_path() -> Option<PathBuf> {
     Some(global_dir()?.join("install.json"))
 }
 
-/// Record install provenance. Called by `init` with the running exe path. Best-effort.
-pub fn record_install(install_path: &str) {
-    let Some(dir) = global_dir() else { return };
-    if std::fs::create_dir_all(&dir).is_err() {
+/// v0.29 (B1): testable core — record install provenance into the EXACT `dir` given
+/// (`dir/install.json`), NEVER `global_dir()`/`metadata_path()`, so a temp-dir caller
+/// can't touch the real `~/.ai-bridge/install.json`. Best-effort.
+pub(crate) fn record_install_in(dir: &Path, install_path: &str) {
+    if std::fs::create_dir_all(dir).is_err() {
         return;
     }
     let meta = serde_json::json!({
@@ -301,9 +302,17 @@ pub fn record_install(install_path: &str) {
         "version": env!("CARGO_PKG_VERSION"),
         "git_sha": crate::GIT_SHA,
     });
-    if let Some(p) = metadata_path() {
-        let _ = std::fs::write(p, serde_json::to_string_pretty(&meta).unwrap_or_default());
-    }
+    let _ = std::fs::write(
+        dir.join("install.json"),
+        serde_json::to_string_pretty(&meta).unwrap_or_default(),
+    );
+}
+
+/// Record install provenance into the REAL (`global_dir()`) metadata. Called by `init`
+/// with the running exe path. Best-effort. Production wrapper over [`record_install_in`].
+pub fn record_install(install_path: &str) {
+    let Some(dir) = global_dir() else { return };
+    record_install_in(&dir, install_path);
 }
 
 /// Pure parser for the `install_path` field of install.json. Separated so the raw
@@ -1102,11 +1111,13 @@ fn asset_filename(install: &Path) -> String {
         .to_string()
 }
 
-/// Update install metadata after a successful replace: record the INSTALLED tag
-/// version (not the running/old binary's), don't carry the old git SHA.
-pub(crate) fn write_installed_meta(install_path: &str, version: &str) {
-    let Some(dir) = global_dir() else { return };
-    if std::fs::create_dir_all(&dir).is_err() {
+/// v0.29 (B1): testable core — write install metadata into the EXACT `dir` given
+/// (`dir/install.json`), NEVER `global_dir()`/`metadata_path()`. So a caller that
+/// passes a temp dir (the staged-apply tests) can never corrupt the real
+/// `~/.ai-bridge/install.json`. Best-effort. Records the INSTALLED tag version (not
+/// the running/old binary's); `git_sha` is "unknown" (we only know the tag here).
+pub(crate) fn write_installed_meta_in(dir: &Path, install_path: &str, version: &str) {
+    if std::fs::create_dir_all(dir).is_err() {
         return;
     }
     let meta = serde_json::json!({
@@ -1116,9 +1127,17 @@ pub(crate) fn write_installed_meta(install_path: &str, version: &str) {
         "version": version,
         "git_sha": "unknown",
     });
-    if let Some(p) = metadata_path() {
-        let _ = std::fs::write(p, serde_json::to_string_pretty(&meta).unwrap_or_default());
-    }
+    let _ = std::fs::write(
+        dir.join("install.json"),
+        serde_json::to_string_pretty(&meta).unwrap_or_default(),
+    );
+}
+
+/// Update the REAL (`global_dir()`) install metadata after a successful replace.
+/// Production wrapper over [`write_installed_meta_in`].
+pub(crate) fn write_installed_meta(install_path: &str, version: &str) {
+    let Some(dir) = global_dir() else { return };
+    write_installed_meta_in(&dir, install_path, version);
 }
 
 #[cfg(test)]
@@ -1228,6 +1247,47 @@ mod tests {
             &|_p| true,
         );
         assert_eq!(got.as_deref(), Some("/real/current/aibridge"));
+    }
+
+    // ─── v0.29 (B1): metadata writers must hit the GIVEN dir, never global_dir() ───
+    fn b1_tmp_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "aibridge-b1-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|t| t.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn write_installed_meta_in_writes_only_to_given_dir() {
+        let dir = b1_tmp_dir("wim");
+        write_installed_meta_in(&dir, "/some/install/aibridge", "9.9.9");
+        let raw = std::fs::read_to_string(dir.join("install.json")).unwrap();
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["install_path"], "/some/install/aibridge");
+        assert_eq!(v["version"], "9.9.9");
+        // round-trips through the pure parser
+        assert_eq!(
+            parse_recorded_install_path(&raw).as_deref(),
+            Some("/some/install/aibridge")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn record_install_in_writes_only_to_given_dir() {
+        let dir = b1_tmp_dir("rec");
+        record_install_in(&dir, "/some/install/aibridge");
+        let raw = std::fs::read_to_string(dir.join("install.json")).unwrap();
+        let v: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["install_path"], "/some/install/aibridge");
+        assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ─── v0.24.0: confirmation must fail closed on non-TTY ───

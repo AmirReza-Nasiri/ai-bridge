@@ -979,7 +979,15 @@ fn apply_in(
     //    NOT consulted here — the apply is gated solely by the Applying claim.
     match swap_fn(&spec.target, &spec.payload) {
         Ok(_note) => {
-            crate::update::write_installed_meta(&spec.target.display().to_string(), &spec.to);
+            // v0.29 (B1): write metadata under THIS apply's `root` (== global_dir() in
+            // production via stage_planned_update/apply_staged_update_from_spec_real),
+            // never global_dir() directly — so test apply_in calls (temp root) can't
+            // corrupt the real ~/.ai-bridge/install.json.
+            crate::update::write_installed_meta_in(
+                root,
+                &spec.target.display().to_string(),
+                &spec.to,
+            );
             let _ = with_status_lock(root, now_ms, liveness, || {
                 if let Some(mut st) = read_status_in(root) {
                     if st.id == spec.id && st.state == StagedState::Applying {

@@ -264,6 +264,17 @@ fn apply_clear_path_self_registers_and_swaps() {
     assert!(target.exists(), "binary swapped into place");
     // staged dir cleaned up on success; global status survives
     assert!(!staged_dir(&root, &st.id).exists(), "staged dir cleaned");
+    // v0.29 (B1): install metadata is written under THIS apply's root (the test temp
+    // dir), NOT the real ~/.ai-bridge — proving `cargo test` no longer corrupts it.
+    let raw =
+        std::fs::read_to_string(root.join("install.json")).expect("install.json under test root");
+    let meta: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(meta["version"], "0.25.0", "records the applied tag version");
+    assert_eq!(
+        meta["install_path"],
+        target.display().to_string(),
+        "records the target path under the test root (not the real ~/.ai-bridge)"
+    );
 }
 
 // v0.28: the macOS/unix immediate-apply entry — records the crash-recovery marker,
