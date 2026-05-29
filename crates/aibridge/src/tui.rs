@@ -26,7 +26,7 @@ use std::io::IsTerminal;
 use std::time::{Duration, Instant};
 
 use aibridge_core::doctor::{self, Check, Status};
-use aibridge_core::{claude_mcp, progress, review_mcp, skills};
+use aibridge_core::{claude_mcp, codex_models, progress, review_mcp, skills};
 
 /// Format a managed-skills `OpResult` into a single footer line. When `ok == false`, the
 /// loud `⚠ NOT fully …` line is preferred so a partial failure is never hidden behind a
@@ -102,6 +102,102 @@ struct McpRow {
 enum McpView {
     Servers,
     Tools,
+}
+
+// ───────────────────────── v0.29 (O1c): review-model selector ─────────────────────────
+//
+// The Review tab is an interactive picker for AI Bridge's review MODEL: a "Default"
+// row (use codex's config.toml — no override), one row per live model from codex's
+// own cache (`codex_models::list_models`), and a "Custom" row for a free-text slug
+// (also the fallback when the cache is missing). Selecting persists via
+// `review_mcp::set_codex_model`. The TUI is a SEPARATE process from the MCP server, and
+// O1b pins ONE review model for the whole server lifetime — so a change is only
+// "configured" on disk and takes effect after Claude Code / the AI Bridge MCP server is
+// restarted (NOT on the next review-child spawn). The TUI never renders a model as
+// "active" and never edits the context-window override (CLI-only; preserved on save).
+
+/// One selectable row in the review-model picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ModelChoice {
+    /// Clear the override → codex uses its own config.toml default (clears ctx too).
+    Default,
+    /// A concrete model from codex's live cache.
+    Model(codex_models::ModelInfo),
+    /// Free-text slug entry (also the fallback when the live cache is empty).
+    Custom,
+}
+
+/// Outcome of feeding one key to the custom-slug text editor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InputOutcome {
+    /// Buffer changed (or the key was ignored) — stay in input mode.
+    Editing,
+    /// Enter pressed — submit the trimmed buffer.
+    Submit(String),
+    /// Esc pressed — leave input mode without saving.
+    Cancel,
+}
+
+/// Pure: the picker rows = [Default, one per cached model, Custom]. Custom is always
+/// last so it is the fallback even when `rows` is empty (→ [Default, Custom]).
+fn model_choices(rows: &[codex_models::ModelInfo]) -> Vec<ModelChoice> {
+    let mut out = Vec::with_capacity(rows.len() + 2);
+    out.push(ModelChoice::Default);
+    out.extend(rows.iter().cloned().map(ModelChoice::Model));
+    out.push(ModelChoice::Custom);
+    out
+}
+
+/// Pure: index of the row the ON-DISK config points to (the "configured" row — NOT
+/// "active": the running server may still hold a different pinned model). No model → 0
+/// (Default); a configured model present in the cache → its row; a configured model NOT
+/// in the cache → the Custom row (last). ctx is irrelevant to which model is configured.
+fn configured_choice_index(
+    rows: &[codex_models::ModelInfo],
+    current: &review_mcp::CodexReviewConfig,
+) -> usize {
+    match &current.model {
+        None => 0,
+        Some(slug) => rows
+            .iter()
+            .position(|m| &m.slug == slug)
+            .map(|i| i + 1)
+            .unwrap_or(rows.len() + 1), // Custom row (last)
+    }
+}
+
+/// Pure: the (model, ctx) args to persist for a chosen row, or `None` when the choice
+/// needs free-text input first (Custom). The context window is PRESERVED for Model rows
+/// (never silently cleared — it is a CLI-only setting); only Default clears both.
+fn model_choice_set_args(
+    choice: &ModelChoice,
+    current_ctx: Option<u64>,
+) -> Option<(Option<String>, Option<u64>)> {
+    match choice {
+        ModelChoice::Default => Some((None, None)),
+        ModelChoice::Model(m) => Some((Some(m.slug.clone()), current_ctx)),
+        ModelChoice::Custom => None,
+    }
+}
+
+/// Pure: feed one key to the custom-slug editor. Only slug-safe chars (matching
+/// `review_mcp`'s validation: ascii-alphanumeric + `.`/`_`/`-`) are accepted, so a typed
+/// id can never be shown-then-rejected on save. Enter submits the trimmed buffer; Esc
+/// cancels; every other key leaves the buffer unchanged.
+fn edit_model_input(buf: &mut String, code: KeyCode) -> InputOutcome {
+    match code {
+        KeyCode::Char(c) if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') => {
+            buf.push(c);
+            InputOutcome::Editing
+        }
+        KeyCode::Backspace => {
+            buf.pop();
+            InputOutcome::Editing
+        }
+        KeyCode::Enter => InputOutcome::Submit(buf.trim().to_string()),
+        KeyCode::Esc => InputOutcome::Cancel,
+        _ => InputOutcome::Editing,
+    }
 }
 
 /// A finished background discovery: (server name, discovered tools or error).
@@ -309,6 +405,15 @@ struct App {
     health_scroll: u16,
     review: Option<serde_json::Value>,
     review_summary: Option<String>,
+    /// v0.29 (O1c) review-model picker. `model_rows` = codex's live model cache
+    /// (read on launch + `r`); `model_current` = the persisted review-mcp.json config
+    /// (what's CONFIGURED, possibly not yet live in the running server); `model_sel` =
+    /// the highlighted picker row; `model_input` = Some(buffer) while typing a custom
+    /// slug (None = list mode).
+    model_rows: Vec<codex_models::ModelInfo>,
+    model_current: review_mcp::CodexReviewConfig,
+    model_sel: usize,
+    model_input: Option<String>,
     /// `None` ⇒ the codex config is present but unenumerable (fail-closed); reviews
     /// would be refused — surfaced as a warning in the MCP tab.
     mcp: Option<Vec<McpRow>>,
@@ -517,6 +622,10 @@ impl App {
             health_scroll: 0,
             review: None,
             review_summary: None,
+            model_rows: Vec::new(),
+            model_current: review_mcp::CodexReviewConfig::default(),
+            model_sel: 0,
+            model_input: None,
             mcp: None,
             mcp_sel: 0,
             mcp_view: McpView::Servers,
@@ -577,6 +686,10 @@ impl App {
             quit: false,
         };
         app.refresh_all();
+        // O1c: load the review-model picker (live cache + persisted config) and open
+        // highlighting the configured row.
+        app.refresh_review_models();
+        app.realign_model_sel();
         app
     }
 
@@ -1547,10 +1660,118 @@ impl App {
         }
     }
 
-    /// Cheap (file read) — safe to call on the ~1s auto-refresh.
+    /// Cheap (file read) — safe to call on the ~1s auto-refresh. Deliberately does NOT
+    /// touch the review-model picker (rows/current/selection) so the auto-tick never
+    /// fights the user's navigation or typing; that state reloads on launch + `r` only.
     fn refresh_review(&mut self) {
         self.review = progress::read_status(&self.cwd);
         self.review_summary = progress::status_report(&self.cwd);
+    }
+
+    /// O1c: reload the review-model picker from disk — the live model cache + the
+    /// persisted config — and clamp the selection to the (possibly shorter) list. Pure
+    /// reads (never writes the config). Called on launch + `r`, NOT on the 1s tick.
+    fn refresh_review_models(&mut self) {
+        self.model_rows = codex_models::list_models();
+        self.model_current = review_mcp::codex_config();
+        let len = model_choices(&self.model_rows).len();
+        if self.model_sel >= len {
+            self.model_sel = len.saturating_sub(1);
+        }
+    }
+
+    /// O1c (pure over already-loaded fields; no IO): move the highlight onto the row the
+    /// on-disk config points to. Used on launch + after a save so the picker re-centers
+    /// on the configured model; plain `r` skips this to preserve navigation.
+    fn realign_model_sel(&mut self) {
+        self.model_sel = configured_choice_index(&self.model_rows, &self.model_current);
+    }
+
+    /// O1c: the picker row Enter acts on (None when the list is somehow empty).
+    fn selected_model_choice(&self) -> Option<ModelChoice> {
+        model_choices(&self.model_rows)
+            .into_iter()
+            .nth(self.model_sel)
+    }
+
+    /// O1c: Enter in list mode. Default/Model persist immediately (ctx PRESERVED for
+    /// Model — only Default clears it); Custom opens the text editor pre-filled with the
+    /// current custom slug when one is configured.
+    fn apply_selected_model(&mut self) {
+        let Some(choice) = self.selected_model_choice() else {
+            return;
+        };
+        // Read the context-window override FRESH (not the cached self.model_current, which
+        // only reloads on launch/`r`) so a ctx changed outside the TUI is never written
+        // back stale. The TUI preserves whatever ctx is on disk; only Default clears it.
+        let ctx = review_mcp::codex_config().model_context_window;
+        match model_choice_set_args(&choice, ctx) {
+            Some((model, ctx)) => {
+                let is_clear = model.is_none();
+                match review_mcp::set_codex_model(model.clone(), ctx) {
+                    Ok(()) => {
+                        self.refresh_review_models();
+                        self.realign_model_sel();
+                        self.message = Some(if is_clear {
+                            "Cleared the review-model override (model + context). Restart Claude \
+                             Code (or the AI Bridge MCP server) to apply."
+                                .to_string()
+                        } else {
+                            format!(
+                                "Configured review model = '{}'. Restart Claude Code (or the AI \
+                                 Bridge MCP server) to apply — the running server keeps its current \
+                                 review model until then.",
+                                model.unwrap_or_default()
+                            )
+                        });
+                    }
+                    Err(e) => self.message = Some(format!("Couldn't save review model: {e}")),
+                }
+            }
+            None => {
+                // Custom row → enter the text editor, pre-filled when a custom slug is set.
+                self.model_input = Some(self.custom_slug_if_configured());
+            }
+        }
+    }
+
+    /// O1c: the configured model slug IFF it isn't one of the cached rows (i.e. a custom
+    /// slug) — used to pre-fill the editor so Enter on the Custom row never starts blank
+    /// over an existing custom model.
+    fn custom_slug_if_configured(&self) -> String {
+        match &self.model_current.model {
+            Some(slug) if !self.model_rows.iter().any(|m| &m.slug == slug) => slug.clone(),
+            _ => String::new(),
+        }
+    }
+
+    /// O1c: submit a typed custom slug. Preserves the context-window override. On success
+    /// leaves input mode + re-centers; on EMPTY or FAILED input it keeps the editor open
+    /// (restoring the typed slug) so the user can fix it or Esc. `handle_key` already
+    /// `take()`s `model_input` before calling this, so this method owns putting it back.
+    fn submit_custom_model(&mut self, slug: String) {
+        if slug.is_empty() {
+            self.model_input = Some(String::new());
+            self.message = Some("Enter a model id, or press Esc to cancel.".to_string());
+            return;
+        }
+        // Fresh read (see apply_selected_model): never overwrite a ctx changed outside.
+        let ctx = review_mcp::codex_config().model_context_window;
+        match review_mcp::set_codex_model(Some(slug.clone()), ctx) {
+            Ok(()) => {
+                self.model_input = None;
+                self.refresh_review_models();
+                self.realign_model_sel();
+                self.message = Some(format!(
+                    "Configured review model = '{slug}'. Restart Claude Code (or the AI Bridge MCP \
+                     server) to apply — the running server keeps its current review model until then."
+                ));
+            }
+            Err(e) => {
+                self.model_input = Some(slug);
+                self.message = Some(format!("Invalid model id: {e}"));
+            }
+        }
     }
 
     fn refresh_mcp(&mut self) {
@@ -1633,7 +1854,15 @@ impl App {
                 self.update_sel = self.update_sel.saturating_add(1);
                 self.clamp_update_sel();
             }
-            Tab::Review => {}
+            // O1c: navigate the review-model picker (no-op while typing a custom slug).
+            Tab::Review => {
+                if self.model_input.is_none() {
+                    let len = model_choices(&self.model_rows).len();
+                    if self.model_sel + 1 < len {
+                        self.model_sel += 1;
+                    }
+                }
+            }
         }
     }
     fn move_up(&mut self) {
@@ -1651,7 +1880,12 @@ impl App {
             Tab::Debug => self.debug_scroll = self.debug_scroll.saturating_sub(1),
             Tab::Skills => self.managed_sel = self.managed_sel.saturating_sub(1),
             Tab::Update => self.update_sel = self.update_sel.saturating_sub(1),
-            Tab::Review => {}
+            // O1c: navigate the review-model picker (no-op while typing a custom slug).
+            Tab::Review => {
+                if self.model_input.is_none() {
+                    self.model_sel = self.model_sel.saturating_sub(1);
+                }
+            }
         }
     }
     fn selected_mcp(&self) -> Option<(&str, bool)> {
@@ -1889,6 +2123,18 @@ fn run_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
 }
 
 fn handle_key(app: &mut App, code: KeyCode) {
+    // O1c: while typing a custom review-model slug, the editor OWNS every key — routed
+    // BEFORE the global q/Esc/Tab/arrow handlers so typing/Esc can't quit or switch tabs.
+    // Guarded to the Review tab so it never leaks elsewhere.
+    if app.tab == Tab::Review && app.model_input.is_some() {
+        let mut buf = app.model_input.take().unwrap_or_default();
+        match edit_model_input(&mut buf, code) {
+            InputOutcome::Editing => app.model_input = Some(buf),
+            InputOutcome::Submit(slug) => app.submit_custom_model(slug),
+            InputOutcome::Cancel => app.model_input = None,
+        }
+        return;
+    }
     // v0.25.0: any key other than `u` cancels a pending FreshInstall 2-key confirm —
     // so an intervening action (c/r/x/g/…) that may change the visible command forces
     // a fresh first press before a first global install can run.
@@ -2075,6 +2321,9 @@ fn handle_key(app: &mut App, code: KeyCode) {
                 );
             }
         }
+        // O1c: Enter on the Review tab = configure the selected review model (list mode;
+        // input mode is intercepted at the top of handle_key).
+        KeyCode::Enter if app.tab == Tab::Review => app.apply_selected_model(),
         // Managed skills: Enter = INSTALL/UPDATE the selected skill → 2-key confirm.
         KeyCode::Enter if app.tab == Tab::Skills => {
             if app.selected_managed().is_none() {
@@ -2186,6 +2435,11 @@ fn handle_key(app: &mut App, code: KeyCode) {
         }
         KeyCode::Char('r') => {
             app.refresh_all();
+            if app.tab == Tab::Review {
+                // O1c: reload the live model cache + persisted config. Preserve the
+                // current navigation position (don't realign) — manual refresh only.
+                app.refresh_review_models();
+            }
             if app.tab == Tab::Skills {
                 app.refresh_skills();
             }
@@ -2257,7 +2511,12 @@ fn ui(f: &mut Frame, app: &App) {
         Tab::Skills => {
             "Up/Dn: select | Enter: install | M: migrate-and-install | U: check upstream | B: bump (preview→commit) | p: repair | o: adopt | d: disable | x: remove | i: apply all | n: init | s/m: personal sync/migrate | r: refresh | q: quit"
         }
-        Tab::Review => "Tab/Left/Right: tabs | r: refresh | q: quit (auto-refreshes ~1s)",
+        Tab::Review if app.model_input.is_some() => {
+            "type model id | Enter: save | Esc: cancel"
+        }
+        Tab::Review => {
+            "Tab/Left/Right: tabs | Up/Dn: select | Enter: configure model | r: refresh | q: quit"
+        }
         Tab::Update => {
             "↑/↓: select | c: check self | u: update/stage | x: cancel staged | g: retry staged | r: re-check | q: quit"
         }
@@ -2401,6 +2660,98 @@ fn render_review(f: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(Color::Yellow),
         )));
     }
+
+    // ── O1c: review-model picker ──
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Review model",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )));
+    let cfg_model = app
+        .model_current
+        .model
+        .clone()
+        .unwrap_or_else(|| "default (codex config.toml)".to_string());
+    let cfg_ctx = app
+        .model_current
+        .model_context_window
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "default".to_string());
+    lines.push(Line::from(Span::styled(
+        format!("Configured:  model={cfg_model}   context={cfg_ctx}"),
+        Style::default().fg(Color::DarkGray),
+    )));
+    if app.model_rows.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "(no live model cache found — pick Custom to type a model id)",
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+    let choices = model_choices(&app.model_rows);
+    let configured = configured_choice_index(&app.model_rows, &app.model_current);
+    let custom_slug = app.custom_slug_if_configured();
+    for (i, choice) in choices.iter().enumerate() {
+        let label = match choice {
+            ModelChoice::Default => "Default (use codex config.toml — no override)".to_string(),
+            ModelChoice::Model(m) => {
+                let ctx = m
+                    .context_window
+                    .map(|n| format!("   ctx {n}"))
+                    .unwrap_or_default();
+                if m.display_name == m.slug {
+                    format!("{}{ctx}", m.slug)
+                } else {
+                    format!("{} ({}){ctx}", m.display_name, m.slug)
+                }
+            }
+            ModelChoice::Custom => {
+                if custom_slug.is_empty() {
+                    "Custom model id…".to_string()
+                } else {
+                    format!("Custom: {custom_slug}")
+                }
+            }
+        };
+        let prefix = if i == app.model_sel { ">" } else { " " };
+        let marker = if i == configured {
+            "  ● configured"
+        } else {
+            ""
+        };
+        let style = if i == app.model_sel {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else if i == configured {
+            Style::default().fg(Color::Green)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(Span::styled(
+            format!("{prefix} {label}{marker}"),
+            style,
+        )));
+    }
+    if let Some(buf) = &app.model_input {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::raw("New model id: "),
+            Span::styled(
+                format!("{buf}_"),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        lines.push(Line::from(Span::styled(
+            "Enter: save   Esc: cancel   (allowed: letters, digits, '.', '_', '-')",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
     let p = Paragraph::new(lines)
         .block(
             Block::default()
@@ -3000,6 +3351,11 @@ mod tests {
             health_scroll: 0,
             review: None,
             review_summary: None,
+            // O1c: hermetic — empty picker state, no real-config IO in tests.
+            model_rows: Vec::new(),
+            model_current: review_mcp::CodexReviewConfig::default(),
+            model_sel: 0,
+            model_input: None,
             mcp_view: McpView::Servers,
             mcp_server: None,
             tool_rows: Vec::new(),
@@ -3078,6 +3434,181 @@ mod tests {
             message: None,
             quit: false,
         }
+    }
+
+    // ───────────────────── O1c: review-model picker (pure logic) ─────────────────────
+
+    fn mi(slug: &str) -> codex_models::ModelInfo {
+        codex_models::ModelInfo {
+            slug: slug.to_string(),
+            display_name: slug.to_string(),
+            context_window: None,
+            priority: 0,
+        }
+    }
+
+    fn mk_cfg(model: Option<&str>, ctx: Option<u64>) -> review_mcp::CodexReviewConfig {
+        review_mcp::CodexReviewConfig {
+            model: model.map(str::to_string),
+            model_context_window: ctx,
+        }
+    }
+
+    #[test]
+    fn model_choices_shape_empty_and_populated() {
+        // Empty cache → [Default, Custom] (Custom is the fallback).
+        let ch = model_choices(&[]);
+        assert_eq!(ch.len(), 2);
+        assert_eq!(ch[0], ModelChoice::Default);
+        assert_eq!(ch[1], ModelChoice::Custom);
+        // N rows → N + 2, models in the middle, Custom last.
+        let rows = vec![mi("a"), mi("b"), mi("c")];
+        let ch = model_choices(&rows);
+        assert_eq!(ch.len(), 5);
+        assert_eq!(ch[0], ModelChoice::Default);
+        assert!(matches!(&ch[1], ModelChoice::Model(m) if m.slug == "a"));
+        assert_eq!(ch[4], ModelChoice::Custom);
+    }
+
+    #[test]
+    fn configured_choice_index_all_four_states() {
+        let rows = vec![mi("a"), mi("b")];
+        // unset → Default (0)
+        assert_eq!(configured_choice_index(&rows, &mk_cfg(None, None)), 0);
+        // a listed model → its row (1 + idx)
+        assert_eq!(configured_choice_index(&rows, &mk_cfg(Some("b"), None)), 2);
+        // an unlisted/custom model → the Custom row (last = rows.len() + 1)
+        assert_eq!(
+            configured_choice_index(&rows, &mk_cfg(Some("zzz"), None)),
+            3
+        );
+        // empty cache + unset → Default
+        assert_eq!(configured_choice_index(&[], &mk_cfg(None, None)), 0);
+        // empty cache + custom → Custom (index 1)
+        assert_eq!(configured_choice_index(&[], &mk_cfg(Some("zzz"), None)), 1);
+        // a context override does NOT change which model is configured
+        assert_eq!(
+            configured_choice_index(&rows, &mk_cfg(Some("a"), Some(123))),
+            1
+        );
+    }
+
+    #[test]
+    fn model_choice_set_args_preserves_ctx_except_default() {
+        // Default clears BOTH model and context, even when a ctx is configured.
+        assert_eq!(
+            model_choice_set_args(&ModelChoice::Default, Some(123)),
+            Some((None, None))
+        );
+        // A Model row PRESERVES the current context override (no silent clear).
+        assert_eq!(
+            model_choice_set_args(&ModelChoice::Model(mi("a")), Some(123)),
+            Some((Some("a".to_string()), Some(123)))
+        );
+        assert_eq!(
+            model_choice_set_args(&ModelChoice::Model(mi("a")), None),
+            Some((Some("a".to_string()), None))
+        );
+        // Custom needs free-text input first (no direct persist).
+        assert_eq!(model_choice_set_args(&ModelChoice::Custom, Some(123)), None);
+    }
+
+    #[test]
+    fn edit_model_input_charset_backspace_enter_esc() {
+        let mut b = String::new();
+        for c in ['g', 'p', 't', '-', '5', '.'] {
+            assert_eq!(
+                edit_model_input(&mut b, KeyCode::Char(c)),
+                InputOutcome::Editing
+            );
+        }
+        assert_eq!(b, "gpt-5.");
+        // disallowed chars (space, '!') are ignored — never enter the buffer.
+        let _ = edit_model_input(&mut b, KeyCode::Char(' '));
+        let _ = edit_model_input(&mut b, KeyCode::Char('!'));
+        assert_eq!(b, "gpt-5.");
+        // backspace pops.
+        assert_eq!(
+            edit_model_input(&mut b, KeyCode::Backspace),
+            InputOutcome::Editing
+        );
+        assert_eq!(b, "gpt-5");
+        // Enter submits the trimmed buffer.
+        assert_eq!(
+            edit_model_input(&mut b, KeyCode::Enter),
+            InputOutcome::Submit("gpt-5".to_string())
+        );
+        // Esc cancels.
+        assert_eq!(edit_model_input(&mut b, KeyCode::Esc), InputOutcome::Cancel);
+    }
+
+    #[test]
+    fn realign_model_sel_centers_on_configured_row() {
+        let mut a = test_app(&[]);
+        a.model_rows = vec![mi("a"), mi("b")];
+        a.model_current = mk_cfg(None, None);
+        a.realign_model_sel();
+        assert_eq!(a.model_sel, 0); // Default
+        a.model_current = mk_cfg(Some("b"), None);
+        a.realign_model_sel();
+        assert_eq!(a.model_sel, 2); // listed row
+        a.model_current = mk_cfg(Some("zzz"), None);
+        a.realign_model_sel();
+        assert_eq!(a.model_sel, 3); // Custom (unlisted)
+        a.model_rows = vec![];
+        a.model_current = mk_cfg(Some("zzz"), None);
+        a.realign_model_sel();
+        assert_eq!(a.model_sel, 1); // empty-cache Custom
+    }
+
+    #[test]
+    fn enter_on_custom_row_opens_input_mode_no_io() {
+        let mut a = test_app(&[]);
+        a.tab = Tab::Review;
+        a.model_rows = vec![mi("a")]; // choices = [Default, a, Custom]
+        a.model_sel = 2; // Custom
+        assert!(a.model_input.is_none());
+        handle_key(&mut a, KeyCode::Enter);
+        assert!(a.model_input.is_some(), "Enter on Custom opens the editor");
+        assert!(!a.quit);
+    }
+
+    #[test]
+    fn input_mode_owns_keys_no_quit_no_tab_switch() {
+        let mut a = test_app(&[]);
+        a.tab = Tab::Review;
+        a.model_input = Some(String::new());
+        // 'q' while typing must NOT quit — it is a valid slug char and goes to the buffer.
+        handle_key(&mut a, KeyCode::Char('q'));
+        assert!(!a.quit);
+        assert!(a.tab == Tab::Review);
+        assert_eq!(a.model_input.as_deref(), Some("q"));
+        // Tab while typing must NOT switch tabs (ignored by the editor).
+        handle_key(&mut a, KeyCode::Tab);
+        assert!(a.tab == Tab::Review);
+        assert_eq!(a.model_input.as_deref(), Some("q"));
+        // Esc cancels input — does NOT quit.
+        handle_key(&mut a, KeyCode::Esc);
+        assert!(a.model_input.is_none());
+        assert!(!a.quit);
+    }
+
+    #[test]
+    fn submit_custom_model_keeps_editor_open_on_empty_or_error() {
+        // `handle_key` `take()`s model_input before calling submit, so submit owns putting
+        // it back. Empty + failed inputs must KEEP the editor open (not close + lose it).
+        let mut a = test_app(&[]);
+        a.tab = Tab::Review;
+        // Empty submit → editor stays open with an empty buffer.
+        a.model_input = None;
+        a.submit_custom_model(String::new());
+        assert_eq!(a.model_input.as_deref(), Some(""));
+        // A slug that fails validation (space → rejected by set_codex_model BEFORE any
+        // write — hermetic) restores the typed buffer so the user can fix it.
+        a.model_input = None;
+        a.submit_custom_model("bad slug!".to_string());
+        assert_eq!(a.model_input.as_deref(), Some("bad slug!"));
+        assert!(!a.quit);
     }
 
     #[test]
