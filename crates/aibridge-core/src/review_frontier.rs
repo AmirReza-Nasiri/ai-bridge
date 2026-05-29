@@ -38,6 +38,7 @@ fn now_ms() -> u128 {
 }
 
 /// The recorded review base for a task.
+#[derive(Debug)]
 pub enum BaseKind {
     /// A specific commit (HEAD at task start).
     Commit(String),
@@ -66,19 +67,29 @@ impl Frontier {
     }
 }
 
-/// Advance the base at task start only when there is no unresolved review debt.
+/// Advance the base at task start only when doing so cannot drop unreviewed work.
 /// Pure (no IO) so it is unit-testable.
 ///
-/// v0.29 note: a model change does NOT gate the advance here. The hook (a separate
-/// short-lived process) can't reliably know the SERVER's active pinned model, and
-/// comparing against the merely-configured model would change behavior before the
-/// restart that applies it (violating the advisory-only pending policy). Model-fp
-/// binding lives only in the server-owned review paths (the Stop receipt + in-memory
-/// allow). Re-reviewing already-frontier-advanced committed work under a new model is a
-/// documented v0.29 limitation; the correct future design is a server-owned repo-level
-/// approved-span ledger (or an explicit `review-model set --rewind-frontier`).
-fn should_advance(prev_status: Option<&str>) -> bool {
-    !matches!(prev_status, Some(STATUS_BLOCKED) | Some(STATUS_NEEDS_USER))
+/// - BLOCKED / NEEDS_USER → never advance (unresolved review debt stays in scope).
+/// - OPEN → advance ONLY when there are no committed-but-unreviewed commits since the
+///   prior base. 'open' means the prior task started but never got a TERMINAL Stop
+///   review; if it committed code and a new prompt arrives before that review (mid-turn
+///   interrupt / reload / stop_active continuation), advancing to HEAD would baseline
+///   PAST those commits and they would never be reviewed. So we keep the old base and
+///   carry them into the next Stop. (v0.30 fix for the interrupt/reload escape.)
+/// - APPROVED / none → advance. APPROVED genuinely reviewed base..HEAD and HEAD cannot
+///   have moved after the turn ended; `none` is the first task (nothing prior to lose).
+///
+/// v0.29 note (unchanged): a model change does NOT gate the advance here — the hook
+/// can't know the server's active pinned model. Re-reviewing already-frontier-advanced
+/// committed work after a model change is a separate documented limitation; the future
+/// design is a server-owned repo-level approved-span ledger.
+fn should_advance(prev_status: Option<&str>, unreviewed_commits: bool) -> bool {
+    match prev_status {
+        Some(STATUS_BLOCKED) | Some(STATUS_NEEDS_USER) => false,
+        Some(STATUS_OPEN) => !unreviewed_commits,
+        _ => true,
+    }
 }
 
 fn global_dir() -> Option<PathBuf> {
@@ -200,12 +211,27 @@ pub fn on_task_start(cwd: &str, session: &str) {
     let Some(root) = crate::git::repo_root(cwd) else {
         return; // not a git repo: nothing to baseline
     };
-    let prev = read_raw(&root, session);
-    let prev_status = prev
-        .as_ref()
-        .and_then(|v| v.get("status").and_then(Value::as_str));
-    if !should_advance(prev_status) {
-        return; // unresolved debt: keep existing base + status
+    // Derive the EFFECTIVE prior frontier (frontier_from normalizes a MISSING status to
+    // OPEN, so a persisted-base-but-no-status row is correctly gated, not treated as
+    // absent). `None` is reserved for truly-absent state (first task).
+    let prev = read_raw(&root, session).map(|v| frontier_from(&v));
+    let prev_status = prev.as_ref().map(|f| f.status.as_str());
+    // Only the 'open' branch can drop committed work, so only it pays the git check:
+    // an 'open' prior task with committed-but-unreviewed work (or an ambiguous/gone
+    // base) must NOT be baselined past — keep the old base so the next Stop reviews it.
+    let unreviewed_commits = if prev_status == Some(STATUS_OPEN) {
+        match prev.as_ref().and_then(|f| f.base_spec()) {
+            Some(base) => {
+                let cd = crate::git::committed_delta(cwd, base);
+                !cd.is_empty || cd.warning.is_some()
+            }
+            None => false,
+        }
+    } else {
+        false
+    };
+    if !should_advance(prev_status, unreviewed_commits) {
+        return; // unresolved debt OR unreviewed committed work: keep existing base + status
     }
     let (kind, oid) = match crate::git::head_oid(cwd) {
         Some(h) => ("commit", h),
@@ -364,11 +390,14 @@ mod tests {
 
     #[test]
     fn advances_only_without_unresolved_debt() {
-        assert!(should_advance(None)); // first task
-        assert!(should_advance(Some(STATUS_OPEN)));
-        assert!(should_advance(Some(STATUS_APPROVED)));
-        assert!(!should_advance(Some(STATUS_BLOCKED)));
-        assert!(!should_advance(Some(STATUS_NEEDS_USER)));
+        assert!(should_advance(None, false)); // first task
+        assert!(should_advance(Some(STATUS_APPROVED), false)); // reviewed → advance
+                                                               // OPEN advances ONLY when there is no committed-but-unreviewed work.
+        assert!(should_advance(Some(STATUS_OPEN), false)); // open + clean → advance
+        assert!(!should_advance(Some(STATUS_OPEN), true)); // open + unreviewed commits → carry
+                                                           // Unresolved review debt never advances, regardless of commits.
+        assert!(!should_advance(Some(STATUS_BLOCKED), false));
+        assert!(!should_advance(Some(STATUS_NEEDS_USER), false));
     }
 
     #[test]
@@ -519,5 +548,121 @@ mod tests {
         run(&["add", "."]);
         run(&["commit", "-m", "init"]);
         p.display().to_string()
+    }
+
+    /// Make a new commit in an existing test repo; return the new HEAD oid.
+    fn commit_file(repo: &str, name: &str, content: &str) -> String {
+        std::fs::write(std::path::Path::new(repo).join(name), content).unwrap();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["add", "."]);
+        run(&["commit", "-m", name]);
+        crate::git::head_oid(repo).expect("head after commit")
+    }
+
+    #[test]
+    fn open_with_committed_work_keeps_base_and_status() {
+        // An 'open' task that COMMITTED code, then a new prompt before any Stop review:
+        // on_task_start must NOT baseline past the unreviewed commit — keep base + open.
+        let repo = make_test_repo();
+        let s = "sess-open-carry";
+        on_task_start(&repo, s); // base = C0, status open
+        let c0 = crate::git::head_oid(&repo).unwrap();
+        commit_file(&repo, "a.txt", "a"); // C1 — committed but never Stop-reviewed
+        on_task_start(&repo, s); // open + C0..C1 non-empty → must carry, not advance
+        let f = read(&repo, s).unwrap();
+        match f.base {
+            BaseKind::Commit(oid) => {
+                assert_eq!(oid, c0, "kept C0 base so C0..C1 stays in review scope")
+            }
+            other => panic!("expected Commit base, got {other:?}"),
+        }
+        assert_eq!(f.status, STATUS_OPEN);
+    }
+
+    #[test]
+    fn open_missing_status_normalized_to_open_carries_committed_work() {
+        // A persisted frontier with a base but NO `status` field: frontier_from defaults
+        // it to OPEN, so on_task_start must still carry committed-but-unreviewed work
+        // (not treat it like absent state and advance). Regression for finding 2.
+        let repo = make_test_repo();
+        let s = "sess-missing-status";
+        let root = crate::git::repo_root(&repo).unwrap();
+        let c0 = crate::git::head_oid(&repo).unwrap();
+        write_raw(
+            &root,
+            s,
+            &json!({ "base_kind": "commit", "base_oid": c0, "updated_ms": now_ms() as u64 }),
+        ); // deliberately NO "status" field
+        commit_file(&repo, "a.txt", "a"); // C1
+        on_task_start(&repo, s); // missing status → normalized to open → carry, not advance
+        let f = read(&repo, s).unwrap();
+        match f.base {
+            BaseKind::Commit(oid) => {
+                assert_eq!(
+                    oid, c0,
+                    "missing-status base carried (not advanced past C0..C1)"
+                )
+            }
+            other => panic!("expected Commit base, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn approved_then_new_head_advances() {
+        // Normal flow not regressed: a reviewed (APPROVED) prior task advances to HEAD.
+        let repo = make_test_repo();
+        let s = "sess-approved-advance";
+        on_task_start(&repo, s);
+        set_status(&repo, s, STATUS_APPROVED);
+        let c1 = commit_file(&repo, "a.txt", "a");
+        on_task_start(&repo, s); // approved → advance to C1
+        let f = read(&repo, s).unwrap();
+        match f.base {
+            BaseKind::Commit(oid) => assert_eq!(oid, c1, "advanced to new HEAD after approval"),
+            other => panic!("expected Commit base, got {other:?}"),
+        }
+        assert_eq!(f.status, STATUS_OPEN);
+    }
+
+    #[test]
+    fn open_with_gone_base_fails_safe_keeps_base() {
+        // Fail-safe: an 'open' frontier whose base object is GONE (ambiguous) must NOT
+        // advance — committed_delta warns, so we carry rather than drop.
+        let repo = make_test_repo();
+        let s = "sess-gone-base";
+        let root = crate::git::repo_root(&repo).unwrap();
+        let bogus = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+        write_raw(
+            &root,
+            s,
+            &json!({
+                "base_kind": "commit",
+                "base_oid": bogus,
+                "status": STATUS_OPEN,
+                "updated_ms": now_ms() as u64,
+            }),
+        );
+        on_task_start(&repo, s); // gone base ⇒ warning ⇒ unreviewed ⇒ keep base
+        let f = read(&repo, s).unwrap();
+        match f.base {
+            BaseKind::Commit(oid) => {
+                assert_eq!(
+                    oid, bogus,
+                    "fail-safe: kept the gone base instead of advancing"
+                )
+            }
+            other => panic!("expected Commit base, got {other:?}"),
+        }
     }
 }
