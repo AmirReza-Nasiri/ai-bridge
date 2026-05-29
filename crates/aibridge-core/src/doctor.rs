@@ -145,6 +145,7 @@ pub fn run(project: &Path, full: bool, check_updates: bool) -> Report {
 
     checks.push(codex_launch_mode());
     checks.push(review_effort());
+    checks.push(review_model());
 
     match DefaultPlatform::find_executable("rtk") {
         Ok(p) => checks.push(check(
@@ -303,6 +304,39 @@ fn review_effort() -> Check {
         Status::Pass,
         "review reasoning effort",
         format!("{effort} ({latency}){global_note}"),
+    )
+}
+
+/// Report the CONFIGURED review model + context window (v0.29 O1d). The MCP server pins
+/// one model per lifetime and runs in a separate process, so this reports what's on disk,
+/// not the server's live pinned model. A configured-but-unappliable setting (invalid slug
+/// or an orphan context window) is a `Warn` — it looks set but the spawn path drops it.
+fn review_model() -> Check {
+    use crate::review_mcp::{classify_ctx, classify_model, CtxState, ModelState};
+    let cfg = crate::review_mcp::codex_config();
+    let model = classify_model(&cfg);
+    let ctx = classify_ctx(&cfg, &model);
+    // Consume each enum EXACTLY ONCE, capturing the "won't actually apply" flag inline, so
+    // status derives from flags (no second use of the moved values).
+    let (model_s, model_bad) = match model {
+        ModelState::Default => ("default".to_string(), false),
+        ModelState::Valid(s) => (s, false),
+        ModelState::Invalid(s) => (format!("{s} (INVALID — ignored)"), true),
+    };
+    let (ctx_s, ctx_bad) = match ctx {
+        CtxState::Unset => ("default".to_string(), false),
+        CtxState::Effective(n) => (n.to_string(), false),
+        CtxState::Ignored(n) => (format!("{n} (ignored — needs a valid model)"), true),
+    };
+    let status = if model_bad || ctx_bad {
+        Status::Warn
+    } else {
+        Status::Pass
+    };
+    check(
+        status,
+        "review model",
+        format!("model={model_s} context={ctx_s} (applies on next MCP server start)"),
     )
 }
 

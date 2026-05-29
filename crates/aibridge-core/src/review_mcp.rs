@@ -757,6 +757,160 @@ pub fn pinned_review_model() -> PinnedReviewModel {
     }
 }
 
+// ───────────────────────── v0.29 (O1d): review-model CLI + doctor reporting ─────────────
+//
+// Honest reporting of the PERSISTED review-model config. A hand-edited review-mcp.json can
+// hold a non-empty-but-invalid model slug (the spawn path drops it via is_valid_model_slug)
+// or a model_context_window with no valid model (the spawn path emits ctx only WITH a valid
+// model). Such settings are "configured but never applied" — the classifiers below let the
+// CLI/doctor say "ignored until fixed" instead of falsely claiming they apply on restart.
+
+/// The effective state of the configured model slug.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ModelState {
+    /// No override → codex uses its config.toml default.
+    Default,
+    /// A valid slug that the spawn path WILL apply.
+    Valid(String),
+    /// A non-empty slug the spawn path will DROP (invalid charset) — never applied.
+    Invalid(String),
+}
+
+/// The effective state of the configured context-window override.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CtxState {
+    /// No context override set.
+    Unset,
+    /// Set AND will apply (a valid model is configured).
+    Effective(u64),
+    /// Set but IGNORED at spawn (no valid model) — an orphan override.
+    Ignored(u64),
+}
+
+/// Pure: classify the configured model slug.
+pub(crate) fn classify_model(cfg: &CodexReviewConfig) -> ModelState {
+    match &cfg.model {
+        None => ModelState::Default,
+        Some(s) if is_valid_model_slug(s) => ModelState::Valid(s.clone()),
+        Some(s) => ModelState::Invalid(s.clone()),
+    }
+}
+
+/// Pure: classify the configured context window relative to the model state. A context
+/// window only applies alongside a VALID model, so it is `Ignored` otherwise.
+pub(crate) fn classify_ctx(cfg: &CodexReviewConfig, model: &ModelState) -> CtxState {
+    match cfg.model_context_window {
+        None => CtxState::Unset,
+        Some(n) if matches!(model, ModelState::Valid(_)) => CtxState::Effective(n),
+        Some(n) => CtxState::Ignored(n),
+    }
+}
+
+/// Pure: the context to persist on `set`. An explicit `--context` wins; omitting it
+/// PRESERVES the current override (TUI parity — a model switch never silently drops ctx).
+pub(crate) fn resolve_set_ctx(arg: Option<u64>, current: Option<u64>) -> Option<u64> {
+    arg.or(current)
+}
+
+const RESTART_NOTE: &str =
+    "Change applies on the next AI Bridge MCP server start (restart Claude Code).";
+
+/// Pure: the `review-model list` report — the live model cache plus the configured choice.
+pub(crate) fn format_model_list(
+    rows: &[crate::codex_models::ModelInfo],
+    cfg: &CodexReviewConfig,
+) -> String {
+    let model = classify_model(cfg);
+    let mut out = String::from("Review models (codex live cache):\n");
+    let mark = |on: bool| if on { "  <= configured" } else { "" };
+
+    out.push_str(&format!(
+        "  default (codex config.toml){}\n",
+        mark(matches!(model, ModelState::Default))
+    ));
+    if rows.is_empty() {
+        out.push_str("  (no live model cache — set a custom id with `review-model set <slug>`)\n");
+    }
+    for m in rows {
+        let on = matches!(&model, ModelState::Valid(s) if s == &m.slug);
+        let ctx = m
+            .context_window
+            .map(|n| format!("  [ctx {n}]"))
+            .unwrap_or_default();
+        let name = if m.display_name == m.slug {
+            m.slug.clone()
+        } else {
+            format!("{} ({})", m.display_name, m.slug)
+        };
+        out.push_str(&format!("  {name}{ctx}{}\n", mark(on)));
+    }
+    // A configured VALID slug that isn't in the cache → a custom row.
+    if let ModelState::Valid(s) = &model {
+        if !rows.iter().any(|m| &m.slug == s) {
+            out.push_str(&format!("  custom: {s}  <= configured\n"));
+        }
+    }
+    if let ModelState::Invalid(s) = &model {
+        out.push_str(&format!(
+            "  configured: {s} — INVALID slug, ignored until fixed (allowed: letters, digits, '.', '_', '-')\n"
+        ));
+    }
+    if let CtxState::Ignored(n) = classify_ctx(cfg, &model) {
+        out.push_str(&format!(
+            "  context {n} is set but IGNORED (needs a valid model)\n"
+        ));
+    }
+    out.push_str(RESTART_NOTE);
+    out
+}
+
+/// Pure: the `review-model show` one-block report of the configured state.
+pub(crate) fn format_model_show(cfg: &CodexReviewConfig) -> String {
+    let model = classify_model(cfg);
+    let ctx = classify_ctx(cfg, &model);
+    let model_line = match &model {
+        ModelState::Default => "model:   default (codex config.toml)".to_string(),
+        ModelState::Valid(s) => format!("model:   {s}"),
+        ModelState::Invalid(s) => format!("model:   {s} — INVALID, ignored until fixed"),
+    };
+    let ctx_line = match ctx {
+        CtxState::Unset => "context: default".to_string(),
+        CtxState::Effective(n) => format!("context: {n}"),
+        CtxState::Ignored(n) => format!("context: {n} — ignored (needs a valid model)"),
+    };
+    format!("{model_line}\n{ctx_line}\n{RESTART_NOTE}")
+}
+
+/// `review-model list` (reads the live cache + persisted config).
+pub fn review_model_list_report() -> String {
+    format_model_list(&crate::codex_models::list_models(), &codex_config())
+}
+
+/// `review-model show` (reads the persisted config).
+pub fn review_model_show_report() -> String {
+    format_model_show(&codex_config())
+}
+
+/// `review-model set <model> [--context N]`. Preserves the current context override when
+/// `--context` is omitted (TUI parity); only `clear` removes it. Propagates the
+/// `set_codex_model` validation error (bad slug / bad ctx) so the CLI exits non-zero.
+pub fn review_model_set(model: &str, ctx_arg: Option<u64>) -> Result<String, String> {
+    let current = codex_config().model_context_window;
+    let ctx = resolve_set_ctx(ctx_arg, current);
+    set_codex_model(Some(model.to_string()), ctx)?;
+    Ok(format!(
+        "Configured review model = '{model}'. {RESTART_NOTE}"
+    ))
+}
+
+/// `review-model clear` — remove the override entirely (model + context).
+pub fn review_model_clear() -> Result<String, String> {
+    set_codex_model(None, None)?;
+    Ok(format!(
+        "Cleared the review-model override (model + context). {RESTART_NOTE}"
+    ))
+}
+
 /// Names in the allowlist that are not (any longer) defined codex servers.
 fn stale_entries(names: &[String], allow: &[String]) -> Vec<String> {
     allow
@@ -1241,6 +1395,105 @@ mod tests {
             codex_overrides_from(&cfg).is_empty(),
             "no lingering context-window override"
         );
+    }
+
+    // ─── v0.29 (O1d) review-model CLI/doctor reporting (pure; no real-config IO) ───
+
+    fn mi(slug: &str, ctx: Option<u64>) -> crate::codex_models::ModelInfo {
+        crate::codex_models::ModelInfo {
+            slug: slug.to_string(),
+            display_name: slug.to_string(),
+            context_window: ctx,
+            priority: 0,
+        }
+    }
+    fn rc(model: Option<&str>, ctx: Option<u64>) -> CodexReviewConfig {
+        CodexReviewConfig {
+            model: model.map(str::to_string),
+            model_context_window: ctx,
+        }
+    }
+
+    #[test]
+    fn classify_model_default_valid_invalid() {
+        assert_eq!(classify_model(&rc(None, None)), ModelState::Default);
+        assert_eq!(
+            classify_model(&rc(Some("gpt-5.5"), None)),
+            ModelState::Valid("gpt-5.5".into())
+        );
+        // a hand-edited slug with a space is invalid (spawn would drop it)
+        assert_eq!(
+            classify_model(&rc(Some("bad slug"), None)),
+            ModelState::Invalid("bad slug".into())
+        );
+    }
+
+    #[test]
+    fn classify_ctx_effective_only_with_valid_model() {
+        // unset
+        assert_eq!(
+            classify_ctx(&rc(None, None), &ModelState::Default),
+            CtxState::Unset
+        );
+        // effective: ctx WITH a valid model
+        let cfg = rc(Some("gpt-5.5"), Some(200_000));
+        assert_eq!(
+            classify_ctx(&cfg, &classify_model(&cfg)),
+            CtxState::Effective(200_000)
+        );
+        // ignored: context-without-model
+        let cfg = rc(None, Some(200_000));
+        assert_eq!(
+            classify_ctx(&cfg, &classify_model(&cfg)),
+            CtxState::Ignored(200_000)
+        );
+        // ignored: context-with-invalid-model
+        let cfg = rc(Some("bad slug"), Some(200_000));
+        assert_eq!(
+            classify_ctx(&cfg, &classify_model(&cfg)),
+            CtxState::Ignored(200_000)
+        );
+    }
+
+    #[test]
+    fn resolve_set_ctx_preserves_on_omit() {
+        assert_eq!(resolve_set_ctx(Some(100), Some(200)), Some(100)); // arg wins
+        assert_eq!(resolve_set_ctx(None, Some(200)), Some(200)); // omit preserves
+        assert_eq!(resolve_set_ctx(None, None), None);
+    }
+
+    #[test]
+    fn format_model_list_states() {
+        // empty cache → default marked configured + the no-cache note
+        let s = format_model_list(&[], &rc(None, None));
+        assert!(s.contains("default (codex config.toml)  <= configured"));
+        assert!(s.contains("no live model cache"));
+        // listed valid model → its row marked, not default
+        let rows = vec![mi("gpt-5.5", Some(272_000)), mi("gpt-5.4", None)];
+        let s = format_model_list(&rows, &rc(Some("gpt-5.4"), None));
+        assert!(s.contains("gpt-5.4  <= configured"));
+        assert!(!s.contains("default (codex config.toml)  <= configured"));
+        // valid custom slug not in cache → custom row
+        let s = format_model_list(&rows, &rc(Some("o9-pro"), None));
+        assert!(s.contains("custom: o9-pro  <= configured"));
+        // invalid slug → INVALID note (not a clean "configured")
+        let s = format_model_list(&rows, &rc(Some("bad slug"), None));
+        assert!(s.contains("INVALID slug, ignored until fixed"));
+        // orphan ctx → ignored note
+        let s = format_model_list(&rows, &rc(None, Some(200_000)));
+        assert!(s.contains("context 200000 is set but IGNORED"));
+    }
+
+    #[test]
+    fn format_model_show_states() {
+        assert!(format_model_show(&rc(None, None)).contains("model:   default"));
+        let s = format_model_show(&rc(Some("gpt-5.5"), Some(200_000)));
+        assert!(s.contains("model:   gpt-5.5"));
+        assert!(s.contains("context: 200000"));
+        assert!(format_model_show(&rc(Some("bad slug"), None))
+            .contains("bad slug — INVALID, ignored until fixed"));
+        assert!(format_model_show(&rc(None, Some(200_000)))
+            .contains("200000 — ignored (needs a valid model)"));
     }
 
     #[test]

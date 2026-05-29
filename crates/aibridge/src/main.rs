@@ -106,6 +106,13 @@ enum Commands {
         #[command(subcommand)]
         action: ReviewMcpAction,
     },
+    /// Choose the codex model AI Bridge's review child uses (list/show/set/clear). Also
+    /// settable in the `status` dashboard's Review tab. A change applies on the next MCP
+    /// server start (restart Claude Code).
+    ReviewModel {
+        #[command(subcommand)]
+        action: ReviewModelAction,
+    },
     /// (Alias of `status`.) Open the interactive dashboard.
     #[command(hide = true)]
     Tui,
@@ -277,6 +284,24 @@ enum ReviewMcpAction {
 }
 
 #[derive(Subcommand, Debug)]
+enum ReviewModelAction {
+    /// List codex models (live cache) and mark the configured one.
+    List,
+    /// Show the configured review model + context window.
+    Show,
+    /// Set the review model. Omitting `--context` KEEPS the current context override.
+    Set {
+        /// The codex model slug (e.g. from `review-model list`).
+        model: String,
+        /// Context-window override; omit to KEEP the current one.
+        #[arg(long)]
+        context: Option<u64>,
+    },
+    /// Clear the override entirely (model + context) → codex's config.toml default.
+    Clear,
+}
+
+#[derive(Subcommand, Debug)]
 enum ProfileAction {
     /// Apply the profile to native CLI config.
     Apply {
@@ -315,6 +340,7 @@ fn main() -> Result<()> {
             HookAction::UserPromptSubmit => hook_user_prompt_submit(),
         },
         Commands::ReviewMcp { action } => review_mcp_cmd(action),
+        Commands::ReviewModel { action } => review_model_cmd(action),
         Commands::Tui => tui::run(),
         Commands::Skills { action } => {
             match action {
@@ -531,6 +557,31 @@ fn review_mcp_cmd(action: ReviewMcpAction) -> Result<()> {
                 }
             }
         }
+    }
+    Ok(())
+}
+
+fn review_model_cmd(action: ReviewModelAction) -> Result<()> {
+    use aibridge_core::review_mcp;
+    match action {
+        ReviewModelAction::List => println!("{}", review_mcp::review_model_list_report()),
+        ReviewModelAction::Show => println!("{}", review_mcp::review_model_show_report()),
+        ReviewModelAction::Set { model, context } => {
+            match review_mcp::review_model_set(&model, context) {
+                Ok(m) => println!("{m}"),
+                Err(e) => {
+                    eprintln!("AI Bridge review-model: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        ReviewModelAction::Clear => match review_mcp::review_model_clear() {
+            Ok(m) => println!("{m}"),
+            Err(e) => {
+                eprintln!("AI Bridge review-model: {e}");
+                std::process::exit(1);
+            }
+        },
     }
     Ok(())
 }
