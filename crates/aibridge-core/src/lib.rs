@@ -7,6 +7,7 @@
 pub mod claude_mcp;
 pub mod cli_update;
 pub mod codex;
+pub mod codex_models;
 pub mod doctor;
 pub mod gate;
 pub mod git;

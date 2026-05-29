@@ -594,6 +594,128 @@ pub fn spawn_overrides() -> Option<Vec<String>> {
     Some(out)
 }
 
+// ───────────────────────── v0.29 (O1): review model config ─────────────────────────
+//
+// A user-selected codex MODEL (+ optional context window) for AI Bridge's review
+// child, persisted additively in review-mcp.json's `codex` object and injected at
+// spawn as `-c model="<slug>"` / `-c model_context_window=<n>` (overriding the user's
+// ~/.codex/config.toml ONLY for the review child). Unset → codex uses its own default.
+
+/// The persisted review model config (additive `codex` object in review-mcp.json).
+/// Both fields optional → unset means "use codex's config.toml default".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CodexReviewConfig {
+    pub model: Option<String>,
+    pub model_context_window: Option<u64>,
+}
+
+/// Upper bound for a context-window override. codex parses the `-c` value as a TOML
+/// integer (i64); this sane cap (well beyond any real window) keeps us inside i64 and
+/// rejects absurd/typo values that codex would refuse.
+const MAX_CONTEXT_WINDOW: u64 = 20_000_000;
+
+/// A codex model slug we'll emit as `-c model="<slug>"`. Restrict to safe chars so the
+/// emitted `-c` arg can never be malformed / injected.
+fn is_valid_model_slug(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// Pure: extract the `codex` object from a policy Value (empty fields when absent).
+fn codex_from(cfg: &Value) -> CodexReviewConfig {
+    let c = cfg.get("codex");
+    CodexReviewConfig {
+        model: c
+            .and_then(|c| c.get("model"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        model_context_window: c
+            .and_then(|c| c.get("model_context_window"))
+            .and_then(Value::as_u64)
+            .filter(|n| *n > 0 && *n <= MAX_CONTEXT_WINDOW),
+    }
+}
+
+/// The persisted review model config (default = unset).
+pub fn codex_config() -> CodexReviewConfig {
+    codex_from(&read_config())
+}
+
+/// Pure: set/clear the `codex` object additively (preserves `allow`/`server_tools`).
+/// The model is PRIMARY: a context-window override only applies WITH a model, so a
+/// `None` model is a full clear (ctx ignored) — never leaves a lingering window
+/// override. An empty config removes the `codex` key entirely.
+fn set_codex_in(cfg: &mut Value, model: Option<String>, ctx: Option<u64>) {
+    if !cfg.is_object() {
+        *cfg = json!({});
+    }
+    let obj = cfg.as_object_mut().expect("object");
+    let mut codex = serde_json::Map::new();
+    if let Some(m) = model {
+        codex.insert("model".into(), json!(m));
+        if let Some(n) = ctx {
+            codex.insert("model_context_window".into(), json!(n));
+        }
+    }
+    if codex.is_empty() {
+        obj.remove("codex");
+    } else {
+        obj.insert("codex".into(), Value::Object(codex));
+    }
+}
+
+/// Persist the review model config. `model` is PRIMARY; a context window applies only
+/// with a model. `None` model fully clears the override (ctx ignored). Rejects an
+/// invalid slug shape (so a bad id is never stored / emitted).
+pub fn set_codex_model(model: Option<String>, ctx: Option<u64>) -> Result<(), String> {
+    if let Some(m) = &model {
+        if !is_valid_model_slug(m) {
+            return Err(format!(
+                "invalid model id '{m}' (allowed: letters, digits, '.', '_', '-')"
+            ));
+        }
+    }
+    if let Some(n) = ctx {
+        if n == 0 || n > MAX_CONTEXT_WINDOW {
+            return Err(format!(
+                "invalid context window {n} (must be 1..={MAX_CONTEXT_WINDOW})"
+            ));
+        }
+    }
+    let mut cfg = read_config();
+    set_codex_in(&mut cfg, model, ctx);
+    write_config(&cfg).map_err(|e| format!("write review-mcp.json: {e}"))
+}
+
+/// Pure: the spawn `-c` overrides for model/context from a policy Value. Empty when
+/// unset; OMITS an invalid slug (never emits a malformed `-c`). The model value is
+/// TOML-serialized; ctx is a bare integer.
+fn codex_overrides_from(cfg: &Value) -> Vec<String> {
+    let c = codex_from(cfg);
+    let mut out = Vec::new();
+    // Model is PRIMARY: emit the context window ONLY alongside a valid model, so a
+    // manually-edited / legacy config with a window but an empty/invalid model can't
+    // leak a lone `-c model_context_window=…` (which would override codex's default
+    // window for whatever model it falls back to).
+    if let Some(m) = c.model.filter(|m| is_valid_model_slug(m)) {
+        out.push("-c".to_string());
+        out.push(format!("model={}", toml::Value::String(m)));
+        if let Some(n) = c.model_context_window {
+            out.push("-c".to_string());
+            out.push(format!("model_context_window={n}"));
+        }
+    }
+    out
+}
+
+/// Spawn-time model/context `-c` overrides for the warm review child (v0.29 O1).
+/// Empty when unset → codex uses its config.toml default (no behavior change).
+pub fn codex_spawn_overrides() -> Vec<String> {
+    codex_overrides_from(&read_config())
+}
+
 /// Names in the allowlist that are not (any longer) defined codex servers.
 fn stale_entries(names: &[String], allow: &[String]) -> Vec<String> {
     allow
@@ -1037,6 +1159,124 @@ pub fn set_all_tools(server: &str, on: bool) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── v0.29 (O1) review model config (pure; never touches the real review-mcp.json) ───
+    #[test]
+    fn codex_from_reads_fields_and_treats_empty_as_unset() {
+        let cfg = json!({"codex": {"model": "gpt-5.5", "model_context_window": 272000}});
+        let c = codex_from(&cfg);
+        assert_eq!(c.model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(c.model_context_window, Some(272_000));
+        // empty model + zero ctx → unset
+        let c2 = codex_from(&json!({"codex": {"model": "", "model_context_window": 0}}));
+        assert!(c2.model.is_none() && c2.model_context_window.is_none());
+        // no codex object → default
+        assert_eq!(codex_from(&json!({})), CodexReviewConfig::default());
+    }
+
+    #[test]
+    fn set_codex_in_is_additive_and_clears() {
+        let mut cfg = json!({"allow": ["context7"]});
+        set_codex_in(&mut cfg, Some("gpt-5.5".into()), Some(272_000));
+        assert_eq!(cfg["allow"], json!(["context7"]), "allow preserved");
+        assert_eq!(cfg["codex"]["model"], "gpt-5.5");
+        assert_eq!(cfg["codex"]["model_context_window"], 272_000);
+        // clearing removes the codex key but keeps allow
+        set_codex_in(&mut cfg, None, None);
+        assert!(cfg.get("codex").is_none(), "empty codex removed");
+        assert_eq!(cfg["allow"], json!(["context7"]));
+    }
+
+    #[test]
+    fn set_codex_in_none_model_fully_clears_even_with_ctx() {
+        // a context window without a model must NOT linger — None model = full clear
+        let mut cfg = json!({"codex": {"model": "gpt-5.5", "model_context_window": 272000}});
+        set_codex_in(&mut cfg, None, Some(500_000));
+        assert!(
+            cfg.get("codex").is_none(),
+            "ctx ignored when model is None → cleared"
+        );
+        assert!(
+            codex_overrides_from(&cfg).is_empty(),
+            "no lingering context-window override"
+        );
+    }
+
+    #[test]
+    fn codex_overrides_from_emits_valid_c_args() {
+        assert_eq!(
+            codex_overrides_from(
+                &json!({"codex": {"model": "gpt-5.5", "model_context_window": 272000}})
+            ),
+            vec![
+                "-c",
+                "model=\"gpt-5.5\"",
+                "-c",
+                "model_context_window=272000"
+            ]
+        );
+        assert_eq!(
+            codex_overrides_from(&json!({"codex": {"model": "gpt-5.4"}})),
+            vec!["-c", "model=\"gpt-5.4\""]
+        );
+        assert!(
+            codex_overrides_from(&json!({})).is_empty(),
+            "unset → no overrides"
+        );
+    }
+
+    #[test]
+    fn codex_overrides_omit_invalid_slug() {
+        // a slug with spaces / shell metacharacters must NOT be emitted as a -c arg
+        let cfg = json!({"codex": {"model": "gpt 5.5; rm -rf /"}});
+        assert!(
+            codex_overrides_from(&cfg).is_empty(),
+            "invalid slug omitted"
+        );
+    }
+
+    #[test]
+    fn codex_overrides_never_leak_ctx_without_valid_model() {
+        // manually-edited / legacy JSON: a context window but empty/invalid model must
+        // NOT emit a lone `-c model_context_window=…` (spawn path reads arbitrary JSON).
+        assert!(
+            codex_overrides_from(&json!({"codex": {"model": "", "model_context_window": 272000}}))
+                .is_empty(),
+            "empty model + ctx → no overrides"
+        );
+        assert!(
+            codex_overrides_from(
+                &json!({"codex": {"model": "bad slug!", "model_context_window": 272000}})
+            )
+            .is_empty(),
+            "invalid model + ctx → no overrides"
+        );
+    }
+
+    #[test]
+    fn set_codex_model_rejects_invalid_slug_before_any_write() {
+        // validation happens BEFORE read/write_config, so this never touches the real file
+        assert!(set_codex_model(Some("bad slug!".into()), None).is_err());
+    }
+
+    #[test]
+    fn codex_from_drops_absurd_context_window() {
+        // a window beyond the sane cap (or 0) is treated as unset → no leaked override
+        let huge = json!({"codex": {"model": "gpt-5.5", "model_context_window": 9_999_999_999u64}});
+        assert_eq!(
+            codex_from(&huge).model_context_window,
+            None,
+            "absurd ctx dropped"
+        );
+        // the model still applies; just no context override
+        assert_eq!(codex_overrides_from(&huge), vec!["-c", "model=\"gpt-5.5\""]);
+    }
+
+    #[test]
+    fn set_codex_model_rejects_absurd_context_window_before_any_write() {
+        assert!(set_codex_model(Some("gpt-5.5".into()), Some(0)).is_err());
+        assert!(set_codex_model(Some("gpt-5.5".into()), Some(u64::MAX)).is_err());
+    }
 
     #[test]
     fn parses_servers_with_command_and_args() {

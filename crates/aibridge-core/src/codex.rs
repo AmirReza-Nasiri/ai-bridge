@@ -127,13 +127,18 @@ impl CodexPeer {
         // derail a review by invoking a browser/scrape server that elicits or hangs.
         // User-controlled via `aibridge review-mcp`. FAIL CLOSED: if the codex config is
         // present but unenumerable we refuse to start (never inherit unfiltered servers).
-        let review_mcp_overrides = crate::review_mcp::spawn_overrides().ok_or_else(|| {
+        let mut review_mcp_overrides = crate::review_mcp::spawn_overrides().ok_or_else(|| {
             anyhow::anyhow!(
                 "can't read/parse ~/.codex/config.toml to enforce the review-mcp policy — \
                  refusing to start the review peer with unfiltered MCP servers; fix the codex \
                  config (see `aibridge review-mcp list`)"
             )
         })?;
+        // v0.29 (O1): append the user-selected review model / context-window overrides
+        // (empty when unset → codex uses its config.toml default). Kept SEPARATE from the
+        // fail-closed mcp-policy overrides above so an unset/invalid model never weakens
+        // policy enforcement.
+        review_mcp_overrides.extend(crate::review_mcp::codex_spawn_overrides());
         let mut child = plan
             .into_command()
             .arg("mcp-server")
