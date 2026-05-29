@@ -113,11 +113,30 @@ pub struct CodexPeer {
     progress: Progress,
     /// Set on drop to stop the heartbeat thread.
     hb_shutdown: Arc<AtomicBool>,
+    /// v0.29 (O1b): the review-model fingerprint this child was SPAWNED under (from the
+    /// same [`crate::review_mcp::PinnedReviewModel`] snapshot that built its `-c model`
+    /// overrides). Bound to the Stop receipt so a model change forces a fresh review.
+    model_fp: u64,
 }
 
 impl CodexPeer {
-    /// Spawn `codex mcp-server`, perform the MCP handshake, and keep it warm.
+    /// v0.29 (O1b): the review-model fingerprint this peer was spawned under.
+    pub fn model_fp(&self) -> u64 {
+        self.model_fp
+    }
+
+    /// Spawn `codex mcp-server` under the CURRENT review-model config (reads a fresh
+    /// [`crate::review_mcp::pinned_review_model`] snapshot). Back-compat entry for one-off
+    /// callers (doctor handshake). The MCP server instead pins ONE snapshot and uses
+    /// [`CodexPeer::spawn_with`] so all its peers share a single review model (v0.29 O1b).
     pub fn spawn() -> Result<Self> {
+        Self::spawn_with(&crate::review_mcp::pinned_review_model())
+    }
+
+    /// v0.29 (O1b): spawn under a PINNED review-model snapshot — uses `pinned.overrides`
+    /// for the model `-c` args and records `pinned.fp` as the peer's `model_fp`, so the
+    /// peer's identity matches the exact config that built its args (one snapshot).
+    pub fn spawn_with(pinned: &crate::review_mcp::PinnedReviewModel) -> Result<Self> {
         let exe = DefaultPlatform::find_executable("codex").context("locating codex")?;
         let plan = DefaultPlatform::spawn_plan(&exe);
         let spawn_kind = plan.kind.as_str();
@@ -134,11 +153,11 @@ impl CodexPeer {
                  config (see `aibridge review-mcp list`)"
             )
         })?;
-        // v0.29 (O1): append the user-selected review model / context-window overrides
-        // (empty when unset → codex uses its config.toml default). Kept SEPARATE from the
+        // v0.29 (O1b): append the PINNED review model / context-window overrides (empty
+        // when unset → codex uses its config.toml default). Kept SEPARATE from the
         // fail-closed mcp-policy overrides above so an unset/invalid model never weakens
-        // policy enforcement.
-        review_mcp_overrides.extend(crate::review_mcp::codex_spawn_overrides());
+        // policy enforcement. The fingerprint stored below is from the SAME snapshot.
+        review_mcp_overrides.extend(pinned.overrides.iter().cloned());
         let mut child = plan
             .into_command()
             .arg("mcp-server")
@@ -254,6 +273,7 @@ impl CodexPeer {
             spawn_program,
             progress,
             hb_shutdown,
+            model_fp: pinned.fp,
         };
         peer.initialize()?;
         Ok(peer)

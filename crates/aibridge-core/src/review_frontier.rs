@@ -68,6 +68,15 @@ impl Frontier {
 
 /// Advance the base at task start only when there is no unresolved review debt.
 /// Pure (no IO) so it is unit-testable.
+///
+/// v0.29 note: a model change does NOT gate the advance here. The hook (a separate
+/// short-lived process) can't reliably know the SERVER's active pinned model, and
+/// comparing against the merely-configured model would change behavior before the
+/// restart that applies it (violating the advisory-only pending policy). Model-fp
+/// binding lives only in the server-owned review paths (the Stop receipt + in-memory
+/// allow). Re-reviewing already-frontier-advanced committed work under a new model is a
+/// documented v0.29 limitation; the correct future design is a server-owned repo-level
+/// approved-span ledger (or an explicit `review-model set --rewind-frontier`).
 fn should_advance(prev_status: Option<&str>) -> bool {
     !matches!(prev_status, Some(STATUS_BLOCKED) | Some(STATUS_NEEDS_USER))
 }
@@ -233,7 +242,7 @@ pub fn set_status(cwd: &str, session: &str, status: &str) {
 /// the current approved-plan scope (`expect_plan_hash`). Any mismatch — or a
 /// pre-persistence frontier with no receipt fields — yields `None` so the Stop gate
 /// re-reviews. Fail-safe by construction: a stale receipt can never auto-allow.
-fn receipt_allows(v: &Value, expect_plan_hash: u64) -> Option<u64> {
+fn receipt_allows(v: &Value, expect_plan_hash: u64, expect_model_fp: u64) -> Option<u64> {
     // v0.23.0: the fast-path is honored ONLY when the frontier status is APPROVED.
     // Otherwise a receipt left behind from a prior approve could fast-allow the next
     // Stop even after a checkpoint (or Stop) recorded BLOCKED/NEEDS_USER debt against
@@ -249,6 +258,12 @@ fn receipt_allows(v: &Value, expect_plan_hash: u64) -> Option<u64> {
     if v.get("allowed_plan_hash").and_then(Value::as_u64) != Some(expect_plan_hash) {
         return None;
     }
+    // v0.29 (O1b): the receipt is bound to the review-model fingerprint it was approved
+    // under. A model change (different fp) → mismatch → None → fresh review on the new
+    // model. A missing `allowed_model_fp` (pre-O1b receipt) also mismatches → re-review.
+    if v.get("allowed_model_fp").and_then(Value::as_u64) != Some(expect_model_fp) {
+        return None;
+    }
     v.get("allowed_diff_hash").and_then(Value::as_u64)
 }
 
@@ -259,9 +274,18 @@ fn receipt_allows(v: &Value, expect_plan_hash: u64) -> Option<u64> {
 /// otherwise `None` → the gate reviews normally. The hash is the same `DefaultHasher`
 /// value the in-memory fast-path uses (`DiffBundle::hash`) so the two paths agree;
 /// a binary upgrade that changes that hash just misses → re-review (never a false allow).
-pub fn read_allowed_hash(cwd: &str, session: &str, expect_plan_hash: u64) -> Option<u64> {
+pub fn read_allowed_hash(
+    cwd: &str,
+    session: &str,
+    expect_plan_hash: u64,
+    expect_model_fp: u64,
+) -> Option<u64> {
     let root = crate::git::repo_root(cwd)?;
-    receipt_allows(&read_raw(&root, session)?, expect_plan_hash)
+    receipt_allows(
+        &read_raw(&root, session)?,
+        expect_plan_hash,
+        expect_model_fp,
+    )
 }
 
 /// v0.23.0: Advance the review frontier base to `reviewed_head` after a checkpoint
@@ -318,7 +342,7 @@ pub fn checkpoint_approved(cwd: &str, session: &str, reviewed_head: &str) -> Res
 /// base/status; the atomic temp+rename in [`write_raw`] keeps a concurrent reader safe.
 /// A new task (`on_task_start`) rewrites a fresh object WITHOUT these fields, so the
 /// receipt is naturally cleared when the task changes.
-pub fn set_allowed_hash(cwd: &str, session: &str, diff_hash: u64, plan_hash: u64) {
+pub fn set_allowed_hash(cwd: &str, session: &str, diff_hash: u64, plan_hash: u64, model_fp: u64) {
     let Some(root) = crate::git::repo_root(cwd) else {
         return;
     };
@@ -327,6 +351,8 @@ pub fn set_allowed_hash(cwd: &str, session: &str, diff_hash: u64, plan_hash: u64
         o.insert("allowed_diff_hash".into(), json!(diff_hash));
         o.insert("allowed_plan_hash".into(), json!(plan_hash));
         o.insert("review_policy_version".into(), json!(REVIEW_POLICY_VERSION));
+        // v0.29 (O1b): bind the receipt to the active review-model fingerprint.
+        o.insert("allowed_model_fp".into(), json!(model_fp));
         o.insert("updated_ms".into(), json!(now_ms() as u64));
     }
     write_raw(&root, session, &v);
@@ -384,26 +410,34 @@ mod tests {
             "allowed_diff_hash": 12345u64,
             "allowed_plan_hash": 999u64,
             "review_policy_version": REVIEW_POLICY_VERSION,
+            "allowed_model_fp": 77u64,
         });
-        // Same policy + same approved-plan scope + APPROVED status ⇒ honored.
-        assert_eq!(receipt_allows(&good, 999), Some(12345));
+        // Same policy + plan scope + model fp + APPROVED status ⇒ honored.
+        assert_eq!(receipt_allows(&good, 999, 77), Some(12345));
         // A different approved plan (same diff) must NOT fast-path — re-review the scope.
-        assert_eq!(receipt_allows(&good, 1000), None);
+        assert_eq!(receipt_allows(&good, 1000, 77), None);
+        // v0.29 (O1b): a different review-model fingerprint must NOT fast-path.
+        assert_eq!(receipt_allows(&good, 999, 88), None);
         // A stale policy version (review semantics changed) must NOT fast-path.
         let stale = json!({
             "status": STATUS_APPROVED,
             "allowed_diff_hash": 12345u64,
             "allowed_plan_hash": 999u64,
             "review_policy_version": REVIEW_POLICY_VERSION + 1,
+            "allowed_model_fp": 77u64,
         });
-        assert_eq!(receipt_allows(&stale, 999), None);
+        assert_eq!(receipt_allows(&stale, 999, 77), None);
         // A pre-persistence frontier (status only, no receipt) ⇒ None (re-review).
-        assert_eq!(receipt_allows(&json!({"status": "approved"}), 999), None);
-        // Plan-scope present but the diff hash missing ⇒ nothing to fast-path.
+        assert_eq!(
+            receipt_allows(&json!({"status": "approved"}), 999, 77),
+            None
+        );
+        // A pre-O1b receipt (no allowed_model_fp) ⇒ None (mismatch → re-review).
         assert_eq!(
             receipt_allows(
-                &json!({"status": STATUS_APPROVED, "allowed_plan_hash": 999u64, "review_policy_version": REVIEW_POLICY_VERSION}),
-                999
+                &json!({"status": STATUS_APPROVED, "allowed_diff_hash": 12345u64, "allowed_plan_hash": 999u64, "review_policy_version": REVIEW_POLICY_VERSION}),
+                999,
+                77
             ),
             None
         );
@@ -419,12 +453,13 @@ mod tests {
                 "allowed_diff_hash": 12345u64,
                 "allowed_plan_hash": 999u64,
                 "review_policy_version": REVIEW_POLICY_VERSION,
+                "allowed_model_fp": 77u64,
             })
         };
-        assert_eq!(receipt_allows(&mk(STATUS_APPROVED), 999), Some(12345));
-        assert_eq!(receipt_allows(&mk(STATUS_BLOCKED), 999), None);
-        assert_eq!(receipt_allows(&mk(STATUS_NEEDS_USER), 999), None);
-        assert_eq!(receipt_allows(&mk(STATUS_OPEN), 999), None);
+        assert_eq!(receipt_allows(&mk(STATUS_APPROVED), 999, 77), Some(12345));
+        assert_eq!(receipt_allows(&mk(STATUS_BLOCKED), 999, 77), None);
+        assert_eq!(receipt_allows(&mk(STATUS_NEEDS_USER), 999, 77), None);
+        assert_eq!(receipt_allows(&mk(STATUS_OPEN), 999, 77), None);
         // status field entirely absent ⇒ None.
         assert_eq!(
             receipt_allows(
@@ -432,8 +467,10 @@ mod tests {
                     "allowed_diff_hash": 12345u64,
                     "allowed_plan_hash": 999u64,
                     "review_policy_version": REVIEW_POLICY_VERSION,
+                    "allowed_model_fp": 77u64,
                 }),
-                999
+                999,
+                77
             ),
             None
         );
@@ -446,12 +483,14 @@ mod tests {
         let repo = make_test_repo();
         let session = "sess-blocked";
         on_task_start(&repo, session);
-        set_allowed_hash(&repo, session, 0xABCD, 0x42);
+        set_allowed_hash(&repo, session, 0xABCD, 0x42, 0x77);
         set_status(&repo, session, STATUS_APPROVED);
-        assert_eq!(read_allowed_hash(&repo, session, 0x42), Some(0xABCD));
+        assert_eq!(read_allowed_hash(&repo, session, 0x42, 0x77), Some(0xABCD));
+        // v0.29 (O1b): a different model fp must no longer fast-allow.
+        assert_eq!(read_allowed_hash(&repo, session, 0x42, 0x99), None);
         // Record debt: the same receipt must no longer fast-allow.
         set_status(&repo, session, STATUS_BLOCKED);
-        assert_eq!(read_allowed_hash(&repo, session, 0x42), None);
+        assert_eq!(read_allowed_hash(&repo, session, 0x42, 0x77), None);
     }
 
     /// Minimal real git repo in a fresh temp dir (mirrors mcp tests' helper).

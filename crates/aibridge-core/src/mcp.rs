@@ -86,6 +86,11 @@ struct Server {
     /// the on-disk epoch changes (a new task started), the thread is dropped so a
     /// new task's plan dialogue never anchors on the previous task's plan.
     plan_epoch: Option<String>,
+    /// v0.29 (O1b): the review-model snapshot pinned for THIS server's lifetime. Read
+    /// ONCE at startup; every peer (cold + warm) spawns under it, so the active review
+    /// model is constant per process. A model change applies on the next server start
+    /// (restart-to-apply); `review_model_pending_restart` surfaces a pending change.
+    pinned_model: crate::review_mcp::PinnedReviewModel,
 }
 
 impl Server {
@@ -97,7 +102,15 @@ impl Server {
             gate_reviews: 0,
             gates: HashMap::new(),
             plan_epoch: None,
+            pinned_model: crate::review_mcp::pinned_review_model(),
         }
+    }
+
+    /// v0.29 (O1b): true when the on-disk review-model config differs from the pinned
+    /// (active) snapshot — i.e. a model change is configured but needs a Claude Code
+    /// restart to take effect. Surfaced as a NON-blocking advisory (never blocks Stop).
+    fn review_model_pending_restart(&self) -> bool {
+        crate::review_mcp::codex_config_fingerprint() != self.pinned_model.fp
     }
 
     /// Ensure a live Codex child, preferring the background-warmed one (which
@@ -135,7 +148,9 @@ impl Server {
                 Err(RecvTimeoutError::Disconnected) | Err(RecvTimeoutError::Timeout) => {}
             }
         }
-        self.codex = Some(CodexPeer::spawn()?);
+        // v0.29 (O1b): cold-spawn under the PINNED review model (same snapshot all this
+        // server's peers use), so the active review model is constant for the lifetime.
+        self.codex = Some(CodexPeer::spawn_with(&self.pinned_model)?);
         self.threads.clear();
         self.gate_reviews = 0; // new child ⇒ new Gate thread; reset the counter
         Ok(())
@@ -147,7 +162,9 @@ impl Server {
         if self.codex.is_some() || self.warm_rx.is_some() {
             return;
         }
-        self.warm_rx = Some(spawn_warming());
+        // v0.29 (O1b): warm under the SAME pinned snapshot → the adopted child always
+        // matches the server's active model (no stale-warmer race).
+        self.warm_rx = Some(spawn_warming(self.pinned_model.clone()));
     }
 
     /// Drop the child + all its (now-dead) thread mappings so the next call spawns
@@ -458,8 +475,17 @@ impl Server {
         // On-demand review shares the reserved review thread (isolated from consults)
         // and counts toward the same anti-anchoring reset bound as the Stop gate.
         self.tick_gate_reset();
+        // v0.29 (O1b): review_diff returns human MCP text (not hook JSON), so it's safe
+        // to prepend the pending-model advisory here when a configured model change
+        // hasn't been activated by a restart yet.
+        let advisory = if self.review_model_pending_restart() {
+            "[AI Bridge] NOTE: a review-model change is configured but NOT active — \
+             restart Claude Code to apply it; this review ran on the active (pinned) model.\n\n"
+        } else {
+            ""
+        };
         match self.ask_topic(TopicKey::Gate, &prompt, &cwd) {
-            Ok(reply) if !reply.trim().is_empty() => reply,
+            Ok(reply) if !reply.trim().is_empty() => format!("{advisory}{reply}"),
             Ok(_) => "AI Bridge: Codex returned an empty review.".to_string(),
             Err(e) => format!(
                 "AI Bridge: review unavailable (Codex error): {e}. \
@@ -701,36 +727,65 @@ impl Server {
         // re-reviews (the receipt is keyed by this scope hash).
         let approved_plan = crate::plan_gate::approved_plan(cwd);
         let plan_hash = gate::hash_str(approved_plan.as_deref().unwrap_or(""));
+        // v0.29 (O1b): the ACTIVE review-model fingerprint (pinned for this server's
+        // lifetime). The receipt + in-memory allow are BOUND to it, so an approval minted
+        // under a different model can never fast-allow. A configured-but-not-restarted
+        // model change is surfaced as a NON-blocking advisory (logs only — review_stop
+        // MUST return valid hook JSON, so we never alter the returned decision string).
+        let active_fp = self.pinned_model.fp;
+        let pending_restart = self.review_model_pending_restart();
         let mut state = self.gates.remove(&key).unwrap_or_default();
         // Hydrate the "already approved this exact diff" fast-path from disk so an MCP
         // reconnect (VS Code reload) doesn't force a redundant minutes-long re-review.
-        // Honored only when the receipt's policy version + plan scope still match (else
-        // None → review normally). Live in-memory state already wins, so we only fill a
-        // freshly-defaulted slot.
+        // Honored only when the receipt's policy version + plan scope + MODEL FP still
+        // match (else None → review normally). Live in-memory state already wins, so we
+        // only fill a freshly-defaulted slot; we set the model fp alongside so the
+        // status check below treats the hydrated allow as model-matched.
         if state.last_allowed_diff_hash.is_none() {
-            state.last_allowed_diff_hash =
-                crate::review_frontier::read_allowed_hash(cwd, session, plan_hash);
+            if let Some(h) =
+                crate::review_frontier::read_allowed_hash(cwd, session, plan_hash, active_fp)
+            {
+                state.last_allowed_diff_hash = Some(h);
+                state.last_allowed_model_fp = Some(active_fp);
+            }
         }
-        let decision = self.gate_decide(&mut state, &bundle, cwd, approved_plan.as_deref());
+        let decision = self.gate_decide(
+            &mut state,
+            &bundle,
+            cwd,
+            approved_plan.as_deref(),
+            active_fp,
+        );
         // Map the outcome to the frontier status so the NEXT task start won't advance
         // the base over unresolved debt. CRUCIAL: an allow is only a genuine APPROVE
-        // when the gate recorded THIS diff as allowed; a fail-ask "delivery" allow
-        // (so Claude can ask the user) does NOT set that, and must stay needs_user —
-        // otherwise unresolved debt would be laundered into `approved` (Codex find).
+        // when the gate recorded THIS diff as allowed UNDER THE ACTIVE MODEL; a fail-ask
+        // "delivery" allow (so Claude can ask the user) does NOT set that, and must stay
+        // needs_user — otherwise unresolved debt (or a stale old-model allow) would be
+        // laundered into `approved` (Codex find + O1b model-fp gate).
         let status = if decision != "{}" {
             crate::review_frontier::STATUS_BLOCKED
-        } else if state.last_allowed_diff_hash == Some(dh) {
+        } else if state.last_allowed_diff_hash == Some(dh)
+            && state.last_allowed_model_fp == Some(active_fp)
+        {
             crate::review_frontier::STATUS_APPROVED
         } else {
             crate::review_frontier::STATUS_NEEDS_USER
         };
         self.gates.insert(key, state);
         // Persist the approval receipt so the fast-path survives a reconnect — bound to
-        // the diff hash, the plan scope it was approved under, and the policy version.
+        // the diff hash, the plan scope, the policy version, AND the active model fp.
         if status == crate::review_frontier::STATUS_APPROVED {
-            crate::review_frontier::set_allowed_hash(cwd, session, dh, plan_hash);
+            crate::review_frontier::set_allowed_hash(cwd, session, dh, plan_hash, active_fp);
         }
         crate::review_frontier::set_status(cwd, session, status);
+        // Protocol-safe pending-model advisory (logs only; never touches the hook JSON).
+        if pending_restart {
+            log_gate(
+                cwd,
+                "review-model change is configured but NOT active — restart Claude Code \
+                 to apply it; reviews currently run on the active (pinned) model",
+            );
+        }
         decision
     }
 
@@ -826,7 +881,16 @@ impl Server {
         // moved (old hash is stale); on Blocked/Refused we recorded debt and a prior
         // cached allow must not survive (Codex code-gate Fix 2 + R3).
         self.invalidate_gate_fastpath(&cwd, &session);
-        match final_outcome {
+        // v0.29 (O1b): review_checkpoint returns human MCP text → safe to prepend the
+        // pending-model advisory when a configured model change awaits a restart.
+        let advisory = if self.review_model_pending_restart() {
+            "[AI Bridge] NOTE: a review-model change is configured but NOT active — \
+             restart Claude Code to apply it; this checkpoint reviewed on the active \
+             (pinned) model.\n\n"
+        } else {
+            ""
+        };
+        let out = match final_outcome {
             CheckpointFinal::Advanced => format_checkpoint_approve(
                 reason,
                 &session,
@@ -846,7 +910,8 @@ impl Server {
                 ctx.committed_warning.as_deref(),
             ),
             CheckpointFinal::Refused(m) => m,
-        }
+        };
+        format!("{advisory}{out}")
     }
 
     /// v0.23.0: Drop the in-memory gate fast-path for a (repo, session) so a prior
@@ -868,10 +933,15 @@ impl Server {
         bundle: &crate::git::DiffBundle,
         cwd: &str,
         approved_plan: Option<&str>,
+        active_fp: u64,
     ) -> String {
         let dh = bundle.hash;
 
-        if st.last_allowed_diff_hash == Some(dh) {
+        // v0.29 (O1b): the in-memory fast-path allows ONLY when this diff was approved
+        // AND under the ACTIVE review model (else a stale allow minted under a different
+        // model would fast-allow on the new model — it must re-review). Pure helper so
+        // the model-fp gate is unit-testable without spawning Codex.
+        if fast_path_allows(st, dh, active_fp) {
             return allow();
         }
         if st.fail_ask_pending {
@@ -943,6 +1013,8 @@ impl Server {
         match gate::parse_verdict(&review) {
             gate::Verdict::Approve => {
                 st.last_allowed_diff_hash = Some(dh);
+                // v0.29 (O1b): bind the in-memory allow to the model that JUST reviewed.
+                st.last_allowed_model_fp = Some(active_fp);
                 st.last_blocked_diff_hash = None;
                 st.cached_block_reason = None;
                 st.same_findings_blocks = 0;
@@ -1066,6 +1138,13 @@ fn collect_filenames_from_diff(diff_text: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// v0.29 (O1b): the in-memory Stop fast-path allows ONLY when the same diff was
+/// already approved AND under the ACTIVE review-model fingerprint. Pure so the
+/// model-fp gate is testable without spawning Codex.
+fn fast_path_allows(st: &gate::GateState, dh: u64, active_fp: u64) -> bool {
+    st.last_allowed_diff_hash == Some(dh) && st.last_allowed_model_fp == Some(active_fp)
 }
 
 /// v0.23.0: Pure-fn verdict mapper for the checkpoint review. Separated so the
@@ -1967,13 +2046,16 @@ const GATE_PRIMER: &str =
 /// the first review is warm. Hands back `(child, gate_threadId)`. Best-effort: the
 /// gate cold-spawns lazily if this isn't ready in time. One tiny cold call per
 /// server start pays the system-prompt cost once, off the review path.
-fn spawn_warming() -> std::sync::mpsc::Receiver<(CodexPeer, String)> {
+fn spawn_warming(
+    pinned: crate::review_mcp::PinnedReviewModel,
+) -> std::sync::mpsc::Receiver<(CodexPeer, String)> {
     let (tx, rx) = std::sync::mpsc::channel();
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| ".".to_string());
     std::thread::spawn(move || {
-        if let Ok(mut peer) = CodexPeer::spawn() {
+        // v0.29 (O1b): warm under the server's pinned review-model snapshot.
+        if let Ok(mut peer) = CodexPeer::spawn_with(&pinned) {
             // Only hand over a child whose gate thread actually opened.
             if let Ok((gate_tid, _)) =
                 peer.open_thread(GATE_PRIMER, &cwd, crate::codex::REVIEW_REASONING_EFFORT)
@@ -2276,6 +2358,53 @@ mod tests {
         assert!(
             !is_context_exhausted(text),
             "session-lost and context-exhausted must be disjoint predicates"
+        );
+    }
+
+    // ───── v0.29 (O1b): in-memory fast-path model-fp gate ─────
+    #[test]
+    fn fast_path_requires_matching_diff_and_model_fp() {
+        let mut st = gate::GateState {
+            last_allowed_diff_hash: Some(0xAA),
+            last_allowed_model_fp: Some(0xF1),
+            ..Default::default()
+        };
+        assert!(
+            fast_path_allows(&st, 0xAA, 0xF1),
+            "diff + model fp match → allow"
+        );
+        assert!(
+            !fast_path_allows(&st, 0xBB, 0xF1),
+            "diff mismatch → no fast-allow"
+        );
+        assert!(
+            !fast_path_allows(&st, 0xAA, 0xF2),
+            "model fp mismatch → no fast-allow (stale allow under a different model)"
+        );
+        st.last_allowed_model_fp = None;
+        assert!(
+            !fast_path_allows(&st, 0xAA, 0xF1),
+            "missing model fp (pre-O1b / unreviewed) → no fast-allow"
+        );
+    }
+
+    #[test]
+    fn review_model_pending_restart_reflects_pinned_vs_configured() {
+        let mut s = Server::new();
+        // At construction the server pinned the current config → not pending.
+        assert!(
+            !s.review_model_pending_restart(),
+            "pinned == configured at startup → not pending"
+        );
+        // Simulate the user changing the review-model config AFTER the server pinned:
+        // the configured fp now differs from the pinned fp → pending restart (advisory).
+        s.pinned_model = crate::review_mcp::PinnedReviewModel {
+            fp: s.pinned_model.fp ^ 0xDEAD_BEEF,
+            overrides: Vec::new(),
+        };
+        assert!(
+            s.review_model_pending_restart(),
+            "configured changed after pin → pending restart"
         );
     }
 
@@ -2699,10 +2828,10 @@ mod tests {
         let session = "sess-rc-receipt";
         let cwd = setup_approved_repo(session);
         let base_a = crate::git::head_oid(&cwd).unwrap();
-        crate::review_frontier::set_allowed_hash(&cwd, session, 0x7777, 0x9);
+        crate::review_frontier::set_allowed_hash(&cwd, session, 0x7777, 0x9, 0xF1);
         crate::review_frontier::set_status(&cwd, session, crate::review_frontier::STATUS_APPROVED);
         assert_eq!(
-            crate::review_frontier::read_allowed_hash(&cwd, session, 0x9),
+            crate::review_frontier::read_allowed_hash(&cwd, session, 0x9, 0xF1),
             Some(0x7777),
             "precondition: receipt honored while approved"
         );
@@ -2710,7 +2839,7 @@ mod tests {
         assert!(matches!(fin, CheckpointFinal::Blocked));
         // Disk receipt is now inert (status==BLOCKED), so the next Stop can't fast-allow.
         assert_eq!(
-            crate::review_frontier::read_allowed_hash(&cwd, session, 0x9),
+            crate::review_frontier::read_allowed_hash(&cwd, session, 0x9, 0xF1),
             None
         );
     }
@@ -2721,10 +2850,10 @@ mod tests {
         // receipt.
         let session = "sess-dirty-receipt";
         let cwd = setup_approved_repo(session);
-        crate::review_frontier::set_allowed_hash(&cwd, session, 0x5555, 0x3);
+        crate::review_frontier::set_allowed_hash(&cwd, session, 0x5555, 0x3, 0xF1);
         crate::review_frontier::set_status(&cwd, session, crate::review_frontier::STATUS_APPROVED);
         assert_eq!(
-            crate::review_frontier::read_allowed_hash(&cwd, session, 0x3),
+            crate::review_frontier::read_allowed_hash(&cwd, session, 0x3, 0xF1),
             Some(0x5555)
         );
         std::fs::write(std::path::Path::new(&cwd).join("seed.txt"), "edit").unwrap();
@@ -2733,7 +2862,7 @@ mod tests {
             matches!(prep, CheckpointPrep::Refuse { ref message, .. } if message.contains("dirty"))
         );
         assert_eq!(
-            crate::review_frontier::read_allowed_hash(&cwd, session, 0x3),
+            crate::review_frontier::read_allowed_hash(&cwd, session, 0x3, 0xF1),
             None
         );
     }
@@ -2873,10 +3002,10 @@ mod tests {
         crate::review_frontier::on_task_start(&cwd, session);
         // Seed a receipt as if a prior Stop approved a diff under some plan scope.
         // Status must be APPROVED for the receipt to be honored (v0.23 Layer 1).
-        crate::review_frontier::set_allowed_hash(&cwd, session, 0xDEAD_BEEF, 0x1234);
+        crate::review_frontier::set_allowed_hash(&cwd, session, 0xDEAD_BEEF, 0x1234, 0xF1);
         crate::review_frontier::set_status(&cwd, session, crate::review_frontier::STATUS_APPROVED);
         assert_eq!(
-            crate::review_frontier::read_allowed_hash(&cwd, session, 0x1234),
+            crate::review_frontier::read_allowed_hash(&cwd, session, 0x1234, 0xF1),
             Some(0xDEAD_BEEF),
             "precondition: receipt is present"
         );
@@ -2884,7 +3013,7 @@ mod tests {
         crate::review_frontier::checkpoint_approved(&cwd, session, &head).unwrap();
         // After advancing the base, the stale receipt must be gone.
         assert_eq!(
-            crate::review_frontier::read_allowed_hash(&cwd, session, 0x1234),
+            crate::review_frontier::read_allowed_hash(&cwd, session, 0x1234, 0xF1),
             None,
             "checkpoint_approved must clear the stale receipt scoped to the old base"
         );

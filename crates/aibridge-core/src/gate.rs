@@ -12,6 +12,11 @@ use std::hash::{Hash, Hasher};
 #[derive(Default)]
 pub struct GateState {
     pub last_allowed_diff_hash: Option<u64>,
+    /// v0.29 (O1b): the review-model fingerprint the `last_allowed_diff_hash` approval
+    /// was minted under. The in-memory fast-path (and APPROVED status) require this to
+    /// match the ACTIVE model fp, so a stale allow under a different model can never
+    /// fast-allow or be recorded as approved.
+    pub last_allowed_model_fp: Option<u64>,
     pub last_blocked_diff_hash: Option<u64>,
     pub last_findings_hash: Option<u64>,
     pub same_findings_blocks: u32,

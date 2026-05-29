@@ -29,6 +29,8 @@
 
 use aibridge_platform::{DefaultPlatform, Platform};
 use serde_json::{json, Value};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 /// A codex MCP server as seen in the config, with a flattened command line used only
@@ -692,14 +694,14 @@ pub fn set_codex_model(model: Option<String>, ctx: Option<u64>) -> Result<(), St
 /// Pure: the spawn `-c` overrides for model/context from a policy Value. Empty when
 /// unset; OMITS an invalid slug (never emits a malformed `-c`). The model value is
 /// TOML-serialized; ctx is a bare integer.
-fn codex_overrides_from(cfg: &Value) -> Vec<String> {
-    let c = codex_from(cfg);
+/// Pure: the spawn `-c` overrides for model/context from a CONFIG snapshot. Empty when
+/// unset; omits an invalid slug; the context window is emitted ONLY alongside a valid
+/// model (so a manually-edited / legacy config with a window but an empty/invalid model
+/// can't leak a lone `-c model_context_window=…`). v0.29 O1b: takes the config so the
+/// fingerprint and the overrides can be derived from the SAME snapshot.
+fn codex_overrides_from_config(c: &CodexReviewConfig) -> Vec<String> {
     let mut out = Vec::new();
-    // Model is PRIMARY: emit the context window ONLY alongside a valid model, so a
-    // manually-edited / legacy config with a window but an empty/invalid model can't
-    // leak a lone `-c model_context_window=…` (which would override codex's default
-    // window for whatever model it falls back to).
-    if let Some(m) = c.model.filter(|m| is_valid_model_slug(m)) {
+    if let Some(m) = c.model.clone().filter(|m| is_valid_model_slug(m)) {
         out.push("-c".to_string());
         out.push(format!("model={}", toml::Value::String(m)));
         if let Some(n) = c.model_context_window {
@@ -710,10 +712,49 @@ fn codex_overrides_from(cfg: &Value) -> Vec<String> {
     out
 }
 
+fn codex_overrides_from(cfg: &Value) -> Vec<String> {
+    codex_overrides_from_config(&codex_from(cfg))
+}
+
 /// Spawn-time model/context `-c` overrides for the warm review child (v0.29 O1).
 /// Empty when unset → codex uses its config.toml default (no behavior change).
 pub fn codex_spawn_overrides() -> Vec<String> {
     codex_overrides_from(&read_config())
+}
+
+/// v0.29 (O1b): stable fingerprint of the active review-model config (model + context
+/// window). A change here means reviews would run under different model semantics, so
+/// it (1) invalidates fast-path approvals minted under a different model and (2) lets
+/// the server detect a pending restart. Pure.
+pub fn codex_fingerprint_of(c: &CodexReviewConfig) -> u64 {
+    let mut h = DefaultHasher::new();
+    c.model.hash(&mut h);
+    c.model_context_window.hash(&mut h);
+    h.finish()
+}
+
+/// The fingerprint of the CURRENTLY-CONFIGURED (on-disk) review model.
+pub fn codex_config_fingerprint() -> u64 {
+    codex_fingerprint_of(&codex_config())
+}
+
+/// v0.29 (O1b): a single-snapshot pin of the review model — the fingerprint AND the
+/// spawn `-c` overrides are derived from ONE read of the config, so they can never
+/// diverge. The MCP server pins one of these for its lifetime; a model change applies
+/// on the next server start (restart-to-apply).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinnedReviewModel {
+    pub fp: u64,
+    pub overrides: Vec<String>,
+}
+
+/// Read the review-model config ONCE and pin both its fingerprint and spawn overrides.
+pub fn pinned_review_model() -> PinnedReviewModel {
+    let c = codex_config();
+    PinnedReviewModel {
+        fp: codex_fingerprint_of(&c),
+        overrides: codex_overrides_from_config(&c),
+    }
 }
 
 /// Names in the allowlist that are not (any longer) defined codex servers.
@@ -1276,6 +1317,59 @@ mod tests {
     fn set_codex_model_rejects_absurd_context_window_before_any_write() {
         assert!(set_codex_model(Some("gpt-5.5".into()), Some(0)).is_err());
         assert!(set_codex_model(Some("gpt-5.5".into()), Some(u64::MAX)).is_err());
+    }
+
+    // ─── v0.29 (O1b): fingerprint + config-snapshot overrides ───
+    fn cfg(model: Option<&str>, ctx: Option<u64>) -> CodexReviewConfig {
+        CodexReviewConfig {
+            model: model.map(str::to_string),
+            model_context_window: ctx,
+        }
+    }
+
+    #[test]
+    fn codex_fingerprint_stable_and_changes_on_model_or_ctx() {
+        let a = cfg(Some("gpt-5.5"), Some(272_000));
+        assert_eq!(
+            codex_fingerprint_of(&a),
+            codex_fingerprint_of(&cfg(Some("gpt-5.5"), Some(272_000))),
+            "equal configs → equal fp"
+        );
+        assert_ne!(
+            codex_fingerprint_of(&a),
+            codex_fingerprint_of(&cfg(Some("gpt-5.4"), Some(272_000))),
+            "model change → fp change"
+        );
+        assert_ne!(
+            codex_fingerprint_of(&a),
+            codex_fingerprint_of(&cfg(Some("gpt-5.5"), Some(200_000))),
+            "ctx change → fp change"
+        );
+        assert_eq!(
+            codex_fingerprint_of(&CodexReviewConfig::default()),
+            codex_fingerprint_of(&CodexReviewConfig::default()),
+            "unset is stable"
+        );
+    }
+
+    #[test]
+    fn codex_overrides_from_config_cases() {
+        assert_eq!(
+            codex_overrides_from_config(&cfg(Some("gpt-5.5"), Some(272_000))),
+            vec![
+                "-c",
+                "model=\"gpt-5.5\"",
+                "-c",
+                "model_context_window=272000"
+            ]
+        );
+        assert_eq!(
+            codex_overrides_from_config(&cfg(Some("gpt-5.4"), None)),
+            vec!["-c", "model=\"gpt-5.4\""]
+        );
+        assert!(codex_overrides_from_config(&CodexReviewConfig::default()).is_empty());
+        // invalid slug → omitted entirely (no lone ctx)
+        assert!(codex_overrides_from_config(&cfg(Some("bad slug!"), Some(1))).is_empty());
     }
 
     #[test]
