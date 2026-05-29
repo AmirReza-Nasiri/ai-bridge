@@ -209,8 +209,8 @@ pub fn absolute_git_dir(cwd: &str) -> Option<String> {
     git_checked(cwd, &["rev-parse", "--absolute-git-dir"])
 }
 
-/// True iff `base` is an ancestor of `HEAD`.
-fn is_ancestor(cwd: &str, base: &str) -> bool {
+/// True iff `base` is an ancestor of `HEAD`. Fail-closed (any git error → false).
+pub fn is_ancestor(cwd: &str, base: &str) -> bool {
     git_ok(cwd, &["merge-base", "--is-ancestor", base, "HEAD"])
 }
 
