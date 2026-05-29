@@ -6,6 +6,58 @@ versioning is semver.
 
 ## [Unreleased]
 
+## [0.29.0] - 2026-05-29
+
+Pick the Codex model AI Bridge reviews with — from the TUI or the CLI — plus gate
+hardening that stops two self-inflicted review loops, and two reliability fixes. All
+changes since v0.28.0 (7 commits: B1, B2, O1a–O1d, O3).
+
+### Added
+- **Review-model selector (O1).** Choose the codex model AI Bridge's review child uses,
+  populated LIVE from codex's own model cache (no hardcoded list). Set it in the `status`
+  dashboard's **Review** tab (live list + a Custom free-text entry + an empty-cache
+  fallback) or via the new **`aibridge review-model {list,show,set [--context N],clear}`**
+  CLI, with a `doctor` line reporting the configured model + context window. A model
+  change FORCES a fresh review: the Stop receipt, the in-memory fast-path, and the
+  APPROVED status are all bound to the active model's fingerprint, so an approval minted
+  under a different model can never fast-allow. The change applies on the next MCP-server
+  start (restart Claude Code) — the TUI/CLI report it as "configured", never "active",
+  since they can't see the running server's pinned model. The context-window override is
+  preserved when you switch models (only "Default" clears it), and an invalid hand-edited
+  slug or an orphan context window is reported as "ignored", never as if it applies.
+
+### Fixed
+- **B1 — `cargo test` could corrupt the real `~/.ai-bridge/install.json`.** The
+  staged-update tests ran the apply path against temp targets through the real metadata
+  writer, polluting the live install record with a temp `install_path` (the root cause
+  behind the v0.28 self-update misfire). Tests now inject the metadata dir and never touch
+  the real file.
+- **B2 — the "restart to use it" nag never cleared.** After an update applied and you
+  restarted onto the new version, the Update tab still nagged because the `Succeeded`
+  staged-status record was never consumed. It's now treated as consumed once the running
+  version matches the status's target.
+
+### Changed
+- **Gate hardening (O3, trimmed).** Plan-gate and Stop-gate review prompts now treat
+  PROCESS/meta steps a plan lists (commit, checkpoint, advancing the review frontier,
+  running gates/tests) as NON-criteria — fixing a `REQUEST_CHANGES` loop where the
+  reviewer flagged those steps as "missing" — and defer compile-ability to the local
+  build/clippy, so the reviewer no longer raises speculative borrow/move "build failure"
+  findings. The Stop gate now retries ONCE on a transient transport error (closed pipe /
+  EOF / dead reader / Windows "os error 232") before asking the user, with the spawn/
+  handshake inside the retried unit and the real error surfaced in the message; a
+  full-review timeout is never retried. `PLAN_RECEIPT_VERSION` and `REVIEW_POLICY_VERSION`
+  are bumped to 2 (the review-prompt semantics changed), so existing approval receipts
+  invalidate and the first plan/Stop review after upgrading runs in full.
+
+### Known limitations / deferred
+- Re-reviewing work that was already committed AND frontier-advanced before a review-model
+  change is not automatic; the planned fix is a server-owned, repo-level approved-span
+  ledger.
+- The plan-receipt lenient-ancestor resume (instant re-approve of an unchanged plan after
+  a commit) and the review-bundle cap / generated-file filtering are deferred to a later
+  version (they need the frontier-coverage fix and careful safety work first).
+
 ## [0.28.0] - 2026-05-28
 
 Self-update reliability: the update now lands on the right binary and, on macOS, takes
