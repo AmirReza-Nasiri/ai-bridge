@@ -52,7 +52,10 @@ pub fn prompt_with_scope(diff_bundle: &str, approved_plan: Option<&str>) -> Stri
              reference, NOT a brittle whitelist (necessary implementation detail that serves the \
              plan is fine). Flag material deviations: a change clearly OUTSIDE this scope, planned \
              work that is missing, or any high-risk action (publish/deploy/migrations/destructive \
-             shell/data loss) the plan did not mention:\n\
+             shell/data loss) the plan did not mention. IMPORTANT: PROCESS/meta steps the plan may \
+             list — commit, push, checkpoint, advancing the review frontier, running gates/tests — \
+             are NOT review criteria; judge the CODE/outcome, and never flag such process steps as \
+             'missing' (the diff cannot show them):\n\
              === APPROVED PLAN ===\n{p}\n=== END APPROVED PLAN ===\n"
         ),
         _ => String::new(),
@@ -83,6 +86,10 @@ pub fn prompt_with_scope(diff_bundle: &str, approved_plan: Option<&str>) -> Stri
          PRE-EXISTING issue should block only if this task worsens it, relies on it, or the \
          approved plan claimed to fix it. Use APPROVE only when the diff is genuinely safe to \
          ship as-is. Use BLOCKED only when required context is missing.\n\
+         The local build/test/clippy gate is AUTHORITATIVE on compile-ability: do NOT raise \
+         \"won't compile\" / borrow-checker / move-semantics as a blocking finding on speculation \
+         — flag a compile error only if you can PROVE it from the diff. Spend your scrutiny on \
+         logic, safety, and correctness, not on guessing whether it builds.\n\
          {scope}\n\
          === TASK CHANGES (committed since task start + uncommitted) ===\n{diff_bundle}"
     )
@@ -101,6 +108,48 @@ pub fn parse_verdict(review: &str) -> Verdict {
         "<AI-BRIDGE-REQUEST-CHANGES/>" => Verdict::RequestChanges,
         "<AI-BRIDGE-BLOCKED/>" => Verdict::Blocked,
         _ => Verdict::Unparseable,
+    }
+}
+
+/// True when a Codex error is a clearly TRANSIENT transport failure worth ONE retry —
+/// a closed pipe / EOF, a broken pipe (Windows "os error 232"), or a dead reader
+/// thread. A full-review TIMEOUT is deliberately NOT retryable (a `CALL_TIMEOUT` retry
+/// could stall for many minutes), and neither are quota / protocol ("codex error:")
+/// failures (a fresh spawn won't fix them).
+pub fn is_retryable_transport_error(msg: &str) -> bool {
+    let m = msg.to_lowercase();
+    // Exclusions checked FIRST: a full-review timeout, a quota failure, or a protocol
+    // ("codex error:") failure must NOT retry even if its text mentions a pipe/EOF.
+    if m.contains("timed out") || m.contains("quota") || m.contains("codex error:") {
+        return false;
+    }
+    // Transient transport failures (closed pipe / EOF / dead-or-disconnected reader /
+    // broken pipe incl. Windows "os error 232"). `pipe` subsumes "broken pipe"/"pipe
+    // closed"; kept alongside for clarity.
+    m.contains("closed its output")
+        || m.contains("reader thread ended")
+        || m.contains("disconnect")
+        || m.contains("eof")
+        || m.contains("pipe")
+        || m.contains("os error 232")
+}
+
+/// Run `ask` once; on a retryable transport error (see [`is_retryable_transport_error`])
+/// invoke `on_retry(err)` (for logging) and retry EXACTLY ONCE. A non-transient error,
+/// or a second failure, returns the (final) `Err`. Pure (holds no peer/server state) so
+/// the retry policy is unit-testable with closures.
+pub fn ask_with_retry<F, L>(mut ask: F, mut on_retry: L) -> anyhow::Result<String>
+where
+    F: FnMut() -> anyhow::Result<String>,
+    L: FnMut(&str),
+{
+    match ask() {
+        Ok(r) => Ok(r),
+        Err(e) if is_retryable_transport_error(&e.to_string()) => {
+            on_retry(&e.to_string());
+            ask()
+        }
+        Err(e) => Err(e),
     }
 }
 
@@ -159,4 +208,113 @@ pub fn write_trace(cwd: &str, diff_bundle: &str, review: &str) -> String {
         let _ = std::fs::write(dir.join("diff.txt"), diff_bundle);
     }
     format!(".ai-bridge/reviews/{ts}/review.txt")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn retryable_transport_error_classification() {
+        for t in [
+            "codex closed its output before responding to `x`",
+            "codex reader thread ended unexpectedly",
+            "write failed: Broken pipe (os error 232)",
+            "io error: broken pipe",
+            "unexpected EOF while reading",
+            "reader disconnected",
+            "pipe closed",
+        ] {
+            assert!(is_retryable_transport_error(t), "should retry: {t}");
+        }
+        for f in [
+            "codex timed out after 1500s waiting for `x`", // full-review timeout: never retry
+            "quota exhausted",
+            "codex error: {\"code\":-32000}",
+            "spawning codex mcp-server: program not found", // missing binary: pointless to retry
+        ] {
+            assert!(!is_retryable_transport_error(f), "should NOT retry: {f}");
+        }
+    }
+
+    #[test]
+    fn ask_with_retry_retries_once_on_transient_then_succeeds() {
+        let calls = Cell::new(0u32);
+        let retried = Cell::new(0u32);
+        let r = ask_with_retry(
+            || {
+                let n = calls.get() + 1;
+                calls.set(n);
+                if n == 1 {
+                    Err(anyhow::anyhow!("codex closed its output before responding"))
+                } else {
+                    Ok("ok".to_string())
+                }
+            },
+            |_e| retried.set(retried.get() + 1),
+        );
+        assert_eq!(r.unwrap(), "ok");
+        assert_eq!(calls.get(), 2, "exactly one retry");
+        assert_eq!(retried.get(), 1, "on_retry fired once");
+    }
+
+    #[test]
+    fn ask_with_retry_second_transient_failure_returns_err() {
+        let calls = Cell::new(0u32);
+        let r = ask_with_retry(
+            || {
+                calls.set(calls.get() + 1);
+                Err::<String, _>(anyhow::anyhow!("broken pipe (os error 232)"))
+            },
+            |_e| {},
+        );
+        assert!(r.is_err());
+        assert_eq!(calls.get(), 2, "tried exactly twice, no more");
+    }
+
+    #[test]
+    fn ask_with_retry_non_transient_does_not_retry() {
+        let calls = Cell::new(0u32);
+        let retried = Cell::new(0u32);
+        let r = ask_with_retry(
+            || {
+                calls.set(calls.get() + 1);
+                Err::<String, _>(anyhow::anyhow!("codex timed out after 1500s"))
+            },
+            |_e| retried.set(retried.get() + 1),
+        );
+        assert!(r.is_err());
+        assert_eq!(calls.get(), 1, "no retry on a non-transient error");
+        assert_eq!(retried.get(), 0, "on_retry NOT fired");
+    }
+
+    #[test]
+    fn ask_with_retry_success_first_try() {
+        let calls = Cell::new(0u32);
+        let r = ask_with_retry(
+            || {
+                calls.set(calls.get() + 1);
+                Ok("ok".to_string())
+            },
+            |_e| panic!("on_retry must not fire on success"),
+        );
+        assert_eq!(r.unwrap(), "ok");
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn prompt_with_scope_has_process_and_compile_clauses() {
+        let p = prompt_with_scope("DIFF", Some("commit then push"));
+        assert!(p.contains("PROCESS/meta steps"), "process-steps exemption");
+        assert!(p.contains("NOT review criteria"));
+        assert!(
+            p.to_lowercase().contains("compile-ability"),
+            "compile-deference clause"
+        );
+        assert!(
+            p.contains("high-risk action"),
+            "still flags high-risk actions"
+        );
+    }
 }

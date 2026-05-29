@@ -28,7 +28,7 @@ pub const STATUS_NEEDS_USER: &str = "needs_user";
 /// ONLY when the receipt's version matches — so changing the review prompt/bundle shape
 /// (which can change what "approved" means) automatically invalidates old receipts and
 /// forces a fresh review. Bump this whenever that semantics changes.
-pub const REVIEW_POLICY_VERSION: u32 = 1;
+pub const REVIEW_POLICY_VERSION: u32 = 2;
 
 fn now_ms() -> u128 {
     SystemTime::now()

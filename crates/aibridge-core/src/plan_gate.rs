@@ -948,7 +948,11 @@ pub fn prompt(plan: &str) -> String {
          has submitted the plan/todolist below. Judge the APPROACH before any code is written: \
          is the plan correct, complete, and safe? Look for wrong approach, missing steps, \
          unhandled edge cases, risky surfaces (auth/payments/migrations/data-loss/deploy), \
-         scope creep, and missing tests.\n\n\
+         scope creep, and missing tests. Judge the CODE approach only: PROCESS/meta steps the \
+         plan lists (commit, push, checkpoint, advancing the review frontier, running gates/tests) \
+         are NOT plan defects — do not flag them as missing. Compile-ability is verified by the \
+         local build/clippy gate, not here — do not reject a plan on speculative \"won't compile\" \
+         grounds.\n\n\
          Write:\n\
          1. FINDINGS: if the plan is sound, write \"No blocking concerns.\"; otherwise list ALL \
          blocking concerns with the plan in THIS single pass — be comprehensive so the agent can \
@@ -1249,6 +1253,16 @@ mod tests {
         let cwd = tmp();
         start_epoch(&cwd, "claude-uuid-xyz", "a task");
         assert_eq!(current_session(&cwd).as_deref(), Some("claude-uuid-xyz"));
+    }
+
+    #[test]
+    fn plan_prompt_has_process_and_compile_clauses() {
+        let p = prompt("do X");
+        assert!(p.contains("PROCESS/meta steps"), "process-steps exemption");
+        assert!(
+            p.to_lowercase().contains("compile-ability"),
+            "compile-deference clause"
+        );
     }
 
     #[test]

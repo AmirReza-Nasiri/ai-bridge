@@ -30,8 +30,9 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Bump when the plan-review prompt/semantics change, so receipts minted under the
-/// old semantics stop fast-pathing and force a fresh review.
-pub const PLAN_RECEIPT_VERSION: u32 = 1;
+/// old semantics stop fast-pathing and force a fresh review. v2: the plan-gate prompt
+/// gained the "process steps are not review criteria" + compile-deference clauses.
+pub const PLAN_RECEIPT_VERSION: u32 = 2;
 
 /// How long after approval a receipt may fast-path a reload-resume (24h — long
 /// enough to survive a reload/restart, short enough to bound replay).
@@ -224,6 +225,9 @@ mod tests {
         // Stale policy version → no resume.
         let oldver = receipt(&ph, head, now as u64, PLAN_RECEIPT_VERSION + 1);
         assert_eq!(receipt_authorizes(&oldver, &ph, head, now), None);
+        // A v1 receipt (the pre-v0.29 default) is stale after the v2 bump → no resume.
+        let v1 = receipt(&ph, head, now as u64, 1);
+        assert_eq!(receipt_authorizes(&v1, &ph, head, now), None);
         // Expired (older than TTL) → no resume.
         let old = receipt(
             &ph,

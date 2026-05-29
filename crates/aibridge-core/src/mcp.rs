@@ -927,6 +927,24 @@ impl Server {
         self.gates.remove(&key);
     }
 
+    /// One Stop-review attempt: ensure the peer (spawn/handshake), log how it launched,
+    /// then ask on the Gate thread. Factored so `gate::ask_with_retry` can retry the
+    /// WHOLE unit — `ensure_peer` is INSIDE the retried boundary, so a flaky cold spawn /
+    /// handshake (closed pipe / os error 232 / dead reader) is retried too.
+    fn gate_review_attempt(&mut self, prompt: &str, cwd: &str) -> anyhow::Result<String> {
+        self.ensure_peer()?;
+        let warm = self.threads.contains_key(&TopicKey::Gate);
+        let kind = self.codex.as_ref().map(|p| p.spawn_kind()).unwrap_or("?");
+        log_gate(
+            cwd,
+            &format!(
+                "calling Codex [{kind}, {}]",
+                if warm { "warm" } else { "cold" }
+            ),
+        );
+        self.ask_topic(TopicKey::Gate, prompt, cwd)
+    }
+
     fn gate_decide(
         &mut self,
         st: &mut gate::GateState,
@@ -973,38 +991,33 @@ impl Server {
         // Periodic anti-anchoring reset of the reserved review thread (shared bound
         // with manual review_diff; warm-cache speed is kept for the runs between).
         self.tick_gate_reset();
-        // Ensure the child (also adopts the warmed one) so we can log how it launched.
-        if let Err(e) = self.ensure_peer() {
-            log_gate(cwd, &format!("Codex review FAILED: {e}"));
-            return self.fail_ask(
-                st,
-                dh,
-                "peer review couldn't run (Codex unavailable, timed out, or quota exhausted)",
-            );
-        }
-        let warm = self.threads.contains_key(&TopicKey::Gate);
-        let kind = self.codex.as_ref().map(|p| p.spawn_kind()).unwrap_or("?");
-        log_gate(
-            cwd,
-            &format!(
-                "calling Codex [{kind}, {}]",
-                if warm { "warm" } else { "cold" }
-            ),
-        );
-        // ask_topic owns peer-invalidation on transport error.
-        let review = match self.ask_topic(TopicKey::Gate, &prompt, cwd) {
+        // Run the review with ONE retry on a transient transport error (closed pipe /
+        // EOF / os error 232 / dead reader) — `gate_review_attempt` puts `ensure_peer`
+        // INSIDE the retried unit, so a flaky cold spawn re-tries. A full-review TIMEOUT
+        // is NOT retried (see `is_retryable_transport_error`). A failed/retried attempt
+        // mutates NO gate state (the approve/receipt path is only reached after a parsed
+        // verdict), so it can never mint an approval.
+        let review = match gate::ask_with_retry(
+            || self.gate_review_attempt(&prompt, cwd),
+            |e| {
+                log_gate(
+                    cwd,
+                    &format!("Codex review transport error, retrying once: {e}"),
+                )
+            },
+        ) {
             Ok(r) => {
                 log_gate(cwd, "Codex review returned");
                 r
             }
             Err(e) => {
-                // Log the real cause (timeout / EOF / quota) for diagnosis; keep
-                // the user-facing reason short. `ask_topic` already dropped the peer.
+                // Surface the REAL final cause (after the retry) so the fail-ask reason is
+                // diagnostic, not generic. ask_topic already dropped the peer on error.
                 log_gate(cwd, &format!("Codex review FAILED: {e}"));
                 return self.fail_ask(
                     st,
                     dh,
-                    "peer review couldn't run (Codex unavailable, timed out, or quota exhausted)",
+                    &format!("peer review couldn't run after 1 retry: {e}"),
                 );
             }
         };
