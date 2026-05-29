@@ -653,6 +653,13 @@ fn set_codex_in(cfg: &mut Value, model: Option<String>, ctx: Option<u64>) {
     if !cfg.is_object() {
         *cfg = json!({});
     }
+    // Preserve non-model codex sub-fields (e.g. plan_review_effort, v0.30 #4) — only the
+    // model + context window are rewritten here, so a `review-model set`/`clear` must NOT
+    // silently erase a separately-configured plan-review effort.
+    let preserved_effort = cfg
+        .get("codex")
+        .and_then(|c| c.get("plan_review_effort"))
+        .cloned();
     let obj = cfg.as_object_mut().expect("object");
     let mut codex = serde_json::Map::new();
     if let Some(m) = model {
@@ -660,6 +667,9 @@ fn set_codex_in(cfg: &mut Value, model: Option<String>, ctx: Option<u64>) {
         if let Some(n) = ctx {
             codex.insert("model_context_window".into(), json!(n));
         }
+    }
+    if let Some(e) = preserved_effort {
+        codex.insert("plan_review_effort".into(), e);
     }
     if codex.is_empty() {
         obj.remove("codex");
@@ -755,6 +765,36 @@ pub fn pinned_review_model() -> PinnedReviewModel {
         fp: codex_fingerprint_of(&c),
         overrides: codex_overrides_from_config(&c),
     }
+}
+
+// ───────────────────────── v0.30 (#4): configurable plan-review effort ─────────────────
+//
+// The plan_gate review is a PROSE review of the plan text; xhigh on it is the slowest part
+// of a fresh-plan round. This OPTIONAL knob (review-mcp.json `codex.plan_review_effort`)
+// lets the user run the PLAN review at a lower effort while the Stop/code review stays
+// xhigh. DEFAULT is unset → xhigh, so "max Codex power" is unchanged unless opted out.
+
+/// A codex reasoning-effort level we accept for the plan review.
+fn is_valid_effort(s: &str) -> bool {
+    matches!(s, "minimal" | "low" | "medium" | "high" | "xhigh")
+}
+
+/// Pure: the configured plan-review effort from a policy Value (validated), or `None`
+/// when unset/invalid (→ caller defaults to the xhigh review effort).
+fn plan_effort_from(cfg: &Value) -> Option<String> {
+    cfg.get("codex")
+        .and_then(|c| c.get("plan_review_effort"))
+        .and_then(Value::as_str)
+        .filter(|s| is_valid_effort(s))
+        .map(str::to_string)
+}
+
+/// The reasoning effort for the plan_gate review — the configured value, else the
+/// default review effort (xhigh). Only the PLAN review uses this; Stop/code/consult
+/// always use [`crate::codex::REVIEW_REASONING_EFFORT`].
+pub fn plan_review_effort() -> String {
+    plan_effort_from(&read_config())
+        .unwrap_or_else(|| crate::codex::REVIEW_REASONING_EFFORT.to_string())
 }
 
 // ───────────────────────── v0.29 (O1d): review-model CLI + doctor reporting ─────────────
@@ -1380,6 +1420,55 @@ mod tests {
         set_codex_in(&mut cfg, None, None);
         assert!(cfg.get("codex").is_none(), "empty codex removed");
         assert_eq!(cfg["allow"], json!(["context7"]));
+    }
+
+    // ─── v0.30 (#4) configurable plan-review effort (pure) ───
+    #[test]
+    fn is_valid_effort_accepts_only_known_levels() {
+        for ok in ["minimal", "low", "medium", "high", "xhigh"] {
+            assert!(is_valid_effort(ok), "{ok}");
+        }
+        for bad in ["ultra", "", "HIGH", "xxhigh", "none"] {
+            assert!(!is_valid_effort(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn plan_effort_from_reads_validated_or_none() {
+        assert_eq!(plan_effort_from(&json!({})), None);
+        assert_eq!(
+            plan_effort_from(&json!({"codex": {"plan_review_effort": "high"}})).as_deref(),
+            Some("high")
+        );
+        // invalid value → None (caller defaults to xhigh)
+        assert_eq!(
+            plan_effort_from(&json!({"codex": {"plan_review_effort": "ultra"}})),
+            None
+        );
+        // non-string → None
+        assert_eq!(
+            plan_effort_from(&json!({"codex": {"plan_review_effort": 5}})),
+            None
+        );
+    }
+
+    #[test]
+    fn set_codex_in_preserves_plan_review_effort() {
+        // A separately-configured plan_review_effort must survive a model set AND a clear.
+        let mut cfg = json!({"codex": {"plan_review_effort": "high"}});
+        set_codex_in(&mut cfg, Some("gpt-5.5".into()), Some(272_000));
+        assert_eq!(cfg["codex"]["model"], "gpt-5.5");
+        assert_eq!(
+            cfg["codex"]["plan_review_effort"], "high",
+            "preserved on set"
+        );
+        // Clearing the MODEL must NOT erase the effort knob (codex object kept).
+        set_codex_in(&mut cfg, None, None);
+        assert_eq!(
+            cfg["codex"]["plan_review_effort"], "high",
+            "preserved on model clear"
+        );
+        assert!(cfg["codex"].get("model").is_none(), "model cleared");
     }
 
     #[test]

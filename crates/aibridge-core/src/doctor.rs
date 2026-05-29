@@ -287,23 +287,34 @@ fn update_check() -> Check {
 /// takes minutes (so a slow review isn't mistaken for a hang — the exact
 /// confusion that masked the root cause during dogfood).
 fn review_effort() -> Check {
-    let effort = crate::codex::review_reasoning_effort();
+    let code = crate::codex::review_reasoning_effort();
+    let plan = crate::review_mcp::plan_review_effort();
     let global = codex_config_path()
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|t| parse_reasoning_effort(&t));
     let global_note = match global {
-        Some(g) if g != effort => format!("; your global Codex config is '{g}'"),
+        Some(g) if g != code => format!("; your global Codex config is '{g}'"),
         _ => String::new(),
     };
-    let latency = match effort {
+    let latency = match code {
         "xhigh" | "high" => "thorough — reviews take minutes, no cutoff",
         "minimal" | "low" => "fast — shallower review",
         _ => "balanced speed and depth",
     };
+    // v0.30 #4: always report BOTH the plan and code review efforts explicitly. The plan
+    // effort is PINNED at MCP-server start, so the CONFIGURED value reported here only takes
+    // effect after a restart — say so, or a user could think a just-edited value is live.
+    let tune_hint = if plan == code {
+        " — tune via codex.plan_review_effort in review-mcp.json"
+    } else {
+        ""
+    };
     check(
         Status::Pass,
         "review reasoning effort",
-        format!("{effort} ({latency}){global_note}"),
+        format!(
+            "code={code} ({latency}); plan={plan} (applies on next MCP server start){tune_hint}{global_note}"
+        ),
     )
 }
 

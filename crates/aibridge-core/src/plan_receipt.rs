@@ -117,6 +117,7 @@ fn receipt_authorizes(
     v: &Value,
     want_plan_hash: &str,
     head_match: HeadMatch,
+    want_effort: &str,
     now: u128,
 ) -> Option<Vec<String>> {
     if v.get("plan_receipt_version").and_then(Value::as_u64) != Some(PLAN_RECEIPT_VERSION as u64) {
@@ -124,6 +125,19 @@ fn receipt_authorizes(
     }
     if v.get("plan_hash").and_then(Value::as_str) != Some(want_plan_hash) {
         return None;
+    }
+    // v0.30 #4: the receipt must have been minted under the SAME plan-review effort, so a
+    // server restart with a changed effort forces a fresh review. ABSENT field → legacy
+    // "xhigh" (pre-#4 receipts, all minted at xhigh); a MALFORMED present value (non-string)
+    // fails closed → None, preserving the strict-receipt invariant.
+    let receipt_effort: Option<&str> = match v.get("plan_review_effort") {
+        None => Some("xhigh"),
+        Some(Value::String(s)) => Some(s.as_str()),
+        Some(_) => None,
+    };
+    match receipt_effort {
+        Some(e) if e == want_effort => {}
+        _ => return None,
     }
     let created = v.get("created_ms").and_then(Value::as_u64).unwrap_or(0) as u128;
     // Reject a zero/absent timestamp, a future one (clock skew/tamper), or an expired one.
@@ -179,7 +193,7 @@ fn head_match(cwd: &str, base_head: &str, head: &str) -> HeadMatch {
 /// ancestor of — the CURRENT HEAD within TTL, return the approved command classes to
 /// restore. `None` → the caller runs a full plan review. Fail-safe: an unborn repo (no
 /// HEAD to bind), a missing/corrupt receipt, or any binding mismatch all yield `None`.
-pub fn matching_classes(cwd: &str, plan: &str) -> Option<Vec<String>> {
+pub fn matching_classes(cwd: &str, plan: &str, want_effort: &str) -> Option<Vec<String>> {
     let head = crate::git::head_oid(cwd)?; // unborn repo → nothing to bind → full review
     let path = receipt_path(cwd)?;
     let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).ok()?).ok()?;
@@ -188,14 +202,17 @@ pub fn matching_classes(cwd: &str, plan: &str) -> Option<Vec<String>> {
         &v,
         &plan_hash(plan),
         head_match(cwd, base_head, &head),
+        want_effort,
         now_ms(),
     )
 }
 
-/// Write/refresh the receipt after a REAL Codex APPROVE so a later reload-resume of
-/// the SAME plan at the SAME HEAD can fast-path. Atomic temp+rename. Best-effort: an
-/// unborn repo / non-repo / unwritable home simply means no future fast-path.
-pub fn write(cwd: &str, plan: &str, command_classes: &[String]) {
+/// Write/refresh the receipt after a REAL Codex APPROVE so a later reload-resume of the
+/// SAME plan can fast-path. `effort` is the PINNED plan-review effort the review actually
+/// ran at (v0.30 #4) — stamped so a later server restart with a different effort forces a
+/// fresh review. Atomic temp+rename. Best-effort: an unborn repo / non-repo / unwritable
+/// home simply means no future fast-path.
+pub fn write(cwd: &str, plan: &str, command_classes: &[String], effort: &str) {
     let Some(head) = crate::git::head_oid(cwd) else {
         return;
     };
@@ -212,6 +229,7 @@ pub fn write(cwd: &str, plan: &str, command_classes: &[String]) {
         "command_classes": command_classes,
         "base_head": head,
         "plan_receipt_version": PLAN_RECEIPT_VERSION,
+        "plan_review_effort": effort,
         "created_ms": now_ms() as u64,
     });
     let body = serde_json::to_string_pretty(&v).unwrap_or_else(|_| "{}".to_string());
@@ -257,30 +275,36 @@ mod tests {
 
         // Exact HEAD + all bindings → returns the approved classes.
         assert_eq!(
-            receipt_authorizes(&good, &ph, HeadMatch::Exact, now),
+            receipt_authorizes(&good, &ph, HeadMatch::Exact, "xhigh", now),
             Some(vec!["remote-publish".to_string()])
         );
         // No usable HEAD relation → no resume.
-        assert_eq!(receipt_authorizes(&good, &ph, HeadMatch::No, now), None);
+        assert_eq!(
+            receipt_authorizes(&good, &ph, HeadMatch::No, "xhigh", now),
+            None
+        );
         // Ancestor + NON-empty classes → no resume (high-risk needs exact HEAD). KEY guard.
         assert_eq!(
-            receipt_authorizes(&good, &ph, HeadMatch::Ancestor, now),
+            receipt_authorizes(&good, &ph, HeadMatch::Ancestor, "xhigh", now),
             None
         );
         // Different plan → no resume.
         assert_eq!(
-            receipt_authorizes(&good, &plan_hash("other"), HeadMatch::Exact, now),
+            receipt_authorizes(&good, &plan_hash("other"), HeadMatch::Exact, "xhigh", now),
             None
         );
         // Stale policy version → no resume.
         let oldver = receipt(&ph, head, now as u64, PLAN_RECEIPT_VERSION + 1);
         assert_eq!(
-            receipt_authorizes(&oldver, &ph, HeadMatch::Exact, now),
+            receipt_authorizes(&oldver, &ph, HeadMatch::Exact, "xhigh", now),
             None
         );
         // A v2 receipt (the pre-v0.30 default) is stale after the v3 bump → no resume.
         let v2 = receipt(&ph, head, now as u64, 2);
-        assert_eq!(receipt_authorizes(&v2, &ph, HeadMatch::Exact, now), None);
+        assert_eq!(
+            receipt_authorizes(&v2, &ph, HeadMatch::Exact, "xhigh", now),
+            None
+        );
         // Expired (older than TTL) → no resume.
         let old = receipt(
             &ph,
@@ -288,16 +312,22 @@ mod tests {
             (now - RECEIPT_TTL_MS - 1) as u64,
             PLAN_RECEIPT_VERSION,
         );
-        assert_eq!(receipt_authorizes(&old, &ph, HeadMatch::Exact, now), None);
+        assert_eq!(
+            receipt_authorizes(&old, &ph, HeadMatch::Exact, "xhigh", now),
+            None
+        );
         // Future timestamp (clock skew / tamper) → no resume.
         let future = receipt(&ph, head, (now + 10_000) as u64, PLAN_RECEIPT_VERSION);
         assert_eq!(
-            receipt_authorizes(&future, &ph, HeadMatch::Exact, now),
+            receipt_authorizes(&future, &ph, HeadMatch::Exact, "xhigh", now),
             None
         );
         // Zero/absent timestamp → no resume.
         let zero = receipt(&ph, head, 0, PLAN_RECEIPT_VERSION);
-        assert_eq!(receipt_authorizes(&zero, &ph, HeadMatch::Exact, now), None);
+        assert_eq!(
+            receipt_authorizes(&zero, &ph, HeadMatch::Exact, "xhigh", now),
+            None
+        );
         // Within TTL (just under) → still authorized.
         let recent = receipt(
             &ph,
@@ -305,10 +335,10 @@ mod tests {
             (now - RECEIPT_TTL_MS + 1) as u64,
             PLAN_RECEIPT_VERSION,
         );
-        assert!(receipt_authorizes(&recent, &ph, HeadMatch::Exact, now).is_some());
+        assert!(receipt_authorizes(&recent, &ph, HeadMatch::Exact, "xhigh", now).is_some());
         // Empty/missing receipt object → no resume (fail-safe).
         assert_eq!(
-            receipt_authorizes(&json!({}), &ph, HeadMatch::Exact, now),
+            receipt_authorizes(&json!({}), &ph, HeadMatch::Exact, "xhigh", now),
             None
         );
 
@@ -328,12 +358,18 @@ mod tests {
             "plan_receipt_version": PLAN_RECEIPT_VERSION, "created_ms": now as u64,
         });
         assert_eq!(
-            receipt_authorizes(&no_field, &ph, HeadMatch::Exact, now),
+            receipt_authorizes(&no_field, &ph, HeadMatch::Exact, "xhigh", now),
             None
         );
         // Not an array → no resume.
         assert_eq!(
-            receipt_authorizes(&base(json!("remote-publish")), &ph, HeadMatch::Exact, now),
+            receipt_authorizes(
+                &base(json!("remote-publish")),
+                &ph,
+                HeadMatch::Exact,
+                "xhigh",
+                now
+            ),
             None
         );
         // Unknown class → no resume (never restore an unreviewed class).
@@ -342,23 +378,24 @@ mod tests {
                 &base(json!(["launch-missiles"])),
                 &ph,
                 HeadMatch::Exact,
+                "xhigh",
                 now
             ),
             None
         );
         // Non-string element → no resume.
         assert_eq!(
-            receipt_authorizes(&base(json!([123])), &ph, HeadMatch::Exact, now),
+            receipt_authorizes(&base(json!([123])), &ph, HeadMatch::Exact, "xhigh", now),
             None
         );
         // Empty array is VALID (a plan that needs no high-risk command) → authorized at
         // BOTH Exact and Ancestor (the empty-classes case is the lenient-resume path).
         assert_eq!(
-            receipt_authorizes(&base(json!([])), &ph, HeadMatch::Exact, now),
+            receipt_authorizes(&base(json!([])), &ph, HeadMatch::Exact, "xhigh", now),
             Some(vec![])
         );
         assert_eq!(
-            receipt_authorizes(&base(json!([])), &ph, HeadMatch::Ancestor, now),
+            receipt_authorizes(&base(json!([])), &ph, HeadMatch::Ancestor, "xhigh", now),
             Some(vec![])
         );
         // Duplicate known classes are deduped (Exact).
@@ -367,10 +404,62 @@ mod tests {
                 &base(json!(["db-migration", "db-migration"])),
                 &ph,
                 HeadMatch::Exact,
+                "xhigh",
                 now
             ),
             Some(vec!["db-migration".to_string()])
         );
+    }
+
+    #[test]
+    fn receipt_effort_binding() {
+        let now: u128 = 1_000_000_000_000;
+        let ph = plan_hash("p");
+        // Build a receipt with empty classes (so the effort gate is the only variable) and
+        // an optional plan_review_effort (json!(null) ⇒ field ABSENT = pre-#4 legacy).
+        let mk = |effort: Value| {
+            let mut r = receipt(&ph, "abc123", now as u64, PLAN_RECEIPT_VERSION);
+            r["command_classes"] = json!([]);
+            if !effort.is_null() {
+                r["plan_review_effort"] = effort;
+            }
+            r
+        };
+        // Minted "high", want "xhigh" → mismatch → no resume (a deeper review is wanted).
+        assert_eq!(
+            receipt_authorizes(&mk(json!("high")), &ph, HeadMatch::Exact, "xhigh", now),
+            None
+        );
+        // Minted "xhigh", want "high" → mismatch → no resume.
+        assert_eq!(
+            receipt_authorizes(&mk(json!("xhigh")), &ph, HeadMatch::Exact, "high", now),
+            None
+        );
+        // Minted "high", want "high" → match → resume.
+        assert_eq!(
+            receipt_authorizes(&mk(json!("high")), &ph, HeadMatch::Exact, "high", now),
+            Some(vec![])
+        );
+        // ABSENT field (pre-#4 receipt) → legacy xhigh: resumes ONLY when want == xhigh.
+        assert_eq!(
+            receipt_authorizes(&mk(json!(null)), &ph, HeadMatch::Exact, "xhigh", now),
+            Some(vec![])
+        );
+        assert_eq!(
+            receipt_authorizes(&mk(json!(null)), &ph, HeadMatch::Exact, "high", now),
+            None
+        );
+        // MALFORMED present value (non-string) → fail closed regardless of want.
+        for bad in [json!(7), json!(["x"]), json!({"a": 1}), json!(null)] {
+            let mut r = receipt(&ph, "abc123", now as u64, PLAN_RECEIPT_VERSION);
+            r["command_classes"] = json!([]);
+            r["plan_review_effort"] = bad;
+            assert_eq!(
+                receipt_authorizes(&r, &ph, HeadMatch::Exact, "xhigh", now),
+                None,
+                "malformed plan_review_effort must fail closed"
+            );
+        }
     }
 
     /// Minimal real git repo in a fresh temp dir (no receipt/home writes).

@@ -53,6 +53,17 @@ fn progress_phase(key: &TopicKey) -> String {
     }
 }
 
+/// v0.30 #4: the reasoning effort a review topic uses. ONLY the PLAN review may run at a
+/// configurable (default xhigh) effort; the Stop/code review (Gate) and Consult always use
+/// the full xhigh review effort, so code-review depth is never lowered. Pure → the routing
+/// is unit-testable without spawning Codex.
+fn effort_for_topic<'a>(key: &TopicKey, plan_effort: &'a str) -> &'a str {
+    match key {
+        TopicKey::PlanGate => plan_effort,
+        TopicKey::Gate | TopicKey::Consult(_) => crate::codex::REVIEW_REASONING_EFFORT,
+    }
+}
+
 /// Cap on simultaneously-tracked consult topics so a long session can't grow the
 /// registry without bound. (The gate slot is separate and never evicted here.)
 const MAX_CONSULT_TOPICS: usize = 32;
@@ -91,6 +102,12 @@ struct Server {
     /// model is constant per process. A model change applies on the next server start
     /// (restart-to-apply); `review_model_pending_restart` surfaces a pending change.
     pinned_model: crate::review_mcp::PinnedReviewModel,
+    /// v0.30 (#4): the plan-review reasoning effort pinned for THIS server's lifetime.
+    /// Read ONCE at startup so the PlanGate thread, the review, and the saved receipt all
+    /// agree on one effort; a change to `codex.plan_review_effort` applies on the next
+    /// server start (restart-to-apply, like the review model). Stop/code/consult always
+    /// use the xhigh review effort regardless.
+    plan_effort: String,
 }
 
 impl Server {
@@ -103,6 +120,7 @@ impl Server {
             gates: HashMap::new(),
             plan_epoch: None,
             pinned_model: crate::review_mcp::pinned_review_model(),
+            plan_effort: crate::review_mcp::plan_review_effort(),
         }
     }
 
@@ -220,13 +238,18 @@ impl Server {
             }
         }
         self.ensure_peer()?;
+        // v0.30 #4: the PLAN review uses the PINNED plan effort (constant per server, set
+        // at startup); Stop/code/consult always use the xhigh review effort. `.to_string()`
+        // releases the self borrow before the peer's &mut self block. Pinned ⇒ the PlanGate
+        // thread, the review, and the saved receipt all agree on one effort.
+        let effort = effort_for_topic(&key, &self.plan_effort).to_string();
         let (opened, elicit) = {
             let peer = self
                 .codex
                 .as_mut()
                 .ok_or_else(|| anyhow::anyhow!("codex peer unavailable"))?;
             peer.begin_progress(cwd, &phase);
-            let r = peer.open_thread(prompt, cwd, crate::codex::REVIEW_REASONING_EFFORT);
+            let r = peer.open_thread(prompt, cwd, &effort);
             let elicit = peer.last_elicitation_note(); // BEFORE end_progress drops the sink
             peer.end_progress(if r.is_ok() { "completed" } else { "error" });
             (r, elicit)
@@ -594,7 +617,8 @@ impl Server {
         // any change falls through to a full review (fail-safe). The gate still fired
         // for this task (start_epoch re-armed it on this prompt); we only skip the
         // redundant Codex round, restoring EXACTLY the previously-reviewed classes.
-        if let Some(classes) = crate::plan_receipt::matching_classes(&cwd, plan) {
+        if let Some(classes) = crate::plan_receipt::matching_classes(&cwd, plan, &self.plan_effort)
+        {
             if crate::plan_gate::record_resume(&cwd, &epoch, plan, &classes) {
                 return "<AI-BRIDGE-APPROVE/> Plan APPROVED from a saved receipt — an identical \
                      plan was Codex-approved for this repo at this HEAD within the last 24h, so no \
@@ -633,7 +657,7 @@ impl Server {
                         .into_iter()
                         .map(str::to_string)
                         .collect();
-                crate::plan_receipt::write(&cwd, plan, &approved_classes);
+                crate::plan_receipt::write(&cwd, plan, &approved_classes, &self.plan_effort);
                 format!(
                     "<AI-BRIDGE-APPROVE/> Codex APPROVED the plan — writes/Bash are now unlocked \
                      for this task. Proceed with execution.\n\n{findings}"
@@ -2371,6 +2395,22 @@ mod tests {
         assert!(
             !is_context_exhausted(text),
             "session-lost and context-exhausted must be disjoint predicates"
+        );
+    }
+
+    // ───── v0.30 (#4): plan-review effort routing ─────
+    #[test]
+    fn effort_for_topic_only_plan_is_configurable() {
+        // The PLAN review uses the configurable effort; Gate (Stop/code) and Consult
+        // always use the full xhigh review effort — code-review depth is never lowered.
+        assert_eq!(effort_for_topic(&TopicKey::PlanGate, "medium"), "medium");
+        assert_eq!(
+            effort_for_topic(&TopicKey::Gate, "medium"),
+            crate::codex::REVIEW_REASONING_EFFORT
+        );
+        assert_eq!(
+            effort_for_topic(&TopicKey::Consult("x".into()), "low"),
+            crate::codex::REVIEW_REASONING_EFFORT
         );
     }
 
