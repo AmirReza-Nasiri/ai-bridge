@@ -6,6 +6,36 @@ versioning is semver.
 
 ## [Unreleased]
 
+## [0.30.0] - 2026-05-29
+
+Gate workflow hardening + speed: the review frontier no longer drops committed-but-
+unreviewed work, an unchanged plan resumes instantly after your own commits, and the
+plan-review effort is tunable. All changes since v0.29.0 (3 commits).
+
+### Fixed
+- **Frontier 'open'-advance coverage gap (#1).** `on_task_start` used to baseline the
+  review frontier to HEAD whenever the prior task wasn't blocked — including the `open`
+  state. If a task committed code and a new prompt arrived before any Stop review (a
+  mid-turn interrupt / reload / stop continuation), those commits were baselined past and
+  never reviewed. Now `open` advances only when there is no committed-but-unreviewed work
+  since the prior base (an ambiguous/gone base fails safe to "carry, don't drop"); the
+  prior status is read normalized so a missing `status` is treated as `open`.
+
+### Added / Changed
+- **Plan-receipt lenient-ancestor resume (#3).** A re-filed, byte-identical plan used to
+  miss the receipt fast-path once HEAD moved (after your own commits) and trigger a full
+  xhigh re-review. Now a base that is an **ancestor** of HEAD may resume too — guarded:
+  ancestor-resume only when **no** high-risk command classes were authorized (a
+  publish/migrate/destructive plan still needs the exact HEAD); `head_match` requires a
+  **full** OID before any git lookup (rejects abbreviated/garbage); gone/non-ancestor/git
+  errors fail closed. `PLAN_RECEIPT_VERSION` → 3 (a one-time fresh review on upgrade).
+- **Configurable plan-review effort (#4).** The plan review is prose; you can now run it at
+  a lower reasoning effort via `review-mcp.json` `codex.plan_review_effort` while the
+  Stop/code review stays `xhigh` (code-review depth is never lowered). The effort is pinned
+  per MCP-server lifetime (applies on the next server start), and the plan receipt is bound
+  to the effort it was minted under (a change forces a fresh review). `doctor` reports both
+  the code and plan efforts + the restart note. Default is unchanged (`xhigh`).
+
 ## [0.29.0] - 2026-05-29
 
 Pick the Codex model AI Bridge reviews with — from the TUI or the CLI — plus gate
