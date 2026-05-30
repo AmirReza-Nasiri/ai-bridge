@@ -611,7 +611,7 @@ impl Server {
         // If this epoch is already approved but the plan materially changed, revoke
         // up front so writes re-block while the new plan is under review (the
         // minutes-long Codex call must not run with stale approval still open).
-        crate::plan_gate::begin_review(&cwd, plan);
+        let consumed_turn = crate::plan_gate::begin_review(&cwd, plan);
         // RELOAD-RESUME fast-path: if a saved receipt shows this EXACT plan was
         // Codex-approved for this repo at the CURRENT HEAD within TTL, re-approve
         // instantly — no minutes-long re-review. Bound to plan+repo+HEAD+policy, so
@@ -619,16 +619,24 @@ impl Server {
         // for this task (start_epoch re-armed it on this prompt); we only skip the
         // redundant Codex round, restoring EXACTLY the previously-reviewed grants
         // (class+shape) — never widening a grant a resume didn't record.
-        if let Some(grants) = crate::plan_receipt::matching_classes(&cwd, plan, &self.plan_effort)
-        {
-            if crate::plan_gate::record_resume(&cwd, &epoch, plan, &grants) {
-                return "<AI-BRIDGE-APPROVE/> Plan APPROVED from a saved receipt — an identical \
-                     plan was Codex-approved for this repo at this HEAD within the last 24h, so no \
-                     fresh review was run (reload-resume). Writes/Bash are unlocked for this task. \
-                     If you changed the plan, edit it and call plan_gate again for a full review."
-                    .to_string();
+        //
+        // v0.31 P1: but NOT when a NON-trivial user turn was pending at review start —
+        // `begin_review` consumed it, and the receipt fast-path runs NO fresh review, so
+        // resuming would unlock writes for a turn that was never reviewed. Force a full
+        // review in that case (a trivial continuation or no marker still fast-paths).
+        if !matches!(consumed_turn, crate::plan_gate::ConsumedTurn::NonTrivial) {
+            if let Some(grants) =
+                crate::plan_receipt::matching_classes(&cwd, plan, &self.plan_effort)
+            {
+                if crate::plan_gate::record_resume(&cwd, &epoch, plan, &grants) {
+                    return "<AI-BRIDGE-APPROVE/> Plan APPROVED from a saved receipt — an identical \
+                         plan was Codex-approved for this repo at this HEAD within the last 24h, so no \
+                         fresh review was run (reload-resume). Writes/Bash are unlocked for this task. \
+                         If you changed the plan, edit it and call plan_gate again for a full review."
+                        .to_string();
+                }
+                // record_resume refused (task changed / unwritable state) → full review.
             }
-            // record_resume refused (task changed / unwritable state) → full review.
         }
         // New task epoch → drop the prior plan dialogue so it can't anchor.
         if self.plan_epoch.as_deref() != Some(epoch.as_str()) {

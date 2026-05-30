@@ -1325,17 +1325,46 @@ pub fn revoke(cwd: &str, reason: &str) {
 ///      superseded review's late APPROVE can't take effect.
 ///
 /// Re-submitting the SAME approved plan keeps approval (marker hash == approved).
-pub fn begin_review(cwd: &str, plan: &str) {
+/// What a pending user-turn marker was when [`begin_review`] consumed it. The caller uses
+/// this to gate the receipt fast-path: a NON-trivial pending turn at review start was NOT
+/// reviewed, so the fast-path (which runs no fresh review) must be skipped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsumedTurn {
+    /// No pending marker at review start.
+    None,
+    /// A trivial continuation (safe to fast-path / resume).
+    Trivial,
+    /// An unknown-delta or malformed marker — a turn that must get a FULL review.
+    NonTrivial,
+}
+
+pub fn begin_review(cwd: &str, plan: &str) -> ConsumedTurn {
     if !is_enabled(cwd) {
-        return;
+        return ConsumedTurn::None;
     }
     write_pending(cwd, &current_epoch(cwd), hash_str(plan));
     // v0.31 P1: submitting a plan for review IS the agent's response to the current user
-    // turn, so consume any pending user-turn marker here ("at review start"). A marker that
-    // re-appears AFTER this (a new prompt during the minutes-long review) is then detectable
-    // by `record`, which refuses to approve an unreviewed turn. No-op in default reset mode
-    // (no marker is ever written) and harmless when none exists.
+    // turn, so consume any pending user-turn marker here ("at review start") and REPORT what
+    // it was. A marker that re-appears AFTER this (a new prompt during the minutes-long review)
+    // is detected by `record`, which refuses to approve an unreviewed turn; and a NON-trivial
+    // marker consumed here tells the caller to SKIP the receipt fast-path (it runs no review).
+    // No-op in default reset mode (no marker is ever written).
+    let consumed = match read_state(cwd)
+        .and_then(|s| s.get("pending_user_turn").filter(|v| !v.is_null()).cloned())
+    {
+        None => ConsumedTurn::None,
+        Some(v) => {
+            if v.get("classification").and_then(Value::as_str)
+                == Some(TurnClass::TrivialContinue.as_marker())
+            {
+                ConsumedTurn::Trivial
+            } else {
+                ConsumedTurn::NonTrivial // unknown_delta / malformed → fail closed
+            }
+        }
+    };
     clear_pending_user_turn(cwd);
+    consumed
 }
 
 /// A post-approval risk delta the approved plan did not cover (v0.31 P3). Either a
@@ -2833,6 +2862,22 @@ mod tests {
             "an unreviewed mid-review turn must refuse approve"
         );
         assert!(!is_approved(&cwd));
+    }
+
+    #[test]
+    fn begin_review_reports_the_consumed_marker_class() {
+        // The receipt fast-path in mcp.rs relies on this report to SKIP a resume when a
+        // non-trivial turn was pending at review start (else the resume runs no review).
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "task");
+        approve(&cwd, "plan");
+        assert!(matches!(begin_review(&cwd, "plan"), ConsumedTurn::None));
+        set_pending_user_turn(&cwd, TurnClass::TrivialContinue);
+        assert!(matches!(begin_review(&cwd, "plan"), ConsumedTurn::Trivial));
+        set_pending_user_turn(&cwd, TurnClass::UnknownDelta);
+        assert!(matches!(begin_review(&cwd, "plan"), ConsumedTurn::NonTrivial));
+        assert!(!has_pending_user_turn(&cwd), "begin_review consumed the marker");
     }
 
     #[test]
