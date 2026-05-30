@@ -409,12 +409,39 @@ fn set_pending_user_turn(cwd: &str, class: TurnClass) -> bool {
     let Some(mut s) = read_state(cwd) else {
         return false;
     };
+    // MONOTONIC (Codex-flagged fail-open fix): a later prompt must NEVER DOWNGRADE an
+    // existing unconsumed marker. Otherwise a scope-delta turn ("also update the API")
+    // could be erased by a following trivial "ok" before any PreToolUse reconciled it, and
+    // the next write would run under the stale approval. If an existing marker is at least
+    // as severe as the new class, keep it untouched (fail closed); only escalate/initialize.
+    let new_sev = marker_severity(class.as_marker());
+    if let Some(ev) = s.get("pending_user_turn").filter(|v| !v.is_null()) {
+        let existing_sev = ev
+            .get("classification")
+            .and_then(Value::as_str)
+            .map(marker_severity)
+            .unwrap_or(u8::MAX); // present-but-malformed → maximally severe → never downgraded
+        if existing_sev >= new_sev {
+            return true; // keep the existing (>= severity) marker
+        }
+    }
     set_field(
         &mut s,
         "pending_user_turn",
         json!({ "classification": class.as_marker() }),
     );
     write_state(cwd, &s).is_ok()
+}
+
+/// Severity rank of a pending-user-turn classification, for the monotonic no-downgrade
+/// rule in [`set_pending_user_turn`]. Higher = more likely to re-gate; an unknown/malformed
+/// marker string ranks highest so it can never be lowered.
+fn marker_severity(classification: &str) -> u8 {
+    match classification {
+        "trivial_continue" => 0,
+        "unknown_delta" => 1,
+        _ => u8::MAX, // explicit_reset / malformed / unrecognized → fail closed (never downgrade)
+    }
 }
 
 /// Whether an UNCONSUMED pending user-turn marker is present (any non-null value, incl.
@@ -2698,6 +2725,37 @@ mod tests {
         assert!(reconcile_pending_user_turn(&cwd).is_none());
         assert!(is_approved(&cwd));
         assert!(!blocks_writes(&cwd));
+    }
+
+    #[test]
+    fn a_trivial_prompt_cannot_downgrade_a_pending_scope_delta() {
+        // Codex-flagged fail-open: a scope-delta marker followed by a trivial "ok" before any
+        // reconcile must NOT be erased — the next write must still re-gate.
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "task");
+        approve(&cwd, "plan");
+        set_pending_user_turn(&cwd, TurnClass::UnknownDelta); // "also update the API"
+        assert!(set_pending_user_turn(&cwd, TurnClass::TrivialContinue)); // a following "ok"
+        // The marker stays non-trivial → the write re-gates with user_scope_delta.
+        let deny = enforce(&cwd, "Write").expect("downgraded marker must still re-gate");
+        assert!(deny.contains("user_scope_delta"), "{deny}");
+        assert!(!is_approved(&cwd));
+    }
+
+    #[test]
+    fn a_scope_delta_escalates_a_prior_trivial_marker() {
+        // The reverse direction DOES update: a trivial marker followed by a scope delta must
+        // escalate so the write re-gates (monotonic upward).
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "task");
+        approve(&cwd, "plan");
+        set_pending_user_turn(&cwd, TurnClass::TrivialContinue);
+        set_pending_user_turn(&cwd, TurnClass::UnknownDelta);
+        let deny = enforce(&cwd, "Write").expect("escalated marker must re-gate");
+        assert!(deny.contains("user_scope_delta"), "{deny}");
+        assert!(!is_approved(&cwd));
     }
 
     #[test]
