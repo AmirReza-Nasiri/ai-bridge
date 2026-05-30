@@ -655,10 +655,18 @@ mod tests {
         let repo = TempDir::new();
         // an in-root file whose name is not valid UTF-8
         let bad_path = repo.0.join(std::ffi::OsStr::from_bytes(b"bad\xFFname"));
-        std::fs::write(&bad_path, b"x").unwrap();
+        // SELF-SKIP on a filesystem that ENFORCES UTF-8 names (macOS/APFS, some others): the
+        // non-UTF-8 setup is impossible there, so this case is unreachable and not a failure.
+        // The assertion stays meaningful on filesystems that allow non-UTF-8 names (e.g. Linux
+        // ext4), where `canonicalize_under_root` must fail CLOSED rather than lossily map to `�`.
+        if std::fs::write(&bad_path, b"x").is_err() {
+            return;
+        }
         // a UTF-8-named symlink pointing at it (so raw_target is a valid &str)
         let link = repo.join("link");
-        std::os::unix::fs::symlink(&bad_path, &link).unwrap();
+        if std::os::unix::fs::symlink(&bad_path, &link).is_err() {
+            return;
+        }
         assert_eq!(
             canonicalize_under_root(&repo.root(), &link.to_string_lossy()),
             Err(ScopeReject::NonCanonicalizable)
