@@ -693,7 +693,36 @@ impl Server {
         };
         let verdict = gate::parse_verdict(&review);
         let findings = gate::findings(&review);
-        match crate::plan_gate::record(&cwd, &epoch, plan, &verdict, &findings) {
+        let outcome = crate::plan_gate::record(&cwd, &epoch, plan, &verdict, &findings);
+        // v0.32 Phase 2: outcome telemetry (shadow, log-only) — pairs the router recommendation
+        // (same epoch) with the plan-review verdict so the recommendation can be evaluated later.
+        if crate::review_mcp::router_shadow() {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            plan.hash(&mut h);
+            let ph = format!("{:x}", h.finish());
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            let _ = crate::router::log_event(
+                &cwd,
+                ts,
+                "plan_gate_outcome",
+                &epoch,
+                Some(&ph),
+                serde_json::json!({
+                    "verdict": match verdict {
+                        gate::Verdict::Approve => "approve",
+                        gate::Verdict::RequestChanges => "request_changes",
+                        gate::Verdict::Blocked => "blocked",
+                        gate::Verdict::Unparseable => "unparseable",
+                    },
+                    "approved": matches!(outcome, crate::plan_gate::Outcome::Approved),
+                }),
+            );
+        }
+        match outcome {
             crate::plan_gate::Outcome::Approved => {
                 // Save a receipt from the SAME risk GRANTS the reviewer just authorized
                 // (class+shape) — parsed directly from THIS review's findings (the exact
@@ -851,6 +880,27 @@ impl Server {
                 cwd,
                 "review-model change is configured but NOT active — restart Claude Code \
                  to apply it; reviews currently run on the active (pinned) model",
+            );
+        }
+        // v0.32 Phase 2: stop-outcome telemetry (shadow, log-only) — keyed by the current epoch
+        // so it joins the router recommendation for THIS task. The real validation signal: did
+        // the Stop review allow/block, and how big was the bundle. Never alters the hook JSON.
+        if crate::review_mcp::router_shadow() {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            let _ = crate::router::log_event(
+                cwd,
+                ts,
+                "stop_outcome",
+                &crate::plan_gate::current_epoch(cwd),
+                None,
+                serde_json::json!({
+                    "decision": if decision == "{}" { "allow" } else { "block" },
+                    "frontier_status": status,
+                    "diff_bytes": bundle.text.len(),
+                }),
             );
         }
         decision

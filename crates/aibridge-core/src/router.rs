@@ -257,15 +257,58 @@ pub fn repo_files(cwd: &str) -> Vec<String> {
     }
 }
 
-/// The shadow telemetry log path (`<repo>/.ai-bridge/router.jsonl`), or `None` outside a repo.
+/// The shadow telemetry log path (`<dir>/.ai-bridge/router.jsonl`). Walks up for an EXISTING
+/// `.ai-bridge` dir using ONLY the filesystem — no `git` shell-out — so it is safe to call on
+/// the Stop hook's critical path (Codex review). `None` when no `.ai-bridge` ancestor exists
+/// (so it never creates `.ai-bridge/` in a repo that isn't using the gate).
 fn router_log_path(cwd: &str) -> Option<PathBuf> {
-    let root = crate::git::repo_root(cwd)?;
-    Some(Path::new(&root).join(".ai-bridge").join("router.jsonl"))
+    let mut p: &Path = Path::new(cwd);
+    loop {
+        let candidate = p.join(".ai-bridge");
+        if candidate.is_dir() {
+            return Some(candidate.join("router.jsonl"));
+        }
+        p = p.parent()?;
+    }
 }
 
-/// Best-effort: append a `router_recommendation` telemetry event. NEVER blocks / NEVER errors
-/// to the caller (returns false on any failure). Caller only invokes this when shadow mode is
-/// enabled; it makes no gating decision and reads no router state.
+/// Reserved top-level keys the telemetry join relies on — caller `fields` may not overwrite them.
+const RESERVED_EVENT_KEYS: &[&str] = &["event", "schema_version", "ts_ms", "epoch", "plan_hash"];
+
+/// Best-effort: append a generic telemetry event to the shadow log. Keyed by `epoch` (+ an
+/// optional `plan_hash`) so the recommendation and the later outcomes (plan_gate_outcome /
+/// stop_outcome) join on the same task. `fields` (if an object) is merged in. NEVER blocks /
+/// NEVER errors to the caller (returns false on any failure). Caller invokes only in shadow mode.
+pub fn log_event(
+    cwd: &str,
+    ts_ms: u128,
+    event: &str,
+    epoch: &str,
+    plan_hash: Option<&str>,
+    fields: Value,
+) -> bool {
+    let Some(path) = router_log_path(cwd) else {
+        return false;
+    };
+    let mut obj = json!({
+        "event": event,
+        "schema_version": 1,
+        "ts_ms": ts_ms as u64,
+        "epoch": epoch,
+        "plan_hash": plan_hash,
+    });
+    if let (Some(o), Some(extra)) = (obj.as_object_mut(), fields.as_object()) {
+        for (k, v) in extra {
+            // Never let caller fields clobber the reserved join keys (epoch/plan_hash/...).
+            if !RESERVED_EVENT_KEYS.contains(&k.as_str()) {
+                o.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    append_jsonl(&path, &obj.to_string())
+}
+
+/// Best-effort: append a `router_recommendation` telemetry event (thin wrapper over [`log_event`]).
 pub fn log_recommendation(
     cwd: &str,
     ts_ms: u128,
@@ -275,20 +318,14 @@ pub fn log_recommendation(
     head_oid: Option<&str>,
     rec: &RouterRecommendation,
 ) -> bool {
-    let Some(path) = router_log_path(cwd) else {
-        return false;
-    };
-    let event = json!({
-        "event": "router_recommendation",
-        "schema_version": 1,
-        "ts_ms": ts_ms as u64,
-        "epoch": epoch,
-        "session": session,
-        "plan_hash": plan_hash,
-        "head_oid": head_oid,
-        "recommendation": rec.to_value(),
-    });
-    append_jsonl(&path, &event.to_string())
+    log_event(
+        cwd,
+        ts_ms,
+        "router_recommendation",
+        epoch,
+        Some(plan_hash),
+        json!({ "session": session, "head_oid": head_oid, "recommendation": rec.to_value() }),
+    )
 }
 
 #[cfg(test)]
@@ -412,10 +449,34 @@ mod tests {
     }
 
     #[test]
-    fn log_recommendation_outside_a_repo_is_a_noop() {
-        // No git repo ancestor → repo_root None → log returns false, nothing written.
+    fn log_recommendation_with_no_aibridge_ancestor_is_a_noop() {
+        // No `.ai-bridge` ancestor → router_log_path None → log returns false, nothing written
+        // (and crucially never CREATES `.ai-bridge/` in a repo that isn't using the gate).
         let r = analyze("x", &[], 4);
         let fake = "/nonexistent-aibridge-router-xyzzy/sub/dir";
         assert!(!log_recommendation(fake, 1, "epoch", None, "hash", None, &r));
+    }
+
+    #[test]
+    fn log_event_protects_reserved_keys_and_merges_extra() {
+        // A temp dir containing `.ai-bridge/` (no git repo needed — router_log_path is fs-walk).
+        let dir = std::env::temp_dir().join(format!("aibridge-router-ev-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(dir.join(".ai-bridge"));
+        // `fields` tries to clobber the reserved `epoch` AND adds a legit `custom` key.
+        assert!(log_event(
+            dir.to_str().unwrap(),
+            7,
+            "plan_gate_outcome",
+            "REAL-EPOCH",
+            Some("REAL-HASH"),
+            json!({ "epoch": "HACKED", "custom": 42 }),
+        ));
+        let body = std::fs::read_to_string(dir.join(".ai-bridge").join("router.jsonl")).unwrap();
+        let v: Value = serde_json::from_str(body.lines().next_back().unwrap()).unwrap();
+        assert_eq!(v["epoch"], "REAL-EPOCH", "reserved key must NOT be clobbered");
+        assert_eq!(v["plan_hash"], "REAL-HASH");
+        assert_eq!(v["event"], "plan_gate_outcome");
+        assert_eq!(v["custom"], 42, "non-reserved field merges through");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
