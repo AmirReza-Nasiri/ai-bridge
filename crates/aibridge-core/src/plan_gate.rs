@@ -417,10 +417,43 @@ pub fn is_gated_tool(tool_name: &str) -> bool {
         || GATED_WRITE_TOOLS.contains(&tool_name)
 }
 
-/// PreToolUse enforcement: `Some(deny_json)` to block a write before approval,
-/// `None` to let the caller proceed (incl. its own rtk handling for Bash).
+/// PreToolUse enforcement (legacy 2-arg surface): `Some(deny_json)` to block a write
+/// before approval, `None` to let the caller proceed. Thin wrapper over [`enforce_tool`]
+/// with an EMPTY command — so the Bash path can never satisfy the (deferred) read-only
+/// carve-out, keeping every existing 2-arg caller byte-identical to pre-P2 behavior.
 pub fn enforce(cwd: &str, tool_name: &str) -> Option<String> {
+    enforce_tool(cwd, tool_name, "")
+}
+
+/// v0.31 (P2): whether the read-only orientation carve-out may EXECUTE a Bash command
+/// pre-approval. Returns `false` in P2 — the carve-out additionally requires a hardened
+/// execution layer (trusted-exe resolution, clean env, no shell startup/functions/aliases,
+/// argv execution) that does NOT yet exist; a parser-only proof can't prove read-only
+/// EXECUTION (shell functions/aliases/builtins, PATH-hijack, `BASH_ENV`). Flipped to a
+/// real capability check when that layer lands. Keeping it const-false makes the read-only
+/// branch in [`enforce_tool`] INERT, so the gate's behavior is unchanged in P2.
+fn read_only_execution_supported() -> bool {
+    false
+}
+
+/// PreToolUse enforcement with the Bash command threaded in: `Some(deny_json)` to block
+/// a write/Bash before approval, `None` to let the caller proceed (incl. its own rtk
+/// handling for Bash). The command is only consulted on the Bash read-only-orientation
+/// path; for every other tool (and an empty command) the decision is exactly as before.
+pub fn enforce_tool(cwd: &str, tool_name: &str, command: &str) -> Option<String> {
     if !is_gated_tool(tool_name) || !blocks_writes(cwd) {
+        return None;
+    }
+    // v0.31 (P2) read-only orientation carve-out (DEFAULT OFF; currently INERT). When the
+    // flag is ON *and* a hardened execution layer exists, a Bash command PROVEN read-only
+    // could run with no approved plan. In P2 `read_only_execution_supported()` is const-false,
+    // so this branch never allows — behavior is byte-identical to the strict default. The
+    // command is threaded now so the follow-up only flips the capability + adds the proof.
+    if tool_name == "Bash"
+        && read_only_execution_supported()
+        && crate::review_mcp::read_only_orientation()
+        && read_only_proven(cwd, command)
+    {
         return None;
     }
     // Count repeated denied writes so the operator can see a wrong-loop (Claude
@@ -432,25 +465,120 @@ pub fn enforce(cwd: &str, tool_name: &str) -> Option<String> {
         }
         let _ = write_state(cwd, &s);
     }
-    Some(deny_json())
+    // Pre-approval block. A flag-ON Bash command the read-only carve-out could not prove
+    // safe denies with the dedicated parser reason code; everything else is the default
+    // no-active-approval block. (Both are inert-equivalent in P2 because the carve-out is
+    // disabled, but the code selection is wired for the follow-up.)
+    let reason = if tool_name == "Bash"
+        && read_only_execution_supported()
+        && crate::review_mcp::read_only_orientation()
+    {
+        BlockReason::ReadOnlyParserDenial
+    } else {
+        BlockReason::NoActiveApproval
+    };
+    Some(deny_json(reason))
 }
 
-/// The operational deny — tells Claude exactly what to do (call the tool, do NOT
-/// retry the blocked edit), so it advances the dialogue instead of looping.
-fn deny_json() -> String {
-    let reason = "PLAN_GATE_REQUIRED: this task has no Codex-approved plan yet. \
-        Do NOT retry this tool. First gather context with Read/Grep/Glob, form a todolist, \
-        then call the MCP tool `mcp__aibridge__plan_gate` with a structured plan \
-        (todos, approach, intended_files, risk_surfaces, test_plan). Revise and call it \
-        again until it returns <AI-BRIDGE-APPROVE/>; only then will writes/Bash be allowed. \
-        If `mcp__aibridge__plan_gate` is NOT available, AI Bridge was just installed/updated — \
-        the tool connects only after a Claude Code restart: restart Claude Code, or relaunch it \
-        with AIBRIDGE_PLAN_GATE=0 set to bypass the gate for this session.";
+/// v0.31 (P2): whether a Bash `command` is PROVEN read-only (and path-confined to `cwd`).
+/// DEFERRED — the sound implementation needs the hardened execution layer
+/// ([`read_only_execution_supported`]); until then this always returns `false` so the
+/// carve-out never allows. Threaded through [`enforce_tool`] so only this function + the
+/// capability flag change when the parser/exec layer lands.
+fn read_only_proven(_cwd: &str, _command: &str) -> bool {
+    false
+}
+
+/// Machine-readable block reason codes for the `PLAN_GATE_REQUIRED:` family (v0.31
+/// P6). Emitted as the first token after the tag — `PLAN_GATE_REQUIRED: <code> — …`
+/// — so an operator or wrapping tool can branch on the CAUSE without parsing prose;
+/// the human recovery hint still follows. Adding a code is OBSERVABILITY ONLY: it
+/// does not change WHEN the gate blocks. The risk-delta and receipt-mismatch families
+/// carry their own tags (`PLAN_RISK_DELTA_REQUIRED:` / `PLAN_RECEIPT_MISMATCH:`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockReason {
+    /// No Codex-approved plan for the current task epoch (the default pre-approval block).
+    NoActiveApproval,
+    /// A previously-valid approval expired (TTL / session / receipt). Wired by P1/receipt.
+    ApprovalExpired,
+    /// The user's latest message changed scope/objective beyond the approved plan. Wired by P1.
+    UserScopeDelta,
+    /// HEAD moved to a commit the approval cannot reconcile against. Wired by P1/P4.
+    HeadMoved,
+    /// The working tree changed outside the approved frontier. Wired by P1.
+    WorkingTreeDelta,
+    /// A read-only-orientation command the parser could not prove safe. Wired by P2.
+    ReadOnlyParserDenial,
+}
+
+impl BlockReason {
+    /// The stable snake_case token emitted right after the `PLAN_GATE_REQUIRED:` tag.
+    pub fn code(self) -> &'static str {
+        match self {
+            BlockReason::NoActiveApproval => "no_active_approval",
+            BlockReason::ApprovalExpired => "approval_expired",
+            BlockReason::UserScopeDelta => "user_scope_delta",
+            BlockReason::HeadMoved => "head_moved",
+            BlockReason::WorkingTreeDelta => "working_tree_delta",
+            BlockReason::ReadOnlyParserDenial => "read_only_parser_denial",
+        }
+    }
+
+    /// A short human recovery hint appended after the code.
+    fn recovery_hint(self) -> &'static str {
+        match self {
+            BlockReason::NoActiveApproval => {
+                "this task has no Codex-approved plan yet. Do NOT retry this tool. First gather \
+                 context with Read/Grep/Glob, form a todolist, then call the MCP tool \
+                 `mcp__aibridge__plan_gate` with a structured plan (todos, approach, \
+                 intended_files, risk_surfaces, test_plan). Revise and call it again until it \
+                 returns <AI-BRIDGE-APPROVE/>; only then will writes/Bash be allowed. If \
+                 `mcp__aibridge__plan_gate` is NOT available, AI Bridge was just installed/updated \
+                 — the tool connects only after a Claude Code restart: restart Claude Code, or \
+                 relaunch it with AIBRIDGE_PLAN_GATE=0 set to bypass the gate for this session."
+            }
+            BlockReason::ApprovalExpired => {
+                "the prior approval expired — re-file the plan with `mcp__aibridge__plan_gate` to \
+                 refresh it before writing."
+            }
+            BlockReason::UserScopeDelta => {
+                "your latest message changed the task's scope beyond the approved plan — re-file \
+                 the updated plan with `mcp__aibridge__plan_gate` before writing."
+            }
+            BlockReason::HeadMoved => {
+                "the commit HEAD moved in a way the approval cannot reconcile — re-file the plan \
+                 with `mcp__aibridge__plan_gate` before writing."
+            }
+            BlockReason::WorkingTreeDelta => {
+                "the working tree changed outside the approved frontier — re-file the plan with \
+                 `mcp__aibridge__plan_gate` before writing."
+            }
+            BlockReason::ReadOnlyParserDenial => {
+                "this command could not be proven read-only — run an approved plan via \
+                 `mcp__aibridge__plan_gate`, or use Read/Grep/Glob for discovery."
+            }
+        }
+    }
+}
+
+/// The `PLAN_GATE_REQUIRED:` deny prose for a given reason (code + recovery hint).
+fn block_message(reason: BlockReason) -> String {
+    format!(
+        "PLAN_GATE_REQUIRED: {} — {}",
+        reason.code(),
+        reason.recovery_hint()
+    )
+}
+
+/// The operational deny — names the machine-readable reason code AND tells Claude
+/// exactly what to do (call the tool, do NOT retry the blocked edit), so it advances
+/// the dialogue instead of looping.
+fn deny_json(reason: BlockReason) -> String {
     json!({
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
             "permissionDecision": "deny",
-            "permissionDecisionReason": reason
+            "permissionDecisionReason": block_message(reason)
         }
     })
     .to_string()
@@ -518,17 +646,119 @@ fn is_pipe_to_shell(lowered: &str) -> bool {
     })
 }
 
-/// Scan free text (a command OR a plan) for ALL high-risk command CLASSES present.
-/// Token-based (not raw substring) so `warm -reset`/`git pushd`/a path containing a
-/// risk phrase don't false-trigger, and `git.exe push`/`/bin/rm -rf` aren't missed.
-/// Shell separators are flattened so each sub-command's program is matched on its
-/// own; surrounding quotes/backticks/punctuation are trimmed so prose like
-/// "run `git push`" classifies too. False positives only cost one extra plan round.
-fn scan_risk_classes(text: &str) -> Vec<&'static str> {
+/// The two SHAPES a high-risk command can take within its class (v0.31 P3). A grant of
+/// the bare class authorizes only `Standard`; a WIDENED variant (e.g. a force/mirror/
+/// tags/delete push) is more destructive within the SAME class and must be granted
+/// explicitly (`class:widened`). For v1 P3, shape detection is scoped to the
+/// `remote-publish` push family — every OTHER class is always `Standard` (so this
+/// tightening adds no new false-deny surface to the existing families).
+pub const SHAPE_STANDARD: &str = "standard";
+pub const SHAPE_WIDENED: &str = "widened";
+
+/// A reviewer-authorized risk grant: a class plus the SHAPE within that class it
+/// authorizes. JSON-serializable (via [`RiskGrant::to_value`] / [`RiskGrant::from_value`])
+/// so it round-trips through state + receipts without pulling in serde-derive (the crate
+/// only depends on `serde_json`); P4 will canonicalize fingerprints over this. A
+/// `widened` grant covers both shapes; a `standard` grant covers ONLY `standard`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RiskGrant {
+    pub class: String,
+    pub shape: String,
+}
+
+impl RiskGrant {
+    fn standard(class: &str) -> Self {
+        RiskGrant {
+            class: class.to_string(),
+            shape: SHAPE_STANDARD.to_string(),
+        }
+    }
+
+    /// Serialize to a `{ "class": .., "shape": .. }` JSON object.
+    pub fn to_value(&self) -> Value {
+        json!({ "class": self.class, "shape": self.shape })
+    }
+
+    /// Parse from a JSON object, accepting ONLY a known class + known shape (so a
+    /// malformed/forged entry yields `None` and the caller fails safe). Both fields
+    /// required and string-typed.
+    pub fn from_value(v: &Value) -> Option<Self> {
+        let class = v.get("class").and_then(Value::as_str)?;
+        let shape = v.get("shape").and_then(Value::as_str)?;
+        if !RISK_CLASSES.contains(&class) {
+            return None;
+        }
+        if shape != SHAPE_STANDARD && shape != SHAPE_WIDENED {
+            return None;
+        }
+        Some(RiskGrant {
+            class: class.to_string(),
+            shape: shape.to_string(),
+        })
+    }
+
+    /// Serialize a slice of grants to a JSON array.
+    pub fn vec_to_value(grants: &[RiskGrant]) -> Value {
+        Value::Array(grants.iter().map(RiskGrant::to_value).collect())
+    }
+    /// Does this grant cover a command of `(class, shape)`? Same class AND the grant's
+    /// shape covers the command's shape (a `widened` grant covers standard+widened; a
+    /// `standard` grant covers ONLY standard).
+    fn covers(&self, class: &str, shape: &str) -> bool {
+        self.class == class && (self.shape == SHAPE_WIDENED || self.shape == shape)
+    }
+}
+
+/// True when this `git push` token set is a WIDENED push (more destructive than a
+/// plain publish): force/delete/mirror/all/prune/tag-publication forms. Detection is
+/// token-based on the already-flattened tokens. Clustered short flags (`-uf`, `-fu`)
+/// are handled by inspecting any single-dash (non-`--`) token's letters for `f`/`d`.
+fn push_is_widened(tokens: &[&str]) -> bool {
+    // A clustered short flag like `-f`/`-uf`/`-fu`/`-d` containing `letter`; excludes `--long`.
+    let short_flag_has = |letter: char| {
+        tokens
+            .iter()
+            .any(|t| t.starts_with('-') && !t.starts_with("--") && t[1..].contains(letter))
+    };
+    tokens.iter().any(|t| {
+        matches!(
+            *t,
+            "--force"
+                | "--force-if-includes"
+                | "--mirror"
+                | "--all"
+                | "--prune"
+                | "--delete"
+                | "--tags"
+                | "--follow-tags"
+        ) || t.starts_with("--force-with-lease") // bare or `=<ref>`
+            || t.starts_with('+') // leading-+ (force-update) refspec, e.g. `+main`/`+src:dst`
+            || t.starts_with(':') // delete refspec, e.g. `:stale`
+            || t.starts_with("refs/tags/") // explicit tag refspec
+    }) || short_flag_has('f')
+        || short_flag_has('d')
+        // explicit `tag <name>` push form (`git push origin tag v1.2.3`)
+        || tokens.windows(2).any(|w| w[0] == "tag" && !w[1].is_empty())
+}
+
+/// Scan free text (a command OR a plan) for ALL high-risk command grants present, each
+/// as a `(class, shape)` [`RiskGrant`]. Token-based (not raw substring) so `warm -reset`/
+/// `git pushd`/a path containing a risk phrase don't false-trigger, and `git.exe push`/
+/// `/bin/rm -rf` aren't missed. Shell separators are flattened so each sub-command's
+/// program is matched on its own; surrounding quotes/backticks/punctuation are trimmed so
+/// prose like "run `git push`" classifies too. False positives only cost one extra plan
+/// round. Shape is `widened` only for a widened `remote-publish` push (see
+/// [`push_is_widened`]); every other class is `standard`.
+fn scan_risk_grants(text: &str) -> Vec<RiskGrant> {
     let lowered = text.to_lowercase();
-    let mut out: Vec<&'static str> = Vec::new();
+    let mut out: Vec<RiskGrant> = Vec::new();
+    let mut push = |g: RiskGrant| {
+        if !out.contains(&g) {
+            out.push(g);
+        }
+    };
     if is_pipe_to_shell(&lowered) {
-        push_unique(&mut out, "pipe-to-shell");
+        push(RiskGrant::standard("pipe-to-shell"));
     }
     // Flatten shell separators so tokens from adjacent sub-commands don't fuse.
     let spaced: String = lowered
@@ -561,11 +791,12 @@ fn scan_risk_classes(text: &str) -> Vec<&'static str> {
         || (has_any(&["rmdir", "rd"]) && has("/s"))
         || (has_cmd("del") && has_any(&["/s", "/q"]))
     {
-        push_unique(&mut out, "destructive-fs");
+        push(RiskGrant::standard("destructive-fs"));
     }
 
     // remote publish / deploy
-    if (has_cmd("git") && has("push"))
+    let is_git_push = has_cmd("git") && has("push");
+    if is_git_push
         || (has_any(&["npm", "yarn", "pnpm", "bun"]) && has("publish"))
         || (has_cmd("cargo") && has("publish"))
         || (has_cmd("gh") && has("release") && has_any(&["create", "upload", "edit", "delete"]))
@@ -574,7 +805,18 @@ fn scan_risk_classes(text: &str) -> Vec<&'static str> {
             && has("deploy"))
         || (has_cmd("vercel") && has("--prod"))
     {
-        push_unique(&mut out, "remote-publish");
+        // SHAPE is `widened` only for a widened `git push` (the one push family whose
+        // flags meaningfully broaden destructiveness within the class). Other publish
+        // forms stay `standard` for v1.
+        let shape = if is_git_push && push_is_widened(&tokens) {
+            SHAPE_WIDENED
+        } else {
+            SHAPE_STANDARD
+        };
+        push(RiskGrant {
+            class: "remote-publish".to_string(),
+            shape: shape.to_string(),
+        });
     }
 
     // destructive DB / schema / migration execution
@@ -590,7 +832,7 @@ fn scan_risk_classes(text: &str) -> Vec<&'static str> {
         || (has_cmd("typeorm") && has("migration:run"))
         || (has_cmd("supabase") && has("db") && has("push"))
     {
-        push_unique(&mut out, "db-migration");
+        push(RiskGrant::standard("db-migration"));
     }
 
     // infrastructure mutation
@@ -598,7 +840,81 @@ fn scan_risk_classes(text: &str) -> Vec<&'static str> {
         || (has_cmd("pulumi") && has_any(&["up", "destroy"]))
         || (has_cmd("kubectl") && has_any(&["apply", "delete"]))
     {
-        push_unique(&mut out, "infra-mutation");
+        push(RiskGrant::standard("infra-mutation"));
+    }
+
+    // payment money-movement (Stripe/Braintree): PaymentIntents/Checkout/charges/
+    // captures/payouts/transfers — the modern money-movement surfaces. Tolerate the
+    // singular/plural resource spellings the CLIs accept.
+    let stripe_resource = |opts: &[&str]| has_cmd("stripe") && has("create") && has_any(opts);
+    if stripe_resource(&[
+        "payment_intents",
+        "payment_intent",
+        "paymentintents",
+        "paymentintent",
+        "charges",
+        "charge",
+        "payouts",
+        "payout",
+        "transfers",
+        "transfer",
+    ]) || (has_cmd("stripe") && has("capture") && has_any(&["charges", "charge", "payment_intents", "payment_intent"]))
+        || (has_cmd("stripe") && has("checkout") && has_any(&["sessions", "session"]) && has("create"))
+        || (has_cmd("braintree") && has("transaction") && has("sale"))
+    {
+        push(RiskGrant::standard("payment"));
+    }
+
+    // refund: explicit refund surfaces.
+    if (has_cmd("stripe") && has_any(&["refunds", "refund"]) && has("create"))
+        || (has_cmd("stripe") && has("refund"))
+        || (has_cmd("braintree") && has("refund"))
+    {
+        push(RiskGrant::standard("refund"));
+    }
+
+    // webhook: triggering/sending or creating webhook endpoints.
+    if (has_cmd("stripe") && has("trigger"))
+        || (has_cmd("stripe") && has_any(&["webhook_endpoints", "webhook_endpoint"]) && has("create"))
+        || (has_cmd("svix") && has_any(&["create", "send"]))
+        || (has("webhook") && has_any(&["create", "trigger", "send"]))
+    {
+        push(RiskGrant::standard("webhook"));
+    }
+
+    // queue: enqueue/purge/drain on known message brokers.
+    if (has_cmd("aws") && has("sqs") && has_any(&["send-message", "purge-queue"]))
+        || (has_cmd("celery") && has("purge"))
+        || (has_cmd("rabbitmqadmin") && has("publish"))
+    {
+        push(RiskGrant::standard("queue"));
+    }
+
+    // admin-auth: credential / token / access mutation.
+    if (has_cmd("aws")
+        && has("iam")
+        && has_any(&["create-access-key", "create-user", "attach-user-policy"]))
+        || (has_cmd("gh") && has("auth"))
+        || (has_cmd("vercel") && has("tokens") && has("create"))
+        || (has_cmd("gcloud")
+            && has("iam")
+            && has("service-accounts")
+            && has("keys")
+            && has("create"))
+    {
+        push(RiskGrant::standard("admin-auth"));
+    }
+    out
+}
+
+/// Scan free text for ALL high-risk command CLASSES present (shape collapsed away).
+/// Built on [`scan_risk_grants`]; kept for callers that only need class names.
+fn scan_risk_classes(text: &str) -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = Vec::new();
+    for g in scan_risk_grants(text) {
+        if let Some(canon) = RISK_CLASSES.iter().find(|c| **c == g.class) {
+            push_unique(&mut out, canon);
+        }
     }
     out
 }
@@ -618,6 +934,11 @@ pub const RISK_CLASSES: &[&str] = &[
     "db-migration",
     "infra-mutation",
     "pipe-to-shell",
+    "payment",
+    "refund",
+    "webhook",
+    "queue",
+    "admin-auth",
 ];
 
 /// Parse the high-risk command classes the REVIEWER explicitly authorized, from a
@@ -647,7 +968,63 @@ pub fn parse_risk_approved(review: &str) -> Vec<&'static str> {
     out
 }
 
-/// Command classes already authorized by the current approved plan.
+/// Parse the reviewer's authorized risk GRANTS — each a `(class, shape)` — from the same
+/// standalone `RISK-APPROVED:` line(s) as [`parse_risk_approved`] (v0.31 P3). Each
+/// comma-separated token is either a bare `class` (→ `standard` shape) or `class:shape`
+/// where `shape` is `standard`/`widened`; an unknown shape falls back to `standard`
+/// (never widens by accident), and an unknown class is ignored. So `remote-publish`
+/// authorizes only a plain push, while `remote-publish:widened` authorizes a
+/// force/mirror/tags/delete push too. Same reviewer-owned-line discipline as
+/// `parse_risk_approved`, so a tag merely quoted in prose still authorizes nothing.
+pub fn parse_risk_grants(review: &str) -> Vec<RiskGrant> {
+    let mut out: Vec<RiskGrant> = Vec::new();
+    for line in review.lines() {
+        let lower = line.to_lowercase();
+        let head = lower.trim_start_matches(|c: char| c.is_whitespace() || "-*>#`".contains(c));
+        let Some(rest) = head.strip_prefix("risk-approved:") else {
+            continue;
+        };
+        for tok in rest.split(',') {
+            let cleaned = tok.trim();
+            // Split an optional `:shape` suffix; both halves are trimmed of stray
+            // non-alphanumeric/`-` punctuation (mirrors parse_risk_approved's token clean).
+            let trim_word = |s: &str| {
+                s.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-')
+                    .to_string()
+            };
+            let (class_raw, shape_raw) = match cleaned.split_once(':') {
+                Some((c, s)) => (trim_word(c), trim_word(s)),
+                None => (trim_word(cleaned), String::new()),
+            };
+            let Some(canon) = RISK_CLASSES.iter().find(|c| **c == class_raw) else {
+                continue; // unknown class → ignore (fail-safe)
+            };
+            let shape = if shape_raw == SHAPE_WIDENED {
+                SHAPE_WIDENED
+            } else {
+                SHAPE_STANDARD // bare or unknown shape → standard (never widen by accident)
+            };
+            let g = RiskGrant {
+                class: canon.to_string(),
+                shape: shape.to_string(),
+            };
+            // Dedupe by class, keeping the BROADEST shape (widened wins) so two tokens
+            // for the same class can't downgrade a widened grant.
+            if let Some(existing) = out.iter_mut().find(|e| e.class == g.class) {
+                if g.shape == SHAPE_WIDENED {
+                    existing.shape = SHAPE_WIDENED.to_string();
+                }
+            } else {
+                out.push(g);
+            }
+        }
+    }
+    out
+}
+
+/// Command classes already authorized by the current approved plan (legacy flat list,
+/// kept for back-compat / display). The AUTHORITATIVE post-approval check is
+/// [`approved_risk_grants`] (structured class+shape).
 pub fn approved_command_classes(cwd: &str) -> Vec<String> {
     read_state(cwd)
         .and_then(|s| {
@@ -659,6 +1036,20 @@ pub fn approved_command_classes(cwd: &str) -> Vec<String> {
                         .map(str::to_string)
                         .collect()
                 })
+        })
+        .unwrap_or_default()
+}
+
+/// The structured risk GRANTS (class+shape) authorized for the current approved plan
+/// (v0.31 P3). Only KNOWN classes and the two known shapes are accepted; any malformed
+/// entry is dropped (fail-safe — a grant that can't be parsed authorizes nothing). This
+/// is the authoritative source for [`unapproved_high_risk`].
+fn approved_risk_grants(cwd: &str) -> Vec<RiskGrant> {
+    read_state(cwd)
+        .and_then(|s| {
+            s.get("approved_risk_grants")
+                .and_then(Value::as_array)
+                .map(|arr| arr.iter().filter_map(RiskGrant::from_value).collect())
         })
         .unwrap_or_default()
 }
@@ -705,11 +1096,36 @@ pub fn begin_review(cwd: &str, plan: &str) {
     write_pending(cwd, &current_epoch(cwd), hash_str(plan));
 }
 
-/// Post-approval risk class that the approved plan did NOT cover, for a Bash/run
-/// command — `None` when the command is ordinary, its class is already approved,
-/// the gate is off/bypassed, or the plan isn't approved (pre-approval is already
-/// blocked by [`enforce`]). Does not mutate state.
-pub fn unapproved_high_risk(cwd: &str, tool_name: &str, command: &str) -> Option<&'static str> {
+/// A post-approval risk delta the approved plan did not cover (v0.31 P3). Either a
+/// brand-NEW risk class, or a same-class WIDENED variant (e.g. a force/mirror/tags
+/// push under a plain `remote-publish` grant). Both re-arm the gate; they differ only
+/// in the reason code emitted so the operator/agent sees WHY.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RiskDelta {
+    /// A high-risk class the approved plan did not authorize at all.
+    NewClass(&'static str),
+    /// A WIDENED variant of an already-granted class (only the standard shape was granted).
+    Widened(&'static str),
+}
+
+impl RiskDelta {
+    fn class(&self) -> &'static str {
+        match self {
+            RiskDelta::NewClass(c) | RiskDelta::Widened(c) => c,
+        }
+    }
+}
+
+/// Post-approval risk DELTA the approved plan did NOT cover, for a Bash/run command —
+/// `None` when the command is ordinary, fully covered by a grant, the gate is
+/// off/bypassed, or the plan isn't approved (pre-approval is already blocked by
+/// [`enforce`]). Checks EVERY `(class, shape)` the command contains against the
+/// structured grants; reports the FIRST uncovered one (a chained
+/// `git push && terraform destroy` can't pass just because its first class is granted).
+/// A class that IS granted but only at `standard` while the command is `widened` yields
+/// [`RiskDelta::Widened`]; an entirely ungranted class yields [`RiskDelta::NewClass`].
+/// Does not mutate state.
+fn risk_delta(cwd: &str, tool_name: &str, command: &str) -> Option<RiskDelta> {
     if !is_enabled(cwd) || bypassed() {
         return None;
     }
@@ -719,42 +1135,92 @@ pub fn unapproved_high_risk(cwd: &str, tool_name: &str, command: &str) -> Option
     if !effectively_approved(cwd) {
         return None;
     }
-    // Check EVERY class in the command (a chained `git push && terraform destroy`
-    // must not pass just because its FIRST class is approved). Deny on the first
-    // class the approved plan did not authorize.
-    let approved = approved_command_classes(cwd);
-    scan_risk_classes(command)
-        .into_iter()
-        .find(|class| !approved.iter().any(|a| a == class))
+    let grants = approved_risk_grants(cwd);
+    for g in scan_risk_grants(command) {
+        // Map the scanned class to its 'static canonical so the delta carries a
+        // 'static name (matches the public surface). Unknown classes are skipped.
+        let Some(canon) = RISK_CLASSES.iter().find(|c| **c == g.class) else {
+            continue;
+        };
+        if grants.iter().any(|a| a.covers(&g.class, &g.shape)) {
+            continue; // covered
+        }
+        // Distinguish a brand-new class from a same-class widened variant.
+        return Some(if grants.iter().any(|a| a.class == g.class) {
+            RiskDelta::Widened(canon)
+        } else {
+            RiskDelta::NewClass(canon)
+        });
+    }
+    None
+}
+
+/// Post-approval risk class that the approved plan did NOT cover, for a Bash/run
+/// command — `None` when the command is ordinary, its class is already approved,
+/// the gate is off/bypassed, or the plan isn't approved. Thin wrapper over
+/// [`risk_delta`] returning just the class (the public surface mcp.rs run-tool uses).
+pub fn unapproved_high_risk(cwd: &str, tool_name: &str, command: &str) -> Option<&'static str> {
+    risk_delta(cwd, tool_name, command).map(|d| d.class())
+}
+
+/// Public form of [`risk_delta`] for the in-process `run` tool, so it can emit the
+/// SAME widened-vs-new-class reason as the PreToolUse hook (a widened push gets the
+/// `risk_policy_widened` message, not the generic new-class one). Does not mutate state.
+pub fn run_risk_delta(cwd: &str, tool_name: &str, command: &str) -> Option<RiskDelta> {
+    risk_delta(cwd, tool_name, command)
 }
 
 /// PreToolUse risk gate (runs AFTER [`enforce`] returns allow): if an approved
-/// task attempts an unapproved high-risk command, revoke approval and DENY so the
-/// plan is re-reviewed with the command in scope. `None` to allow.
+/// task attempts an unapproved high-risk command (a new class OR a widened same-class
+/// variant), revoke approval and DENY so the plan is re-reviewed with the command in
+/// scope. `None` to allow.
 pub fn enforce_risk(cwd: &str, tool_name: &str, command: &str) -> Option<String> {
-    let class = unapproved_high_risk(cwd, tool_name, command)?;
+    let delta = risk_delta(cwd, tool_name, command)?;
     revoke(cwd, "high_risk_command_delta");
-    Some(risk_deny_json(class))
+    Some(risk_deny_json(&delta))
 }
 
-/// Human-readable instruction for a high-risk re-gate (shared by the hook deny and
-/// the `run` tool's plain-text reply).
+/// Human-readable instruction for a NEW-class high-risk re-gate (shared by the hook
+/// deny and the `run` tool's plain-text reply).
 pub fn risk_delta_message(class: &str) -> String {
     format!(
-        "PLAN_RISK_DELTA_REQUIRED: this command is a high-risk class ('{class}') that the \
-         approved plan did not cover, so the plan gate has re-armed. Do NOT retry this command. \
-         Update your plan to name this exact command under risk_surfaces (e.g. `git push`, \
-         `prisma migrate deploy`, `rm -rf`), call `mcp__aibridge__plan_gate` again, and once it \
-         returns <AI-BRIDGE-APPROVE/> this command class is allowed for the task."
+        "PLAN_RISK_DELTA_REQUIRED: new_risk_surface={class} — this command is a high-risk class \
+         ('{class}') that the approved plan did not cover, so the plan gate has re-armed. Do NOT \
+         retry this command. Update your plan to name this exact command under risk_surfaces \
+         (e.g. `git push`, `prisma migrate deploy`, `rm -rf`), call `mcp__aibridge__plan_gate` \
+         again, and once it returns <AI-BRIDGE-APPROVE/> this command class is allowed for the task."
     )
 }
 
-fn risk_deny_json(class: &str) -> String {
+/// Human-readable instruction for a same-class WIDENED re-gate (v0.31 P3): the class
+/// was granted, but only its standard shape — this widened variant (force/mirror/tags/
+/// delete push, etc.) needs an explicit `class:widened` grant.
+pub fn risk_widened_message(class: &str) -> String {
+    format!(
+        "PLAN_RISK_DELTA_REQUIRED: risk_policy_widened class={class} — this command is a WIDENED \
+         variant of the '{class}' class (e.g. a force/mirror/tags/delete push) that goes beyond the \
+         plain '{class}' grant the plan was approved with, so the plan gate has re-armed. Do NOT \
+         retry this command. Update your plan to name this exact widened command under \
+         risk_surfaces, have the reviewer authorize it as `{class}:widened`, call \
+         `mcp__aibridge__plan_gate` again, and once it returns <AI-BRIDGE-APPROVE/> this widened \
+         command is allowed for the task."
+    )
+}
+
+/// The deny prose for a risk delta — new-class vs widened-same-class (v0.31 P3).
+pub fn risk_delta_reason(delta: &RiskDelta) -> String {
+    match delta {
+        RiskDelta::NewClass(c) => risk_delta_message(c),
+        RiskDelta::Widened(c) => risk_widened_message(c),
+    }
+}
+
+fn risk_deny_json(delta: &RiskDelta) -> String {
     json!({
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
             "permissionDecision": "deny",
-            "permissionDecisionReason": risk_delta_message(class)
+            "permissionDecisionReason": risk_delta_reason(delta)
         }
     })
     .to_string()
@@ -850,13 +1316,20 @@ pub fn record(
             // Bind approval to THIS epoch so is_approved() can reject a stale flag.
             set_field(&mut s, "approved_epoch", json!(epoch));
             set_field(&mut s, "approved_plan_hash", json!(hash_str(plan)));
-            // Pre-authorize ONLY the high-risk classes the REVIEWER explicitly
-            // allowed (its `RISK-APPROVED:` line) — never inferred from plan prose.
+            // Pre-authorize ONLY the high-risk classes/shapes the REVIEWER explicitly
+            // allowed (its `RISK-APPROVED:` line) — never inferred from plan prose. The
+            // structured grants (class+shape) are the AUTHORITATIVE post-approval check
+            // (v0.31 P3); the legacy flat class list is kept for back-compat/display.
             // Keep the plan text for the Stop gate's scope-vs-diff comparison.
             set_field(
                 &mut s,
                 "approved_command_classes",
                 json!(parse_risk_approved(findings)),
+            );
+            set_field(
+                &mut s,
+                "approved_risk_grants",
+                RiskGrant::vec_to_value(&parse_risk_grants(findings)),
             );
             set_field(&mut s, "approved_plan", json!(cap_plan(plan)));
             set_field(&mut s, "status", json!("approved"));
@@ -906,12 +1379,13 @@ pub fn record(
 
 /// Fast-path resume: re-approve the CURRENT epoch from a matching plan RECEIPT (a
 /// reload-resume of an already-Codex-approved plan) WITHOUT a fresh review round.
-/// Mirrors [`record`]'s Approve path, but the command classes come from the RECEIPT
-/// (a real reviewer's prior `RISK-APPROVED`), never re-parsed — so a resume can't
-/// grant a class that was never reviewed. Same fail-safe state contract + epoch
-/// TOCTOU guard as `record`. Returns `true` only if approval was actually recorded;
-/// `false` (task changed / missing state) means the caller must run a full review.
-pub fn record_resume(cwd: &str, expected_epoch: &str, plan: &str, classes: &[String]) -> bool {
+/// Mirrors [`record`]'s Approve path, but the risk GRANTS come from the RECEIPT
+/// (a real reviewer's prior `RISK-APPROVED`, with their authorized class+shape), never
+/// re-parsed — so a resume can't grant a class or widen a shape that was never reviewed.
+/// Same fail-safe state contract + epoch TOCTOU guard as `record`. Returns `true` only
+/// if approval was actually recorded; `false` (task changed / missing state) means the
+/// caller must run a full review.
+pub fn record_resume(cwd: &str, expected_epoch: &str, plan: &str, grants: &[RiskGrant]) -> bool {
     // Fail-safe: when enabled, never approve from missing/unparseable state.
     let mut s = match read_state(cwd) {
         Some(s) => s,
@@ -929,10 +1403,17 @@ pub fn record_resume(cwd: &str, expected_epoch: &str, plan: &str, classes: &[Str
     if epoch != expected_epoch {
         return false;
     }
+    // Legacy flat class list derived from the structured grants (back-compat/display).
+    let classes: Vec<String> = grants.iter().map(|g| g.class.clone()).collect();
     set_field(&mut s, "approved", json!(true));
     set_field(&mut s, "approved_epoch", json!(epoch));
     set_field(&mut s, "approved_plan_hash", json!(hash_str(plan)));
     set_field(&mut s, "approved_command_classes", json!(classes));
+    set_field(
+        &mut s,
+        "approved_risk_grants",
+        RiskGrant::vec_to_value(grants),
+    );
     set_field(&mut s, "approved_plan", json!(cap_plan(plan)));
     set_field(&mut s, "status", json!("approved"));
     set_field(&mut s, "revoked_reason", Value::Null);
@@ -963,9 +1444,13 @@ pub fn prompt(plan: &str) -> String {
          2. If — and only if — the plan legitimately REQUIRES high-risk commands that you are \
          approving, add a line listing those classes (omit it entirely otherwise):\n\
          RISK-APPROVED: <comma-separated subset of: remote-publish, db-migration, destructive-fs, \
-         infra-mutation, pipe-to-shell>\n\
+         infra-mutation, pipe-to-shell, payment, refund, webhook, queue, admin-auth>\n\
          Only list a class the plan genuinely needs; if the plan says NOT to run such a command, \
-         do NOT list it. Unlisted high-risk commands will be re-gated before they run.\n\
+         do NOT list it. Unlisted high-risk commands will be re-gated before they run. A bare \
+         class authorizes only its STANDARD form (e.g. `remote-publish` authorizes a plain \
+         `git push` but NOT a force/mirror/tags/delete push, and not tag publication). To \
+         authorize a WIDENED variant, write `class:widened` (e.g. `remote-publish:widened`); only \
+         do so when the plan genuinely needs that more-destructive form.\n\
          3. A final line that is EXACTLY one of:\n\
          <AI-BRIDGE-APPROVE/>       (plan is good to execute)\n\
          <AI-BRIDGE-REQUEST-CHANGES/> (revise the plan as noted)\n\
@@ -1565,13 +2050,13 @@ mod tests {
         start_epoch(&cwd, "sess", "task");
         let epoch = current_epoch(&cwd);
         // The receipt fast-path: begin_review stamps the pending marker for THIS plan,
-        // then record_resume approves from the receipt's classes (no Codex round).
+        // then record_resume approves from the receipt's grants (no Codex round).
         begin_review(&cwd, "plan A");
         assert!(record_resume(
             &cwd,
             &epoch,
             "plan A",
-            &["remote-publish".to_string()]
+            &[RiskGrant::standard("remote-publish")]
         ));
         assert!(is_approved(&cwd));
         // Writes must ACTUALLY unlock — guards that record_resume's approved_plan_hash
@@ -1604,5 +2089,447 @@ mod tests {
         assert!(!record_resume(&cwd, &stale, "plan A", &[]));
         assert!(!is_approved(&cwd));
         assert!(blocks_writes(&cwd));
+    }
+
+    // --- v0.31 Step 1: regression locks for the CURRENT strict behavior ----------
+    // These pin behaviors that the planned relaxations will touch — P1 (state-based
+    // invalidation), P2 (read-only orientation), P3 (structured risk grants), P4
+    // (canonical fingerprints) — so each later change surfaces as a DELIBERATE,
+    // test-visible diff instead of a silent safety regression. They assert TODAY's
+    // behavior, not the target behavior. No env mutation / no real-HOME IO (B1).
+
+    #[test]
+    fn gated_tool_surface_is_exactly_writes_bash_and_run() {
+        // The exact set the gate holds pre-approval. P2 will relax Bash specifically;
+        // locking the surface makes that relaxation an explicit, reviewable change.
+        for t in [
+            "Write",
+            "Edit",
+            "MultiEdit",
+            "NotebookEdit",
+            "Bash",
+            "mcp__aibridge__run",
+        ] {
+            assert!(is_gated_tool(t), "{t} must be gated");
+        }
+        for t in [
+            "Read",
+            "Grep",
+            "Glob",
+            "LS",
+            "TodoWrite",
+            "mcp__aibridge__plan_gate",
+            "mcp__aibridge__review_diff",
+        ] {
+            assert!(!is_gated_tool(t), "{t} must NOT be gated");
+        }
+    }
+
+    #[test]
+    fn bash_is_gated_pre_approval_regardless_of_command() {
+        // TODAY enforce() takes only the tool name and denies ALL Bash before approval —
+        // even a read-only `git status`/`ls`. P2 will add a narrow read-only allowance
+        // behind a flag; this documents the strict default so that change stays visible.
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "task");
+        assert!(
+            enforce(&cwd, "Bash").is_some(),
+            "all Bash is denied pre-approval today (no read-only carve-out yet)"
+        );
+    }
+
+    #[test]
+    fn enforce_tool_threads_command_but_is_behavior_neutral_in_p2() {
+        // P2 wires the command through enforce_tool + an INERT read-only-orientation seam
+        // (read_only_execution_supported() is const-false), so a Bash command is STILL
+        // denied pre-approval — with the default no_active_approval code, not the parser
+        // code — and the 2-arg enforce() wrapper is identical to enforce_tool(..,"").
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "task");
+        // A read-only-looking Bash command is denied (carve-out is inert in P2).
+        let deny = enforce_tool(&cwd, "Bash", "ls -la src").expect("Bash denied pre-approval");
+        let v: Value = serde_json::from_str(&deny).expect("deny is valid json");
+        let reason = v
+            .pointer("/hookSpecificOutput/permissionDecisionReason")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(
+            reason.contains("PLAN_GATE_REQUIRED: no_active_approval"),
+            "inert P2 carve-out must keep the default code, got: {reason}"
+        );
+        // Writes are denied regardless of any command argument.
+        assert!(enforce_tool(&cwd, "Write", "ls").is_some());
+        // The wrapper and the empty-command call agree (byte-identical OFF path).
+        assert_eq!(enforce(&cwd, "Bash"), enforce_tool(&cwd, "Bash", ""));
+        // read_only_proven is deferred → never proves anything in P2.
+        assert!(!read_only_proven(&cwd, "ls"));
+        assert!(!read_only_execution_supported());
+    }
+
+    #[test]
+    fn different_findings_reset_the_no_progress_counter() {
+        // Only REPEATED identical findings escalate to Stuck; a different finding resets
+        // the counter so a productive multi-round dialogue is never cut off early.
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "task");
+        let v = crate::gate::Verdict::RequestChanges;
+        assert!(matches!(
+            record(&cwd, &current_epoch(&cwd), "p1", &v, "finding X"),
+            Outcome::Revise(_)
+        ));
+        // A DIFFERENT finding resets same_findings → still Revise (not Stuck).
+        assert!(matches!(
+            record(&cwd, &current_epoch(&cwd), "p2", &v, "finding Y"),
+            Outcome::Revise(_)
+        ));
+        // Now the SAME finding repeats → second identical → Stuck.
+        assert!(matches!(
+            record(&cwd, &current_epoch(&cwd), "p3", &v, "finding Y"),
+            Outcome::Stuck(_)
+        ));
+    }
+
+    #[test]
+    fn denied_write_increments_the_denied_counter() {
+        // enforce() bumps `denied_writes` for operator diagnostics. P6 layers machine-
+        // readable reason codes on this observability, so lock the counter now.
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "task");
+        assert!(enforce(&cwd, "Write").is_some());
+        assert!(enforce(&cwd, "Write").is_some());
+        let n = read_state(&cwd)
+            .unwrap()
+            .get("denied_writes")
+            .and_then(Value::as_u64)
+            .unwrap();
+        assert_eq!(n, 2, "two denied writes must be counted");
+    }
+
+    #[test]
+    fn same_class_widening_re_gates_under_a_standard_grant() {
+        // v0.31 P3 (TIGHTENING): a bare `remote-publish` grant authorizes ONLY a plain
+        // push; a WIDENED variant (force/mirror/tags/delete, etc.) re-gates. This was the
+        // KNOWN GAP locked by the old `same_class_widening_is_not_separately_gated_today`
+        // test — now the tightening is the asserted behavior.
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "deploy");
+        record(
+            &cwd,
+            &current_epoch(&cwd),
+            "deploy plan",
+            &crate::gate::Verdict::Approve,
+            "ok\nRISK-APPROVED: remote-publish",
+        );
+        // Plain push is allowed (standard shape, in the granted shape).
+        assert_eq!(
+            unapproved_high_risk(&cwd, "Bash", "git push origin main"),
+            None
+        );
+        // Force push is now RE-GATED (widened shape beyond the standard grant).
+        assert_eq!(
+            unapproved_high_risk(&cwd, "Bash", "git push --force origin main"),
+            Some("remote-publish")
+        );
+        // …still classified as remote-publish, not a distinct class.
+        assert_eq!(
+            high_risk_class("git push --force origin main"),
+            Some("remote-publish")
+        );
+    }
+
+    #[test]
+    fn every_widened_push_form_re_gates_under_standard_grant() {
+        // EXHAUSTIVE: each widened `git push` form must re-gate when only the standard
+        // `remote-publish` shape was granted (a standard grant must NOT cover any of the
+        // higher-risk push variants — force/delete/mirror/all/prune/tag-publication).
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "deploy");
+        record(
+            &cwd,
+            &current_epoch(&cwd),
+            "deploy plan",
+            &crate::gate::Verdict::Approve,
+            "ok\nRISK-APPROVED: remote-publish",
+        );
+        for cmd in [
+            "git push --force origin main",
+            "git push -f origin main",
+            "git push -uf origin main",     // clustered force
+            "git push -fu origin main",     // clustered force (reordered)
+            "git push --force-with-lease",
+            "git push --force-with-lease=origin/main",
+            "git push --force-if-includes origin main",
+            "git push --mirror origin",
+            "git push --tags origin",
+            "git push --follow-tags origin main",
+            "git push --prune origin",
+            "git push --all origin",
+            "git push --delete origin x",
+            "git push -d origin x",
+            "git push origin :stale",       // delete refspec
+            "git push origin +main",        // leading-+ (force-update) refspec
+            "git push origin tag v1.2.3",   // explicit tag push
+            "git push origin refs/tags/v1.2.3",
+        ] {
+            assert_eq!(
+                unapproved_high_risk(&cwd, "Bash", cmd),
+                Some("remote-publish"),
+                "widened push must re-gate: {cmd}"
+            );
+        }
+        // …but plain / non-widening short clusters stay standard (allowed).
+        for cmd in [
+            "git push origin main",
+            "git push",
+            "git push -u origin main", // -u is not force/delete → standard
+        ] {
+            assert_eq!(
+                unapproved_high_risk(&cwd, "Bash", cmd),
+                None,
+                "plain push must stay allowed: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_widened_grant_allows_a_force_push() {
+        // A reviewer who writes `remote-publish:widened` authorizes the widened variant too
+        // (and a plain push remains allowed — widened covers standard).
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "deploy");
+        record(
+            &cwd,
+            &current_epoch(&cwd),
+            "force-deploy plan",
+            &crate::gate::Verdict::Approve,
+            "ok\nRISK-APPROVED: remote-publish:widened",
+        );
+        assert_eq!(
+            unapproved_high_risk(&cwd, "Bash", "git push --force origin main"),
+            None
+        );
+        assert_eq!(
+            unapproved_high_risk(&cwd, "Bash", "git push origin main"),
+            None
+        );
+    }
+
+    #[test]
+    fn new_risk_classes_are_detected_and_lookalikes_are_not() {
+        // Each new class (payment/refund/webhook/queue/admin-auth) is detected by a
+        // representative command and NOT by an ordinary lookalike (false positives only
+        // cost a plan round, false negatives are unsafe — so detect the real surfaces).
+        for cmd in [
+            "stripe payment_intents create --amount 1000",
+            "stripe charges create --amount 500",
+            "stripe checkout sessions create",
+            "stripe payouts create",
+            "stripe transfers create --amount 1000",
+        ] {
+            assert_eq!(high_risk_class(cmd), Some("payment"), "payment: {cmd}");
+        }
+        assert_eq!(
+            high_risk_class("stripe refunds create --charge ch_1"),
+            Some("refund")
+        );
+        for cmd in [
+            "stripe trigger payment_intent.succeeded",
+            "svix message create app_1 --data x",
+        ] {
+            assert_eq!(high_risk_class(cmd), Some("webhook"), "webhook: {cmd}");
+        }
+        for cmd in ["aws sqs purge-queue --queue-url u", "celery -A app purge"] {
+            assert_eq!(high_risk_class(cmd), Some("queue"), "queue: {cmd}");
+        }
+        for cmd in ["aws iam create-access-key --user-name bob", "gh auth login"] {
+            assert_eq!(high_risk_class(cmd), Some("admin-auth"), "admin-auth: {cmd}");
+        }
+        // Ordinary lookalikes must NOT classify.
+        for cmd in [
+            "stripe logs tail",
+            "aws sqs receive-message --queue-url u",
+            "gh repo view",
+            "celery -A app worker",
+            "stripe products list",
+        ] {
+            assert_eq!(high_risk_class(cmd), None, "lookalike must not classify: {cmd}");
+        }
+    }
+
+    #[test]
+    fn parse_risk_grants_respects_standalone_line_and_shapes() {
+        // Standalone reviewer line: bare class → standard shape.
+        assert_eq!(
+            parse_risk_grants("findings\nRISK-APPROVED: remote-publish"),
+            vec![RiskGrant::standard("remote-publish")]
+        );
+        // `class:widened` → widened shape.
+        assert_eq!(
+            parse_risk_grants("RISK-APPROVED: remote-publish:widened"),
+            vec![RiskGrant {
+                class: "remote-publish".to_string(),
+                shape: "widened".to_string()
+            }]
+        );
+        // Unknown shape suffix → standard (never widen by accident).
+        assert_eq!(
+            parse_risk_grants("RISK-APPROVED: remote-publish:bogus"),
+            vec![RiskGrant::standard("remote-publish")]
+        );
+        // Unknown class → ignored.
+        assert!(parse_risk_grants("RISK-APPROVED: launch-missiles").is_empty());
+        // The tag merely QUOTED inside prose does NOT grant anything.
+        assert!(
+            parse_risk_grants("Do not add a RISK-APPROVED: remote-publish line.").is_empty()
+        );
+        // Two tokens for the same class: widened wins (can't be downgraded).
+        assert_eq!(
+            parse_risk_grants("RISK-APPROVED: remote-publish, remote-publish:widened"),
+            vec![RiskGrant {
+                class: "remote-publish".to_string(),
+                shape: "widened".to_string()
+            }]
+        );
+    }
+
+    #[test]
+    fn widened_vs_new_class_delta_messages() {
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "deploy");
+        record(
+            &cwd,
+            &current_epoch(&cwd),
+            "deploy plan",
+            &crate::gate::Verdict::Approve,
+            "ok\nRISK-APPROVED: remote-publish",
+        );
+        // A widened same-class command → risk_policy_widened.
+        let widened = enforce_risk(&cwd, "Bash", "git push --force origin main")
+            .expect("widened push must re-gate");
+        let v: Value = serde_json::from_str(&widened).unwrap();
+        let reason = v
+            .pointer("/hookSpecificOutput/permissionDecisionReason")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(
+            reason.starts_with("PLAN_RISK_DELTA_REQUIRED: risk_policy_widened class=remote-publish"),
+            "{reason}"
+        );
+        // Re-approve (revoked by the prior enforce_risk) then hit a brand-NEW class.
+        start_epoch(&cwd, "sess", "deploy 2");
+        record(
+            &cwd,
+            &current_epoch(&cwd),
+            "deploy plan 2",
+            &crate::gate::Verdict::Approve,
+            "ok\nRISK-APPROVED: remote-publish",
+        );
+        let newclass = enforce_risk(&cwd, "Bash", "terraform apply")
+            .expect("new class must re-gate");
+        let v2: Value = serde_json::from_str(&newclass).unwrap();
+        let reason2 = v2
+            .pointer("/hookSpecificOutput/permissionDecisionReason")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(
+            reason2.starts_with("PLAN_RISK_DELTA_REQUIRED: new_risk_surface=infra-mutation"),
+            "{reason2}"
+        );
+    }
+
+    #[test]
+    fn prompt_documents_new_classes_and_widened_shape() {
+        let p = prompt("do X");
+        for class in ["payment", "refund", "webhook", "queue", "admin-auth"] {
+            assert!(p.contains(class), "prompt must list new class {class}");
+        }
+        assert!(p.contains("class:widened"), "prompt must document the :widened shape");
+        assert!(
+            p.contains("remote-publish:widened"),
+            "prompt must give the widened example"
+        );
+    }
+
+    // --- v0.31 Step 2 / P6: machine-readable block reason codes ------------------
+
+    #[test]
+    fn block_reason_codes_are_stable_snake_case() {
+        // Each code is the stable token operators/tools branch on — pin them.
+        assert_eq!(BlockReason::NoActiveApproval.code(), "no_active_approval");
+        assert_eq!(BlockReason::ApprovalExpired.code(), "approval_expired");
+        assert_eq!(BlockReason::UserScopeDelta.code(), "user_scope_delta");
+        assert_eq!(BlockReason::HeadMoved.code(), "head_moved");
+        assert_eq!(BlockReason::WorkingTreeDelta.code(), "working_tree_delta");
+        assert_eq!(
+            BlockReason::ReadOnlyParserDenial.code(),
+            "read_only_parser_denial"
+        );
+        // Every code is lower snake_case (no spaces/uppercase) so it parses as one token.
+        for r in [
+            BlockReason::NoActiveApproval,
+            BlockReason::ApprovalExpired,
+            BlockReason::UserScopeDelta,
+            BlockReason::HeadMoved,
+            BlockReason::WorkingTreeDelta,
+            BlockReason::ReadOnlyParserDenial,
+        ] {
+            let c = r.code();
+            assert!(
+                c.chars().all(|ch| ch.is_ascii_lowercase() || ch == '_') && !c.is_empty(),
+                "code {c:?} must be lower snake_case"
+            );
+        }
+    }
+
+    #[test]
+    fn block_message_carries_tag_then_code() {
+        // `PLAN_GATE_REQUIRED: <code> — <hint>` so the code is the first token after the tag.
+        let m = block_message(BlockReason::NoActiveApproval);
+        assert!(m.starts_with("PLAN_GATE_REQUIRED: no_active_approval — "), "{m}");
+        assert!(block_message(BlockReason::HeadMoved).starts_with("PLAN_GATE_REQUIRED: head_moved — "));
+    }
+
+    #[test]
+    fn enforce_deny_is_json_with_the_reason_code() {
+        // The PreToolUse deny payload is valid JSON whose reason names the code.
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "task");
+        let deny = enforce(&cwd, "Write").expect("denied pre-approval");
+        let v: Value = serde_json::from_str(&deny).expect("deny is valid json");
+        let reason = v
+            .pointer("/hookSpecificOutput/permissionDecisionReason")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(
+            reason.contains("PLAN_GATE_REQUIRED: no_active_approval"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn risk_delta_message_names_the_new_risk_surface() {
+        // The risk-delta family carries `new_risk_surface=<class>` after its own tag.
+        let m = risk_delta_message("remote-publish");
+        assert!(
+            m.starts_with("PLAN_RISK_DELTA_REQUIRED: new_risk_surface=remote-publish"),
+            "{m}"
+        );
+        // The hook deny wrapping it is valid JSON carrying the same token.
+        let deny = risk_deny_json(&RiskDelta::NewClass("db-migration"));
+        let v: Value = serde_json::from_str(&deny).unwrap();
+        let reason = v
+            .pointer("/hookSpecificOutput/permissionDecisionReason")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(reason.contains("new_risk_surface=db-migration"), "{reason}");
     }
 }

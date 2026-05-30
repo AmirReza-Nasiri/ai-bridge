@@ -797,6 +797,30 @@ pub fn plan_review_effort() -> String {
         .unwrap_or_else(|| crate::codex::REVIEW_REASONING_EFFORT.to_string())
 }
 
+// ───────────────────────── v0.31 (P2): read-only orientation flag ─────────────────────
+//
+// An OPT-IN relaxation: when ON, a NARROW set of provably-read-only Bash commands could
+// run with no approved plan (only mutators stay gated). DEFAULT is OFF — the strict gate
+// is byte-identical until this is explicitly flipped. P2 lands ONLY this pure reader +
+// the inert enforcement seam; the actual carve-out (which requires a hardened execution
+// layer — trusted-exe resolution, clean env, no shell startup/functions/aliases, argv
+// execution) is a deferred follow-up.
+
+/// Pure: the `planGate.readOnlyOrientation` flag from a policy Value. DEFAULT FALSE;
+/// an absent/non-bool/malformed value also reads FALSE (fail-safe — the relaxation
+/// never turns on by accident).
+fn read_only_orientation_from(cfg: &Value) -> bool {
+    cfg.get("planGate")
+        .and_then(|p| p.get("readOnlyOrientation"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Whether the read-only orientation relaxation is enabled (on-disk config). DEFAULT OFF.
+pub fn read_only_orientation() -> bool {
+    read_only_orientation_from(&read_config())
+}
+
 // ───────────────────────── v0.29 (O1d): review-model CLI + doctor reporting ─────────────
 //
 // Honest reporting of the PERSISTED review-model config. A hand-edited review-mcp.json can
@@ -1450,6 +1474,28 @@ mod tests {
             plan_effort_from(&json!({"codex": {"plan_review_effort": 5}})),
             None
         );
+    }
+
+    #[test]
+    fn read_only_orientation_from_defaults_off() {
+        // Absent → OFF (the strict default; the relaxation never turns on by accident).
+        assert!(!read_only_orientation_from(&json!({})));
+        assert!(!read_only_orientation_from(&json!({"planGate": {}})));
+        // Explicitly true → ON.
+        assert!(read_only_orientation_from(
+            &json!({"planGate": {"readOnlyOrientation": true}})
+        ));
+        // Explicitly false → OFF.
+        assert!(!read_only_orientation_from(
+            &json!({"planGate": {"readOnlyOrientation": false}})
+        ));
+        // Malformed / non-bool → OFF (fail-safe).
+        assert!(!read_only_orientation_from(
+            &json!({"planGate": {"readOnlyOrientation": "true"}})
+        ));
+        assert!(!read_only_orientation_from(
+            &json!({"planGate": {"readOnlyOrientation": 1}})
+        ));
     }
 
     #[test]

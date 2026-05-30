@@ -378,15 +378,16 @@ impl Server {
                     "AI Bridge: `run` is blocked by the plan gate — this task has no approved \
                      plan yet. Call `plan_gate` with your plan and retry after <AI-BRIDGE-APPROVE/>."
                         .to_string()
-                } else if let Some(class) =
-                    crate::plan_gate::unapproved_high_risk(&cwd, "mcp__aibridge__run", command)
+                } else if let Some(delta) =
+                    crate::plan_gate::run_risk_delta(&cwd, "mcp__aibridge__run", command)
                 {
                     // Approved task, but a high-risk command class the plan didn't
-                    // cover → re-arm the gate (same contract as the PreToolUse hook).
+                    // cover (a new class OR a widened same-class variant) → re-arm the
+                    // gate (same contract + reason as the PreToolUse hook).
                     crate::plan_gate::revoke(&cwd, "high_risk_command_delta");
                     format!(
                         "AI Bridge: `run` blocked — {}",
-                        crate::plan_gate::risk_delta_message(class)
+                        crate::plan_gate::risk_delta_reason(&delta)
                     )
                 } else {
                     run_command(command)
@@ -616,10 +617,11 @@ impl Server {
         // instantly — no minutes-long re-review. Bound to plan+repo+HEAD+policy, so
         // any change falls through to a full review (fail-safe). The gate still fired
         // for this task (start_epoch re-armed it on this prompt); we only skip the
-        // redundant Codex round, restoring EXACTLY the previously-reviewed classes.
-        if let Some(classes) = crate::plan_receipt::matching_classes(&cwd, plan, &self.plan_effort)
+        // redundant Codex round, restoring EXACTLY the previously-reviewed grants
+        // (class+shape) — never widening a grant a resume didn't record.
+        if let Some(grants) = crate::plan_receipt::matching_classes(&cwd, plan, &self.plan_effort)
         {
-            if crate::plan_gate::record_resume(&cwd, &epoch, plan, &classes) {
+            if crate::plan_gate::record_resume(&cwd, &epoch, plan, &grants) {
                 return "<AI-BRIDGE-APPROVE/> Plan APPROVED from a saved receipt — an identical \
                      plan was Codex-approved for this repo at this HEAD within the last 24h, so no \
                      fresh review was run (reload-resume). Writes/Bash are unlocked for this task. \
@@ -648,16 +650,12 @@ impl Server {
         let findings = gate::findings(&review);
         match crate::plan_gate::record(&cwd, &epoch, plan, &verdict, &findings) {
             crate::plan_gate::Outcome::Approved => {
-                // Save a receipt from the SAME classes the reviewer just authorized —
-                // parsed directly from THIS review's findings (the exact source record()
-                // used), NOT read back from mutable state — so the receipt can't drift
-                // from what was approved. Reached only on a real APPROVE.
-                let approved_classes: Vec<String> =
-                    crate::plan_gate::parse_risk_approved(&findings)
-                        .into_iter()
-                        .map(str::to_string)
-                        .collect();
-                crate::plan_receipt::write(&cwd, plan, &approved_classes, &self.plan_effort);
+                // Save a receipt from the SAME risk GRANTS the reviewer just authorized
+                // (class+shape) — parsed directly from THIS review's findings (the exact
+                // source record() used), NOT read back from mutable state — so the receipt
+                // can't drift from what was approved. Reached only on a real APPROVE.
+                let approved_grants = crate::plan_gate::parse_risk_grants(&findings);
+                crate::plan_receipt::write(&cwd, plan, &approved_grants, &self.plan_effort);
                 format!(
                     "<AI-BRIDGE-APPROVE/> Codex APPROVED the plan — writes/Bash are now unlocked \
                      for this task. Proceed with execution.\n\n{findings}"

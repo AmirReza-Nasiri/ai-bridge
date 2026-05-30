@@ -51,7 +51,7 @@ pub fn pretooluse(hook_input: &Value) -> String {
     // 1. Pre-approval plan gate: deny writes/Bash until the plan is Codex-approved
     //    (deny wins; merged here so a denied pre-approval Bash is never also
     //    rtk-rewritten, per Codex review).
-    if let Some(deny) = crate::plan_gate::enforce(cwd, tool_name) {
+    if let Some(deny) = crate::plan_gate::enforce_tool(cwd, tool_name, command) {
         return deny;
     }
     // 2. Post-approval risk delta: an APPROVED task attempting an unapproved
@@ -183,5 +183,40 @@ mod tests {
     fn unsafe_command_is_passthrough() {
         // even if rtk were present, an unsafe command must not be rewritten
         assert_eq!(pretooluse(&cmd("rm -rf build")), "{}");
+    }
+
+    #[test]
+    fn pretooluse_threads_command_to_plan_gate_but_p2_is_behavior_neutral() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let cwd = std::env::temp_dir().join(format!(
+            "aibridge-optimizer-p2-{}-{}",
+            std::process::id(),
+            n
+        ));
+        std::fs::create_dir_all(&cwd).unwrap();
+        let cwd = cwd.display().to_string();
+        // Enable an unapproved gate: a read-only-looking Bash command must STILL be
+        // denied pre-approval (the P2 carve-out is inert), and the deny carries the
+        // default no_active_approval code — proving the command is threaded through
+        // enforce_tool without yet enabling any pre-approval allowance.
+        crate::plan_gate::enable(&cwd).unwrap();
+        crate::plan_gate::start_epoch(&cwd, "sess", "task");
+        let payload = json!({
+            "tool_name": "Bash",
+            "cwd": cwd,
+            "tool_input": {"command": "ls -la src"}
+        });
+        let out = pretooluse(&payload);
+        let v: Value = serde_json::from_str(&out).expect("deny is valid json");
+        let reason = v
+            .pointer("/hookSpecificOutput/permissionDecisionReason")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(
+            reason.contains("PLAN_GATE_REQUIRED: no_active_approval"),
+            "flag-OFF / inert carve-out keeps the strict default, got: {reason}"
+        );
     }
 }

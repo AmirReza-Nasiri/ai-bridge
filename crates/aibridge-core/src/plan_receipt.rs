@@ -36,7 +36,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// gained the "process steps are not review criteria" + compile-deference clauses.
 /// v3: resume is no longer EXACT-HEAD only — a base that is an ancestor of HEAD may
 /// resume too (guarded; see `head_match` / `receipt_authorizes`).
-pub const PLAN_RECEIPT_VERSION: u32 = 3;
+/// v4 (v0.31 P3): risk grants are STRUCTURED (class+shape), so a flat-class v3 receipt
+/// must NOT silently authorize a WIDENED variant — every pre-v4 receipt fails closed
+/// (full review), and a v4 receipt carries a `risk_grants` array.
+pub const PLAN_RECEIPT_VERSION: u32 = 4;
 
 /// How long after approval a receipt may fast-path a reload-resume (24h — long
 /// enough to survive a reload/restart, short enough to bound replay).
@@ -111,15 +114,15 @@ pub(crate) enum HeadMatch {
 
 /// Pure authorization check: does this receipt JSON authorize a fast-path resume for
 /// `want_plan_hash` given the HEAD relation `head_match` and time `now`? Returns the
-/// approved command classes if EVERY binding holds; `None` otherwise (→ full review).
-/// No IO, so it is unit-testable.
+/// approved risk GRANTS (class+shape) if EVERY binding holds; `None` otherwise
+/// (→ full review). No IO, so it is unit-testable.
 fn receipt_authorizes(
     v: &Value,
     want_plan_hash: &str,
     head_match: HeadMatch,
     want_effort: &str,
     now: u128,
-) -> Option<Vec<String>> {
+) -> Option<Vec<crate::plan_gate::RiskGrant>> {
     if v.get("plan_receipt_version").and_then(Value::as_u64) != Some(PLAN_RECEIPT_VERSION as u64) {
         return None;
     }
@@ -144,30 +147,36 @@ fn receipt_authorizes(
     if created == 0 || now < created || now - created > RECEIPT_TTL_MS {
         return None;
     }
-    // `command_classes` MUST be present, an ARRAY, and contain ONLY KNOWN risk-class
-    // names — so a malformed/truncated/forged receipt fails safe (→ None, full review)
-    // instead of authorizing, and a resume can never restore an unrecognized class. An
-    // EMPTY array is valid and common (a plan that needs no high-risk command).
-    let arr = v.get("command_classes").and_then(Value::as_array)?;
-    let mut classes: Vec<String> = Vec::new();
+    // v4 (v0.31 P3): `risk_grants` MUST be present, an ARRAY, and contain ONLY well-formed
+    // grants — each an object with a KNOWN risk-class `class` and a KNOWN `shape`
+    // (standard/widened). A missing field (a v3 receipt that the version gate already
+    // rejected, or a truncated/forged v4), a non-array, a non-object element, an unknown
+    // class, or an unknown shape ALL fail safe (→ None, full review) — so a resume can
+    // never restore an unrecognized class or silently WIDEN a grant. An EMPTY array is
+    // valid and common (a plan that needs no high-risk command).
+    let arr = v.get("risk_grants").and_then(Value::as_array)?;
+    let mut grants: Vec<crate::plan_gate::RiskGrant> = Vec::new();
     for item in arr {
-        let s = item.as_str()?; // a non-string element ⇒ malformed ⇒ fail safe
-        if !crate::plan_gate::RISK_CLASSES.contains(&s) {
-            return None; // unknown class ⇒ fail safe (never restore an unreviewed class)
-        }
-        if !classes.iter().any(|c| c == s) {
-            classes.push(s.to_string()); // dedupe
+        // `from_value` accepts ONLY a well-formed object with a KNOWN class + KNOWN shape;
+        // a non-object element, unknown class, or unknown shape ⇒ None ⇒ fail safe (never
+        // restore an unreviewed class or silently widen a grant).
+        let g = crate::plan_gate::RiskGrant::from_value(item)?;
+        if !grants.contains(&g) {
+            grants.push(g); // dedupe
         }
     }
-    // HEAD relation gate (v3). Exact resumes with any classes (v1 behavior); an Ancestor
-    // (my own commits atop the reviewed base) resumes ONLY with NO high-risk classes — a
-    // plan that authorized publish/migrate/destructive still needs exact HEAD or a fresh
-    // review, since the security context can shift across those commits. (The committed
-    // delta itself is still Stop-reviewed: the frontier no longer advances past it.)
+    // HEAD relation gate (v3, extended for v4). Exact resumes with any grants (v1
+    // behavior); an Ancestor (my own commits atop the reviewed base) resumes ONLY when NO
+    // high-risk grants were authorized — a plan that authorized publish/migrate/destructive
+    // (or ANY widened variant) still needs exact HEAD or a fresh review, since the security
+    // context can shift across those commits. (The committed delta itself is still
+    // Stop-reviewed: the frontier no longer advances past it.) A non-empty grant set — even
+    // an all-standard one — keeps the v3 rule that any authorized high-risk class needs
+    // exact HEAD.
     match head_match {
         HeadMatch::No => None,
-        HeadMatch::Exact => Some(classes),
-        HeadMatch::Ancestor if classes.is_empty() => Some(classes),
+        HeadMatch::Exact => Some(grants),
+        HeadMatch::Ancestor if grants.is_empty() => Some(grants),
         HeadMatch::Ancestor => None,
     }
 }
@@ -190,10 +199,15 @@ fn head_match(cwd: &str, base_head: &str, head: &str) -> HeadMatch {
 }
 
 /// If a saved receipt authorizes a fast-path resume of `plan` for this repo at — or an
-/// ancestor of — the CURRENT HEAD within TTL, return the approved command classes to
-/// restore. `None` → the caller runs a full plan review. Fail-safe: an unborn repo (no
-/// HEAD to bind), a missing/corrupt receipt, or any binding mismatch all yield `None`.
-pub fn matching_classes(cwd: &str, plan: &str, want_effort: &str) -> Option<Vec<String>> {
+/// ancestor of — the CURRENT HEAD within TTL, return the approved risk GRANTS
+/// (class+shape) to restore. `None` → the caller runs a full plan review. Fail-safe: an
+/// unborn repo (no HEAD to bind), a missing/corrupt receipt, or any binding mismatch all
+/// yield `None`.
+pub fn matching_classes(
+    cwd: &str,
+    plan: &str,
+    want_effort: &str,
+) -> Option<Vec<crate::plan_gate::RiskGrant>> {
     let head = crate::git::head_oid(cwd)?; // unborn repo → nothing to bind → full review
     let path = receipt_path(cwd)?;
     let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).ok()?).ok()?;
@@ -208,11 +222,13 @@ pub fn matching_classes(cwd: &str, plan: &str, want_effort: &str) -> Option<Vec<
 }
 
 /// Write/refresh the receipt after a REAL Codex APPROVE so a later reload-resume of the
-/// SAME plan can fast-path. `effort` is the PINNED plan-review effort the review actually
-/// ran at (v0.30 #4) — stamped so a later server restart with a different effort forces a
-/// fresh review. Atomic temp+rename. Best-effort: an unborn repo / non-repo / unwritable
-/// home simply means no future fast-path.
-pub fn write(cwd: &str, plan: &str, command_classes: &[String], effort: &str) {
+/// SAME plan can fast-path. `grants` are the reviewer-authorized risk grants (class+shape,
+/// v0.31 P3). `effort` is the PINNED plan-review effort the review actually ran at
+/// (v0.30 #4) — stamped so a later server restart with a different effort forces a fresh
+/// review. Atomic temp+rename. Best-effort: an unborn repo / non-repo / unwritable home
+/// simply means no future fast-path. The legacy flat `command_classes` is written too
+/// (back-compat / display); the authoritative resume field is `risk_grants`.
+pub fn write(cwd: &str, plan: &str, grants: &[crate::plan_gate::RiskGrant], effort: &str) {
     let Some(head) = crate::git::head_oid(cwd) else {
         return;
     };
@@ -224,9 +240,11 @@ pub fn write(cwd: &str, plan: &str, command_classes: &[String], effort: &str) {
             return;
         }
     }
+    let command_classes: Vec<String> = grants.iter().map(|g| g.class.clone()).collect();
     let v = json!({
         "plan_hash": plan_hash(plan),
         "command_classes": command_classes,
+        "risk_grants": crate::plan_gate::RiskGrant::vec_to_value(grants),
         "base_head": head,
         "plan_receipt_version": PLAN_RECEIPT_VERSION,
         "plan_review_effort": effort,
@@ -256,10 +274,21 @@ mod tests {
         assert_eq!(h, plan_hash("the plan"));
     }
 
+    use crate::plan_gate::RiskGrant;
+
+    fn grant(class: &str, shape: &str) -> RiskGrant {
+        RiskGrant {
+            class: class.to_string(),
+            shape: shape.to_string(),
+        }
+    }
+
+    /// A v4 receipt carrying a single standard `remote-publish` risk grant.
     fn receipt(plan_hash_val: &str, head: &str, created_ms: u64, ver: u32) -> Value {
         json!({
             "plan_hash": plan_hash_val,
             "command_classes": ["remote-publish"],
+            "risk_grants": [{ "class": "remote-publish", "shape": "standard" }],
             "base_head": head,
             "plan_receipt_version": ver,
             "created_ms": created_ms,
@@ -273,17 +302,17 @@ mod tests {
         let head = "abc123";
         let good = receipt(&ph, head, now as u64, PLAN_RECEIPT_VERSION);
 
-        // Exact HEAD + all bindings → returns the approved classes.
+        // Exact HEAD + all bindings → returns the approved grants.
         assert_eq!(
             receipt_authorizes(&good, &ph, HeadMatch::Exact, "xhigh", now),
-            Some(vec!["remote-publish".to_string()])
+            Some(vec![grant("remote-publish", "standard")])
         );
         // No usable HEAD relation → no resume.
         assert_eq!(
             receipt_authorizes(&good, &ph, HeadMatch::No, "xhigh", now),
             None
         );
-        // Ancestor + NON-empty classes → no resume (high-risk needs exact HEAD). KEY guard.
+        // Ancestor + NON-empty grants → no resume (high-risk needs exact HEAD). KEY guard.
         assert_eq!(
             receipt_authorizes(&good, &ph, HeadMatch::Ancestor, "xhigh", now),
             None
@@ -299,10 +328,11 @@ mod tests {
             receipt_authorizes(&oldver, &ph, HeadMatch::Exact, "xhigh", now),
             None
         );
-        // A v2 receipt (the pre-v0.30 default) is stale after the v3 bump → no resume.
-        let v2 = receipt(&ph, head, now as u64, 2);
+        // A v3 receipt (the pre-P3 default, even with valid risk_grants) is stale after the
+        // v4 bump → no resume (so a flat-era receipt can never authorize a widened variant).
+        let v3 = receipt(&ph, head, now as u64, 3);
         assert_eq!(
-            receipt_authorizes(&v2, &ph, HeadMatch::Exact, "xhigh", now),
+            receipt_authorizes(&v3, &ph, HeadMatch::Exact, "xhigh", now),
             None
         );
         // Expired (older than TTL) → no resume.
@@ -342,20 +372,21 @@ mod tests {
             None
         );
 
-        // --- strict command_classes validation (fail-safe on malformed/forged) ---
-        let base = |classes: Value| {
+        // --- strict risk_grants validation (fail-safe on malformed/forged) ---
+        let base = |grants: Value| {
             json!({
                 "plan_hash": ph,
                 "base_head": head,
                 "plan_receipt_version": PLAN_RECEIPT_VERSION,
                 "created_ms": now as u64,
-                "command_classes": classes,
+                "risk_grants": grants,
             })
         };
-        // Missing command_classes entirely (truncated/old receipt) → no resume.
+        // Missing risk_grants entirely (truncated/old-shape receipt) → no resume.
         let no_field = json!({
             "plan_hash": ph, "base_head": head,
             "plan_receipt_version": PLAN_RECEIPT_VERSION, "created_ms": now as u64,
+            "command_classes": ["remote-publish"],
         });
         assert_eq!(
             receipt_authorizes(&no_field, &ph, HeadMatch::Exact, "xhigh", now),
@@ -375,7 +406,7 @@ mod tests {
         // Unknown class → no resume (never restore an unreviewed class).
         assert_eq!(
             receipt_authorizes(
-                &base(json!(["launch-missiles"])),
+                &base(json!([{ "class": "launch-missiles", "shape": "standard" }])),
                 &ph,
                 HeadMatch::Exact,
                 "xhigh",
@@ -383,13 +414,24 @@ mod tests {
             ),
             None
         );
-        // Non-string element → no resume.
+        // Unknown shape → no resume (never restore an unrecognized shape).
+        assert_eq!(
+            receipt_authorizes(
+                &base(json!([{ "class": "remote-publish", "shape": "bogus" }])),
+                &ph,
+                HeadMatch::Exact,
+                "xhigh",
+                now
+            ),
+            None
+        );
+        // Non-object element → no resume.
         assert_eq!(
             receipt_authorizes(&base(json!([123])), &ph, HeadMatch::Exact, "xhigh", now),
             None
         );
         // Empty array is VALID (a plan that needs no high-risk command) → authorized at
-        // BOTH Exact and Ancestor (the empty-classes case is the lenient-resume path).
+        // BOTH Exact and Ancestor (the empty-grants case is the lenient-resume path).
         assert_eq!(
             receipt_authorizes(&base(json!([])), &ph, HeadMatch::Exact, "xhigh", now),
             Some(vec![])
@@ -398,28 +440,47 @@ mod tests {
             receipt_authorizes(&base(json!([])), &ph, HeadMatch::Ancestor, "xhigh", now),
             Some(vec![])
         );
-        // Duplicate known classes are deduped (Exact).
+        // Duplicate known grants are deduped (Exact).
         assert_eq!(
             receipt_authorizes(
-                &base(json!(["db-migration", "db-migration"])),
+                &base(json!([
+                    { "class": "db-migration", "shape": "standard" },
+                    { "class": "db-migration", "shape": "standard" }
+                ])),
                 &ph,
                 HeadMatch::Exact,
                 "xhigh",
                 now
             ),
-            Some(vec!["db-migration".to_string()])
+            Some(vec![grant("db-migration", "standard")])
         );
+        // A WIDENED grant round-trips through the receipt (Exact).
+        assert_eq!(
+            receipt_authorizes(
+                &base(json!([{ "class": "remote-publish", "shape": "widened" }])),
+                &ph,
+                HeadMatch::Exact,
+                "xhigh",
+                now
+            ),
+            Some(vec![grant("remote-publish", "widened")])
+        );
+    }
+
+    #[test]
+    fn plan_receipt_version_is_four() {
+        assert_eq!(PLAN_RECEIPT_VERSION, 4);
     }
 
     #[test]
     fn receipt_effort_binding() {
         let now: u128 = 1_000_000_000_000;
         let ph = plan_hash("p");
-        // Build a receipt with empty classes (so the effort gate is the only variable) and
+        // Build a receipt with empty grants (so the effort gate is the only variable) and
         // an optional plan_review_effort (json!(null) ⇒ field ABSENT = pre-#4 legacy).
         let mk = |effort: Value| {
             let mut r = receipt(&ph, "abc123", now as u64, PLAN_RECEIPT_VERSION);
-            r["command_classes"] = json!([]);
+            r["risk_grants"] = json!([]);
             if !effort.is_null() {
                 r["plan_review_effort"] = effort;
             }
@@ -452,7 +513,7 @@ mod tests {
         // MALFORMED present value (non-string) → fail closed regardless of want.
         for bad in [json!(7), json!(["x"]), json!({"a": 1}), json!(null)] {
             let mut r = receipt(&ph, "abc123", now as u64, PLAN_RECEIPT_VERSION);
-            r["command_classes"] = json!([]);
+            r["risk_grants"] = json!([]);
             r["plan_review_effort"] = bad;
             assert_eq!(
                 receipt_authorizes(&r, &ph, HeadMatch::Exact, "xhigh", now),

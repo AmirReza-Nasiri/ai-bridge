@@ -665,4 +665,115 @@ mod tests {
             other => panic!("expected Commit base, got {other:?}"),
         }
     }
+
+    /// Run a git command in `repo`, asserting success (for the squash/reset setup).
+    fn git_ok_in(repo: &str, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .expect("git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn open_squashed_history_under_base_keeps_base_in_scope() {
+        // (P5-a) A squash/rebase REWRITES committed history under the recorded 'open'
+        // frontier base: C0 (base) → C1 → C2, then `reset --soft C0` + a single new
+        // commit Cs collapses C1+C2. C0 is still an ANCESTOR of Cs, and the net C0..Cs
+        // diff is non-empty, so the squashed work must stay in review scope: on_task_start
+        // must CARRY (keep base == C0), never baseline past the rewritten commits.
+        let repo = make_test_repo();
+        let s = "sess-squash-carry";
+        on_task_start(&repo, s); // base = C0, status open
+        let c0 = crate::git::head_oid(&repo).unwrap();
+        commit_file(&repo, "a.txt", "a"); // C1
+        commit_file(&repo, "b.txt", "b"); // C2 — both committed, never Stop-reviewed
+        // Squash C1+C2 into one new commit Cs (history rewrite under the base).
+        git_ok_in(&repo, &["reset", "--soft", &c0]);
+        git_ok_in(&repo, &["commit", "-m", "squashed a+b"]);
+        let cs = crate::git::head_oid(&repo).unwrap();
+        assert_ne!(cs, c0, "squash produced a new commit");
+        assert!(
+            crate::git::is_ancestor(&repo, &c0),
+            "C0 is still an ancestor of the squashed HEAD"
+        );
+        on_task_start(&repo, s); // open + non-empty C0..Cs → carry, not advance
+        let f = read(&repo, s).unwrap();
+        match f.base {
+            BaseKind::Commit(oid) => assert_eq!(
+                oid, c0,
+                "squashed work under the base stays in review scope (base kept at C0)"
+            ),
+            other => panic!("expected Commit base, got {other:?}"),
+        }
+        assert_eq!(f.status, STATUS_OPEN);
+    }
+
+    #[test]
+    fn open_orphaned_base_after_head_rewind_fails_safe_keeps_base() {
+        // (P5-b) The recorded 'open' frontier base C1 becomes UNREACHABLE when HEAD is
+        // rewound below it: record base = C1, then `reset --hard C0`. C1 is no longer an
+        // ancestor of HEAD, so committed_delta warns (diverged) — on_task_start must FAIL
+        // SAFE and keep the base, never silently advance past the orphaned commit.
+        let repo = make_test_repo();
+        let s = "sess-orphan-rewind";
+        let c0 = crate::git::head_oid(&repo).unwrap();
+        let c1 = commit_file(&repo, "a.txt", "a"); // C1
+        on_task_start(&repo, s); // base = C1, status open
+        assert_eq!(frontier_oid(&repo, s).as_deref(), Some(c1.as_str()));
+        // Rewind HEAD below the recorded base so C1 is orphaned / no longer an ancestor.
+        git_ok_in(&repo, &["reset", "--hard", &c0]);
+        assert!(
+            !crate::git::is_ancestor(&repo, &c1),
+            "after rewind C1 is no longer an ancestor of HEAD"
+        );
+        on_task_start(&repo, s); // orphaned base ⇒ warning ⇒ unreviewed ⇒ keep base
+        let f = read(&repo, s).unwrap();
+        match f.base {
+            BaseKind::Commit(oid) => assert_eq!(
+                oid, c1,
+                "fail-safe: kept the orphaned base C1 instead of advancing to the rewound HEAD"
+            ),
+            other => panic!("expected Commit base, got {other:?}"),
+        }
+        assert_eq!(f.status, STATUS_OPEN);
+    }
+
+    #[test]
+    fn checkpoint_reconciles_head_moved_while_base_still_ancestor() {
+        // (P5-c) The legitimate ancestor-advance: base = C0, commit C1 (C0 is still an
+        // ancestor of HEAD), clean tree, and the reviewed head equals current HEAD.
+        // checkpoint_approved must reconcile by advancing the base to C1 with APPROVED.
+        let repo = make_test_repo();
+        let s = "sess-ancestor-advance";
+        on_task_start(&repo, s); // base = C0
+        let c0 = crate::git::head_oid(&repo).unwrap();
+        let c1 = commit_file(&repo, "a.txt", "a"); // C1 — HEAD moved, C0 still ancestor
+        assert!(
+            crate::git::is_ancestor(&repo, &c0),
+            "C0 is still an ancestor of C1"
+        );
+        checkpoint_approved(&repo, s, &c1).expect("clean tree + HEAD==reviewed_head ⇒ advance");
+        let f = read(&repo, s).unwrap();
+        match f.base {
+            BaseKind::Commit(oid) => {
+                assert_eq!(oid, c1, "base reconciled forward to the reviewed HEAD C1")
+            }
+            other => panic!("expected Commit base, got {other:?}"),
+        }
+        assert_eq!(f.status, STATUS_APPROVED);
+    }
+
+    /// The recorded frontier base oid for (repo, session), or None when not a Commit base.
+    fn frontier_oid(repo: &str, session: &str) -> Option<String> {
+        match read(repo, session).map(|f| f.base) {
+            Some(BaseKind::Commit(o)) => Some(o),
+            _ => None,
+        }
+    }
 }
