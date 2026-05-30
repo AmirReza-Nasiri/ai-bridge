@@ -770,7 +770,8 @@ impl BlockReason {
                 "this task has no Codex-approved plan yet. Do NOT retry this tool. First gather \
                  context with Read/Grep/Glob, form a todolist, then call the MCP tool \
                  `mcp__aibridge__plan_gate` with a structured plan (todos, approach, \
-                 intended_files, risk_surfaces, test_plan). Revise and call it again until it \
+                 intended_files, risk_surfaces, test_plan — and, IF the task writes files, an \
+                 `ALLOWED-GLOBS:` line declaring them). Revise and call it again until it \
                  returns <AI-BRIDGE-APPROVE/>; only then will writes/Bash be allowed. If \
                  `mcp__aibridge__plan_gate` is NOT available, AI Bridge was just installed/updated \
                  — the tool connects only after a Claude Code restart: restart Claude Code, or \
@@ -1817,6 +1818,17 @@ pub fn prompt(plan: &str) -> String {
          `git push` but NOT a force/mirror/tags/delete push, and not tag publication). To \
          authorize a WIDENED variant, write `class:widened` (e.g. `remote-publish:widened`); only \
          do so when the plan genuinely needs that more-destructive form.\n\
+         2b. FILE SCOPE (optional): if the plan declares a machine-readable `ALLOWED-GLOBS:` \
+         line (the files it intends to write), ECHO each glob you APPROVE as its OWN standalone \
+         `SCOPE-APPROVED: <glob>` line (one glob per line, verbatim). A glob you do NOT echo is \
+         treated as out-of-scope. Breadth policy: echo an exact-file glob (`src/foo.rs`) or a \
+         single-directory-level glob (`dir/*`, `*.rs`) normally; for a RECURSIVE glob — any \
+         NON-leading `**`, e.g. `dir/**` or `src/**/*.rs` — you must ALSO add a \
+         `RISK-APPROVED: broad-scope` line (a scope-BREADTH grant, NOT a command class) to \
+         authorize that breadth, and only when the plan genuinely needs a whole subtree. NEVER \
+         echo a repo-wide or unsupported glob — bare `*`, bare `**`, `**/*`, any LEADING `**` \
+         (e.g. `**/*.rs`), `.`, or any rooted/`..`/drive/`?`/`[`/`{{` form — those are always \
+         dropped.\n\
          3. A final line that is EXACTLY one of:\n\
          <AI-BRIDGE-APPROVE/>       (plan is good to execute)\n\
          <AI-BRIDGE-REQUEST-CHANGES/> (revise the plan as noted)\n\
@@ -1838,6 +1850,37 @@ mod tests {
             std::env::temp_dir().join(format!("aibridge-plangate-{}-{}", std::process::id(), n));
         std::fs::create_dir_all(&p).unwrap();
         p.display().to_string()
+    }
+
+    #[test]
+    fn prompt_includes_file_scope_protocol() {
+        let p = prompt("ALLOWED-GLOBS: src/a.rs");
+        // The reviewer is told to echo each approved glob.
+        assert!(p.contains("SCOPE-APPROVED"), "prompt must instruct SCOPE-APPROVED echoes");
+        // `broad-scope` is framed as a scope-breadth grant (FILE SCOPE section), and the
+        // command-class RISK-APPROVED list must NOT be polluted with it.
+        assert!(p.contains("broad-scope"));
+        assert!(p.contains("scope-BREADTH grant"));
+        let cmd_line = p
+            .lines()
+            .find(|l| l.contains("comma-separated subset of"))
+            .expect("the command RISK-APPROVED list line");
+        assert!(
+            !cmd_line.contains("broad-scope"),
+            "broad-scope must NOT appear in the command-class list"
+        );
+        // Repo-wide policy text covers leading `**` / `**/*`.
+        assert!(p.contains("**/*"));
+        assert!(p.contains("LEADING"));
+        // The brace example renders literally (guards the `{{` format-string escaping).
+        assert!(p.contains("`{`"), "the brace glob example must render as a literal `{{`");
+    }
+
+    #[test]
+    fn no_active_approval_hint_mentions_allowed_globs() {
+        assert!(BlockReason::NoActiveApproval
+            .recovery_hint()
+            .contains("ALLOWED-GLOBS"));
     }
 
     #[test]
