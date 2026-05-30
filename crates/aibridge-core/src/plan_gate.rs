@@ -741,6 +741,26 @@ fn push_is_widened(tokens: &[&str]) -> bool {
         || tokens.windows(2).any(|w| w[0] == "tag" && !w[1].is_empty())
 }
 
+/// True when ANY `git push` SUB-COMMAND in `lowered` is a widened push. Segments the
+/// command on shell separators FIRST, so widening flags from a SIBLING sub-command (e.g.
+/// the `-f` in `git push origin main && rm -f stale.log`, or a `:done`/`+x` operand) can't
+/// leak into a plain push's shape. Only the segment that actually contains `git … push`
+/// is inspected by [`push_is_widened`]. (Class detection still uses the flattened tokens;
+/// only SHAPE is segment-scoped — over-broad class detection merely fails closed.)
+fn git_push_is_widened(lowered: &str) -> bool {
+    lowered
+        .split(|c: char| "|&;\n\r()".contains(c))
+        .any(|segment| {
+            let toks: Vec<&str> = segment
+                .split_whitespace()
+                .map(|t| t.trim_matches(|c: char| "`'\".,!?".contains(c)))
+                .filter(|t| !t.is_empty())
+                .collect();
+            let is_push = toks.iter().any(|t| token_is_cmd(t, "git")) && toks.contains(&"push");
+            is_push && push_is_widened(&toks)
+        })
+}
+
 /// Scan free text (a command OR a plan) for ALL high-risk command grants present, each
 /// as a `(class, shape)` [`RiskGrant`]. Token-based (not raw substring) so `warm -reset`/
 /// `git pushd`/a path containing a risk phrase don't false-trigger, and `git.exe push`/
@@ -808,7 +828,7 @@ fn scan_risk_grants(text: &str) -> Vec<RiskGrant> {
         // SHAPE is `widened` only for a widened `git push` (the one push family whose
         // flags meaningfully broaden destructiveness within the class). Other publish
         // forms stay `standard` for v1.
-        let shape = if is_git_push && push_is_widened(&tokens) {
+        let shape = if is_git_push && git_push_is_widened(&lowered) {
             SHAPE_WIDENED
         } else {
             SHAPE_STANDARD
@@ -2319,6 +2339,50 @@ mod tests {
             unapproved_high_risk(&cwd, "Bash", "git push origin main"),
             None
         );
+    }
+
+    #[test]
+    fn chained_plain_push_is_not_widened_by_a_sibling_subcommand() {
+        // Regression: a plain `git push` chained with a sibling sub-command that happens to
+        // carry an `-f`/`-d`/leading-`+`/leading-`:` token must STAY standard — the widening
+        // flags belong to the sibling, not the push. (Pre-fix, scan_risk_grants flattened ALL
+        // sub-commands into one token list and mis-flagged these as widened → over-strict.)
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "deploy");
+        record(
+            &cwd,
+            &current_epoch(&cwd),
+            "deploy plan",
+            &crate::gate::Verdict::Approve,
+            "ok\nRISK-APPROVED: remote-publish",
+        );
+        // NB: each sibling here is NOT itself a risk class (`rm -f` without -r is not
+        // destructive-fs), so the ONLY grant in play is the push — isolating the shape bug.
+        for cmd in [
+            "git push origin main && rm -f stale.log", // -f in a sibling
+            "git push origin main && git branch -d feature", // -d in a sibling
+            "git push origin main && chmod +x foo",    // leading-+ in a sibling
+            "git push origin main && echo :done",      // leading-: in a sibling
+            "git push origin main; tar -df archive.tar", // clustered -df in a sibling
+        ] {
+            assert_eq!(
+                unapproved_high_risk(&cwd, "Bash", cmd),
+                None,
+                "plain push chained with a sibling must stay standard: {cmd}"
+            );
+        }
+        // …but a genuinely widened push chained with anything STILL re-gates.
+        for cmd in [
+            "git push --force origin main && echo done",
+            "echo start && git push origin :stale",
+        ] {
+            assert_eq!(
+                unapproved_high_risk(&cwd, "Bash", cmd),
+                Some("remote-publish"),
+                "widened push in a chain must still re-gate: {cmd}"
+            );
+        }
     }
 
     #[test]
