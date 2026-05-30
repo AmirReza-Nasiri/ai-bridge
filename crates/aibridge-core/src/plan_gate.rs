@@ -343,49 +343,77 @@ fn classify_turn(prompt: &str) -> TurnClass {
     TurnClass::UnknownDelta
 }
 
-/// Pure decision for [`start_epoch`]: given the flag + whether a plan is currently
-/// approved + the prompt's class, should we PRESERVE the approved epoch (recording a
-/// pending user-turn marker for the PreToolUse authority) or start a FRESH epoch?
-/// `true` = preserve. Kept pure so the policy is unit-testable without config/IO.
+/// Pure decision for [`start_epoch`]: given the flag + whether a plan is currently approved +
+/// whether a REAL enforced file scope is in force + the prompt's class, should we PRESERVE the
+/// approved epoch (recording a pending user-turn marker for the PreToolUse authority) or start a
+/// FRESH epoch? `true` = preserve. Kept pure so the policy is unit-testable without config/IO.
+///
+/// v0.32 Unit 5: `scope_enforced` couples preservation to an active write-time fence — an
+/// approval may only be carried across a user turn when its writes are confined to a non-empty
+/// reviewer-approved scope (so an out-of-scope write a "trivial yes" might smuggle in is fenced
+/// by Unit 4). A non-declaring / declared-but-empty / corrupt scope re-arms exactly as today.
 fn preserve_epoch_decision(
     reset_on_user_turn: bool,
     currently_approved: bool,
+    scope_enforced: bool,
     class: TurnClass,
 ) -> bool {
-    if reset_on_user_turn || !currently_approved {
+    if reset_on_user_turn || !currently_approved || !scope_enforced {
         return false; // default behavior: every prompt re-arms a fresh epoch
     }
-    // Flag OFF + an approved plan in flight: preserve unless the user explicitly reset.
+    // Flag OFF + an approved, scope-fenced plan in flight: preserve unless the user explicitly reset.
     !matches!(class, TurnClass::ExplicitReset)
 }
 
-/// v0.31 P1: whether state-based invalidation may actually PRESERVE an approval across a
-/// user turn. Returns `false` in v0.31 — the preserve path is sound for high-risk (P3 still
-/// re-gates) but NOT for ordinary out-of-scope writes, because a short-lived hook cannot tell
-/// a bare affirmation ("yes"/"ok") that CONTINUES the plan from one that ANSWERS a
-/// scope-broadening question ("also update X?") — it has no prior-assistant context. Until a
-/// PreToolUse tool-context file-scope check (re-gate writes outside the approved files) lands,
-/// keeping this const-false makes the `resetOnUserTurn=false` preserve path INERT, so the gate
-/// never fails open. The classify/reconcile machinery + tests stay so the follow-up only flips
-/// this const + adds the scope check. (Mirrors P2's `read_only_execution_supported`.)
+/// v0.32 Unit 5: whether a REAL enforced file scope is currently in force — i.e. the approved
+/// epoch has a present, non-empty, all-valid `approved_allowed_globs` ([`ScopeState::Globs`]).
+/// A non-declaring scope ([`ScopeState::None`]), a declared-but-empty scope
+/// ([`ScopeState::DenyAll`]), or corrupt scope state ([`ScopeState::Corrupt`]) is NOT a basis to
+/// preserve an approval across a user turn (fail closed → re-arm).
+fn scope_is_enforced(cwd: &str) -> bool {
+    matches!(scope_in_force_state(cwd), ScopeState::Globs(_))
+}
+
+/// v0.31 P1 / v0.32 Unit 5: whether state-based invalidation may actually PRESERVE an approval
+/// across a user turn. Returns `true` as of Unit 4 — the missing piece (a PreToolUse tool-context
+/// file-scope check that re-gates writes outside the approved files) now exists ([`scope_fence`]),
+/// so a preserved approval can no longer fail open on ordinary out-of-scope WRITE-tool writes:
+/// those are denied at write-time. Preservation is additionally coupled to an active enforced
+/// scope ([`scope_is_enforced`]) and stays behind `planGate.resetOnUserTurn=false` (DEFAULT TRUE,
+/// so the default behavior is byte-identical). Accepted residual: Bash/`mcp__aibridge__run` are
+/// NOT fenced (an out-of-scope write through them is caught only by the Stop-gate), and a
+/// bare-affirmation that broadened the objective WITHIN the approved files is Stop-only; high-risk
+/// commands still re-gate via the P3 risk-delta check. (Mirrors P2's `read_only_execution_supported`.)
 fn p1_state_invalidation_supported() -> bool {
-    false
+    true
 }
 
 /// Begin a fresh PENDING epoch for a new task (called by the UserPromptSubmit hook),
 /// UNLESS state-based invalidation is supported AND `planGate.resetOnUserTurn` is false AND a
-/// plan is currently approved AND the prompt is not an explicit reset — in which case the
-/// approved epoch is PRESERVED and a pending user-turn marker is recorded for the PreToolUse
-/// authority to reconcile before the next mutator. The epoch id ties an approval to THIS task
-/// so a later prompt re-gates. In v0.31 the preserve path is INERT (see
-/// [`p1_state_invalidation_supported`]), so this always re-arms a fresh epoch — byte-identical
-/// to pre-P1 regardless of the `resetOnUserTurn` config.
+/// plan is currently approved AND a real enforced scope is in force AND the prompt is not an
+/// explicit reset — in which case the approved epoch is PRESERVED and a pending user-turn marker
+/// is recorded for the PreToolUse authority to reconcile before the next mutator. The epoch id
+/// ties an approval to THIS task so a later prompt re-gates. With the default `resetOnUserTurn`
+/// (true) this always re-arms a fresh epoch — byte-identical to pre-P1.
 pub fn start_epoch(cwd: &str, session: &str, prompt: &str) {
+    start_epoch_inner(
+        cwd,
+        session,
+        prompt,
+        crate::review_mcp::reset_on_user_turn(),
+    )
+}
+
+/// [`start_epoch`] with the `resetOnUserTurn` config value INJECTED, so the opt-in preservation
+/// path is unit-testable without real-HOME config IO. The public wrapper supplies the on-disk
+/// value; behavior is otherwise identical.
+fn start_epoch_inner(cwd: &str, session: &str, prompt: &str, reset_on_user_turn: bool) {
     let class = classify_turn(prompt);
     if p1_state_invalidation_supported()
         && preserve_epoch_decision(
-            crate::review_mcp::reset_on_user_turn(),
+            reset_on_user_turn,
             is_approved(cwd),
+            scope_is_enforced(cwd),
             class,
         )
     {
@@ -3360,14 +3388,126 @@ mod tests {
     fn preserve_epoch_decision_is_invalidate_unless_trivially_safe() {
         use TurnClass::*;
         // Flag ON (default) → never preserve (today's per-turn reset).
-        assert!(!preserve_epoch_decision(true, true, TrivialContinue));
+        assert!(!preserve_epoch_decision(true, true, true, TrivialContinue));
         // No current approval → nothing to preserve.
-        assert!(!preserve_epoch_decision(false, false, TrivialContinue));
-        // Flag OFF + approved: preserve for trivial AND unknown (the marker defers the
-        // authoritative decision to reconcile), but NOT for an explicit reset.
-        assert!(preserve_epoch_decision(false, true, TrivialContinue));
-        assert!(preserve_epoch_decision(false, true, UnknownDelta));
-        assert!(!preserve_epoch_decision(false, true, ExplicitReset));
+        assert!(!preserve_epoch_decision(false, false, true, TrivialContinue));
+        // v0.32 Unit 5: no real enforced scope → never preserve (fail closed → re-arm).
+        assert!(!preserve_epoch_decision(false, true, false, TrivialContinue));
+        assert!(!preserve_epoch_decision(false, true, false, UnknownDelta));
+        // Flag OFF + approved + enforced scope: preserve for trivial AND unknown (the marker
+        // defers the authoritative decision to reconcile), but NOT for an explicit reset.
+        assert!(preserve_epoch_decision(false, true, true, TrivialContinue));
+        assert!(preserve_epoch_decision(false, true, true, UnknownDelta));
+        assert!(!preserve_epoch_decision(false, true, true, ExplicitReset));
+    }
+
+    #[test]
+    fn p1_state_invalidation_now_supported() {
+        // v0.32 Unit 5 flipped this on (Unit 4 provides the write-time scope fence it waited for).
+        assert!(p1_state_invalidation_supported());
+    }
+
+    // A throwaway APPROVED epoch with an explicit `approved_allowed_globs` + `approved_scope_declared`,
+    // so each ScopeState (Globs / None / DenyAll / Corrupt) can be set up for the Unit-5 tests.
+    fn approve_with_scope_state(cwd: &str, globs: Value, declared: bool) {
+        enable(cwd).unwrap();
+        start_epoch(cwd, "sess", "task");
+        let epoch = current_epoch(cwd);
+        let s = json!({
+            "epoch": epoch,
+            "approved": true,
+            "approved_epoch": epoch,
+            "approved_plan_hash": hash_str("the plan"),
+            "approved_allowed_globs": globs,
+            "approved_scope_declared": declared,
+            "status": "approved",
+            "rounds": 1,
+            "same_findings": 0,
+        });
+        write_state(cwd, &s).unwrap();
+        assert!(!blocks_writes(cwd));
+    }
+
+    #[test]
+    fn scope_is_enforced_only_for_real_nonempty_scope() {
+        let g = tmp();
+        approve_with_scope_state(&g, json!(["src/a.rs"]), true);
+        assert!(scope_is_enforced(&g), "Globs → enforced");
+        let none = tmp();
+        approve_with_scope_state(&none, json!([]), false);
+        assert!(!scope_is_enforced(&none), "empty/non-declaring (None) → not enforced");
+        let denyall = tmp();
+        approve_with_scope_state(&denyall, json!([]), true);
+        assert!(!scope_is_enforced(&denyall), "declared-but-empty (DenyAll) → not enforced");
+        let corrupt = tmp();
+        approve_with_scope_state(&corrupt, json!("oops"), false);
+        assert!(!scope_is_enforced(&corrupt), "corrupt → not enforced");
+    }
+
+    #[test]
+    fn start_epoch_preserves_trivial_continue_with_enforced_scope() {
+        // resetOnUserTurn=false + approved + Globs scope + a trivial "ok" → SAME epoch preserved,
+        // a trivial_continue marker recorded, effective approval suspended until reconciled.
+        let cwd = tmp();
+        approve_with_scope_state(&cwd, json!(["src/a.rs"]), true);
+        let epoch_before = current_epoch(&cwd);
+        start_epoch_inner(&cwd, "sess", "ok", false);
+        assert_eq!(current_epoch(&cwd), epoch_before, "epoch preserved, not re-armed");
+        assert!(has_pending_user_turn(&cwd), "a pending user-turn marker is recorded");
+        assert_eq!(
+            read_state(&cwd).unwrap()["pending_user_turn"]["classification"],
+            json!(TurnClass::TrivialContinue.as_marker())
+        );
+        assert!(!effectively_approved(&cwd), "suspended until PreToolUse reconciles");
+    }
+
+    #[test]
+    fn start_epoch_rearms_trivial_continue_without_enforced_scope() {
+        // resetOnUserTurn=false + approved but NO real enforced scope (None / DenyAll / Corrupt)
+        // → re-arm a fresh epoch (fail closed): no preserved approval, no marker.
+        for (globs, declared) in [(json!([]), false), (json!([]), true), (json!("x"), false)] {
+            let cwd = tmp();
+            approve_with_scope_state(&cwd, globs.clone(), declared);
+            let epoch_before = current_epoch(&cwd);
+            start_epoch_inner(&cwd, "sess", "ok", false);
+            assert_ne!(
+                current_epoch(&cwd),
+                epoch_before,
+                "no enforced scope must re-arm (globs={globs}, declared={declared})"
+            );
+            assert!(!is_approved(&cwd), "prior approval not carried over");
+            assert!(blocks_writes(&cwd));
+            assert!(!has_pending_user_turn(&cwd), "no preserve marker");
+        }
+    }
+
+    #[test]
+    fn start_epoch_marks_unknown_delta_then_pretooluse_regates() {
+        // resetOnUserTurn=false + approved + Globs scope + a non-trivial turn → preserved as an
+        // unknown_delta marker, then the next mutator re-gates with user_scope_delta (reconcile
+        // runs BEFORE the scope fence) and revokes approval.
+        let cwd = tmp();
+        approve_with_scope_state(&cwd, json!(["src/a.rs"]), true);
+        start_epoch_inner(&cwd, "sess", "also add a delete endpoint", false);
+        assert_eq!(
+            read_state(&cwd).unwrap()["pending_user_turn"]["classification"],
+            json!(TurnClass::UnknownDelta.as_marker())
+        );
+        let deny = enforce_tool_scoped(&cwd, "Write", WriteTarget::Path("src/a.rs"), "")
+            .expect("unknown-delta turn must re-gate the next write");
+        assert!(deny_code(&deny).contains("user_scope_delta"));
+        assert!(!is_approved(&cwd), "scope-delta turn revokes approval");
+    }
+
+    #[test]
+    fn start_epoch_default_reset_mode_rearms_even_with_enforced_scope() {
+        // The DEFAULT (resetOnUserTurn=true) re-arms every prompt regardless of scope.
+        let cwd = tmp();
+        approve_with_scope_state(&cwd, json!(["src/a.rs"]), true);
+        let epoch_before = current_epoch(&cwd);
+        start_epoch_inner(&cwd, "sess", "ok", true);
+        assert_ne!(current_epoch(&cwd), epoch_before, "default mode re-arms");
+        assert!(!has_pending_user_turn(&cwd));
     }
 
     #[test]
