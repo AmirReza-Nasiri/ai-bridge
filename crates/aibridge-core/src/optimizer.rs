@@ -48,10 +48,33 @@ pub fn pretooluse(hook_input: &Value) -> String {
         .and_then(|t| t.get("command"))
         .and_then(Value::as_str)
         .unwrap_or("");
+    // v0.32 Unit 4: extract the authoritative write target for the post-approval scope fence.
+    // Read ONLY the field this tool actually uses (NotebookEdit → `notebook_path`; every other
+    // gated write tool → `file_path`) so a payload carrying BOTH cannot trick the fence into
+    // checking the wrong path. A present non-empty value is the target; an absent/empty/non-string
+    // one becomes `Missing` so the fence fails closed under an active scope. Non-write tools
+    // carry no target.
+    let target = if crate::plan_gate::GATED_WRITE_TOOLS.contains(&tool_name) {
+        let field = if tool_name == "NotebookEdit" {
+            "notebook_path"
+        } else {
+            "file_path"
+        };
+        match tool_input_opt
+            .and_then(|t| t.get(field))
+            .and_then(Value::as_str)
+        {
+            Some(p) if !p.is_empty() => crate::plan_gate::WriteTarget::Path(p),
+            _ => crate::plan_gate::WriteTarget::Missing,
+        }
+    } else {
+        crate::plan_gate::WriteTarget::Unknown
+    };
     // 1. Pre-approval plan gate: deny writes/Bash until the plan is Codex-approved
     //    (deny wins; merged here so a denied pre-approval Bash is never also
-    //    rtk-rewritten, per Codex review).
-    if let Some(deny) = crate::plan_gate::enforce_tool(cwd, tool_name, command) {
+    //    rtk-rewritten, per Codex review). Post-approval, the same call applies the
+    //    v0.32 write-time scope fence for path-bearing write tools.
+    if let Some(deny) = crate::plan_gate::enforce_tool_scoped(cwd, tool_name, target, command) {
         return deny;
     }
     // 2. Post-approval risk delta: an APPROVED task attempting an unapproved
@@ -218,5 +241,145 @@ mod tests {
             reason.contains("PLAN_GATE_REQUIRED: no_active_approval"),
             "flag-OFF / inert carve-out keeps the strict default, got: {reason}"
         );
+    }
+
+    // ── v0.32 Unit 4: pretooluse extracts the write target + applies the scope fence ─────
+    //
+    // An APPROVED epoch whose reviewer-approved scope is exactly `src/a.rs` (declared in the
+    // plan, echoed by the reviewer).
+    fn scoped_cwd() -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let cwd = std::env::temp_dir().join(format!(
+            "aibridge-opt-scope-{}-{}",
+            std::process::id(),
+            n
+        ));
+        std::fs::create_dir_all(&cwd).unwrap();
+        let cwd = cwd.display().to_string();
+        crate::plan_gate::enable(&cwd).unwrap();
+        crate::plan_gate::start_epoch(&cwd, "sess", "task");
+        let ep = crate::plan_gate::current_epoch(&cwd);
+        assert!(matches!(
+            crate::plan_gate::record(
+                &cwd,
+                &ep,
+                "ALLOWED-GLOBS: src/a.rs",
+                &crate::gate::Verdict::Approve,
+                "SCOPE-APPROVED: src/a.rs",
+            ),
+            crate::plan_gate::Outcome::Approved
+        ));
+        cwd
+    }
+
+    #[test]
+    fn pretooluse_allows_in_scope_write() {
+        let cwd = scoped_cwd();
+        let out = pretooluse(&json!({
+            "tool_name": "Write",
+            "cwd": cwd,
+            "tool_input": {"file_path": "src/a.rs"}
+        }));
+        assert_eq!(out, "{}", "in-scope write must pass through unchanged");
+    }
+
+    #[test]
+    fn pretooluse_denies_out_of_scope_write() {
+        let cwd = scoped_cwd();
+        let out = pretooluse(&json!({
+            "tool_name": "Write",
+            "cwd": cwd,
+            "tool_input": {"file_path": "src/b.rs"}
+        }));
+        assert!(out.contains("out_of_scope_path"), "got: {out}");
+        assert!(out.contains("\"deny\""));
+    }
+
+    #[test]
+    fn pretooluse_denies_write_with_missing_path_under_scope() {
+        // A gated write tool whose authoritative payload has no `file_path` fails closed.
+        let cwd = scoped_cwd();
+        let out = pretooluse(&json!({
+            "tool_name": "Write",
+            "cwd": cwd,
+            "tool_input": {}
+        }));
+        assert!(out.contains("out_of_scope_path"), "got: {out}");
+    }
+
+    #[test]
+    fn pretooluse_extracts_notebook_path() {
+        // NotebookEdit carries `notebook_path` (not `file_path`); an out-of-scope one denies.
+        let cwd = scoped_cwd();
+        let out = pretooluse(&json!({
+            "tool_name": "NotebookEdit",
+            "cwd": cwd,
+            "tool_input": {"notebook_path": "src/b.ipynb"}
+        }));
+        assert!(out.contains("out_of_scope_path"), "got: {out}");
+    }
+
+    #[test]
+    fn pretooluse_leaves_bash_free_under_scope() {
+        // Owner-accepted residual: Bash is not fenced (the Stop-gate is its backstop).
+        let cwd = scoped_cwd();
+        let out = pretooluse(&json!({
+            "tool_name": "Bash",
+            "cwd": cwd,
+            "tool_input": {"command": "echo hello"}
+        }));
+        assert!(!out.contains("out_of_scope_path"), "Bash must not be scope-fenced, got: {out}");
+        assert!(!out.contains("\"deny\""), "got: {out}");
+    }
+
+    #[test]
+    fn pretooluse_denies_all_when_scope_declared_but_unapproved() {
+        // End-to-end: a plan DECLARES `src/**` but the reviewer never grants `broad-scope`, so
+        // the recursive glob is dropped and ZERO globs are approved. The fence must DENY every
+        // write (declared-but-empty ⇒ DenyAll) — NOT treat the empty scope as "no scope".
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let cwd = std::env::temp_dir().join(format!(
+            "aibridge-opt-emptyscope-{}-{}",
+            std::process::id(),
+            n
+        ));
+        std::fs::create_dir_all(&cwd).unwrap();
+        let cwd = cwd.display().to_string();
+        crate::plan_gate::enable(&cwd).unwrap();
+        crate::plan_gate::start_epoch(&cwd, "sess", "task");
+        let ep = crate::plan_gate::current_epoch(&cwd);
+        assert!(matches!(
+            crate::plan_gate::record(
+                &cwd,
+                &ep,
+                "ALLOWED-GLOBS: src/**",
+                &crate::gate::Verdict::Approve,
+                "SCOPE-APPROVED: src/**", // echoed, but NO `RISK-APPROVED: broad-scope` → dropped
+            ),
+            crate::plan_gate::Outcome::Approved
+        ));
+        let out = pretooluse(&json!({
+            "tool_name": "Write",
+            "cwd": cwd,
+            "tool_input": {"file_path": "secrets.txt"}
+        }));
+        assert!(out.contains("out_of_scope_path"), "declared-but-empty scope must deny, got: {out}");
+    }
+
+    #[test]
+    fn pretooluse_notebook_edit_ignores_file_path_field() {
+        // A NotebookEdit payload carrying BOTH an in-scope `file_path` and an out-of-scope
+        // `notebook_path` must be checked on `notebook_path` (the field it actually writes).
+        let cwd = scoped_cwd(); // scope = src/a.rs
+        let out = pretooluse(&json!({
+            "tool_name": "NotebookEdit",
+            "cwd": cwd,
+            "tool_input": {"file_path": "src/a.rs", "notebook_path": "outside.ipynb"}
+        }));
+        assert!(out.contains("out_of_scope_path"), "must check notebook_path, not file_path; got: {out}");
     }
 }

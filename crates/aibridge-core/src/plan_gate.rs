@@ -662,11 +662,38 @@ fn read_only_execution_supported() -> bool {
     false
 }
 
-/// PreToolUse enforcement with the Bash command threaded in: `Some(deny_json)` to block
-/// a write/Bash before approval, `None` to let the caller proceed (incl. its own rtk
-/// handling for Bash). The command is only consulted on the Bash read-only-orientation
-/// path; for every other tool (and an empty command) the decision is exactly as before.
+/// Tool-context for the v0.32 Unit 4 write-time scope fence. A tri-state so the fence fails
+/// CLOSED on a missing authoritative path while staying INERT for legacy callers:
+/// - `Unknown` — no tool-context (the legacy `enforce`/`enforce_tool` surfaces) → the scope
+///   fence is skipped entirely (byte-identical pre-Unit-4 behavior).
+/// - `Missing` — the authoritative PreToolUse path for a gated WRITE tool that yielded NO
+///   usable path (absent/non-string/empty `file_path`|`notebook_path`) → DENY under an active
+///   non-empty scope (a write with no checkable target must not slip the fence).
+/// - `Path(p)` — a concrete extracted target → canonicalize + scope-check.
+pub enum WriteTarget<'a> {
+    Unknown,
+    Missing,
+    Path(&'a str),
+}
+
+/// PreToolUse enforcement (legacy 3-arg surface): forwards with NO tool-context, so the
+/// v0.32 scope fence stays inert and every existing 3-arg caller is byte-identical.
 pub fn enforce_tool(cwd: &str, tool_name: &str, command: &str) -> Option<String> {
+    enforce_tool_scoped(cwd, tool_name, WriteTarget::Unknown, command)
+}
+
+/// PreToolUse enforcement with tool-context (v0.32 Unit 4): the same pre-approval gate as
+/// before, PLUS a post-approval write-time scope fence ([`scope_fence`]) for path-bearing
+/// write tools when a reviewer-approved file scope is in force. `Some(deny_json)` blocks the
+/// tool; `None` lets the caller proceed (incl. its own rtk handling for Bash). The command is
+/// only consulted on the Bash read-only-orientation path; for every other tool (and an empty
+/// command) the pre-approval decision is exactly as before.
+pub fn enforce_tool_scoped(
+    cwd: &str,
+    tool_name: &str,
+    target: WriteTarget,
+    command: &str,
+) -> Option<String> {
     if !is_gated_tool(tool_name) {
         return None;
     }
@@ -681,6 +708,12 @@ pub fn enforce_tool(cwd: &str, tool_name: &str, command: &str) -> Option<String>
         }
     }
     if !blocks_writes(cwd) {
+        // Approved / gate-off / bypassed. v0.32 Unit 4: apply the write-time scope fence —
+        // a no-op unless a non-empty reviewer-approved scope is in force AND this is a
+        // path-bearing write tool carrying tool-context.
+        if let Some(deny) = scope_fence(cwd, tool_name, target) {
+            return Some(deny);
+        }
         return None;
     }
     // v0.31 (P2) read-only orientation carve-out (DEFAULT OFF; currently INERT). When the
@@ -719,6 +752,121 @@ pub fn enforce_tool(cwd: &str, tool_name: &str, command: &str) -> Option<String>
     Some(deny_json(reason))
 }
 
+/// The reviewer-approved file scope currently in force, as a tri-state (v0.32 Unit 4). The
+/// distinction is FAIL-CLOSED: ABSENT/EMPTY scope is backward-compatible (non-declaring plans
+/// behave exactly as before), but a PRESENT-but-malformed scope must NEVER silently widen
+/// authorization — it denies.
+enum ScopeState {
+    /// No scope was DECLARED (non-declaring/legacy plan): gate off/bypassed, or
+    /// `approved_scope_declared` is false AND `approved_allowed_globs` is absent/null/empty →
+    /// fence inert (backward-compat — these plans write as before, Stop-gate backstop).
+    None,
+    /// A scope WAS declared but ZERO globs were approved (`approved_scope_declared` true with an
+    /// absent/empty `approved_allowed_globs`) → DENY EVERY write (the reviewer approved no file
+    /// scope, so nothing is in scope). This is the fail-closed half of the empty-array ambiguity.
+    DenyAll,
+    /// `approved_allowed_globs` present but non-array, or an entry is non-string / fails
+    /// [`crate::scope::validate_glob`] → DENY (corrupt scope data must not authorize a write).
+    Corrupt,
+    /// A present, non-empty scope whose every entry is a valid glob.
+    Globs(Vec<String>),
+}
+
+/// Read the reviewer-approved scope from authority state as a [`ScopeState`]. Only meaningful
+/// once an epoch is effectively approved (the fence calls it from the `!blocks_writes` branch).
+fn scope_in_force_state(cwd: &str) -> ScopeState {
+    // Gate off / bypassed → no scope to enforce.
+    if !is_enabled(cwd) || bypassed() {
+        return ScopeState::None;
+    }
+    let Some(s) = read_state(cwd) else {
+        return ScopeState::None;
+    };
+    // Whether the approved plan DECLARED a file scope (an `ALLOWED-GLOBS:` line). This
+    // disambiguates an empty `approved_allowed_globs`: declared+empty ⇒ DenyAll (reviewer
+    // approved nothing); not-declared+empty ⇒ None (legacy/non-declaring → inert). ABSENT is
+    // back-compat (false); a PRESENT-but-non-boolean value is corrupt authority state → deny.
+    let declared = match s.get("approved_scope_declared") {
+        std::option::Option::None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return ScopeState::Corrupt,
+    };
+    let empty_state = if declared {
+        ScopeState::DenyAll
+    } else {
+        ScopeState::None
+    };
+    match s.get("approved_allowed_globs") {
+        std::option::Option::None | Some(Value::Null) => empty_state,
+        Some(Value::Array(arr)) if arr.is_empty() => empty_state,
+        Some(Value::Array(arr)) => {
+            let mut globs = Vec::with_capacity(arr.len());
+            for item in arr {
+                match item.as_str() {
+                    Some(g) if crate::scope::validate_glob(g).is_ok() => globs.push(g.to_string()),
+                    // a non-string entry OR an invalid glob → corrupt (fail closed).
+                    _ => return ScopeState::Corrupt,
+                }
+            }
+            ScopeState::Globs(globs)
+        }
+        // present but not an array → corrupt.
+        Some(_) => ScopeState::Corrupt,
+    }
+}
+
+/// Whether the plan contains an `ALLOWED-GLOBS:` declaration LABEL at all, regardless of how
+/// many (if any) globs follow. A present-but-empty/malformed `ALLOWED-GLOBS:` line still counts
+/// as a DECLARED scope, so it fails CLOSED (DenyAll) rather than being mistaken for a
+/// non-declaring plan — unlike [`crate::scope::declared_globs`], which drops empty tokens and so
+/// cannot distinguish a bare label from no declaration. Label match mirrors `declared_globs`
+/// (whole-line trim, case-insensitive label).
+fn scope_declared_in_plan(plan: &str) -> bool {
+    const LABEL: &str = "allowed-globs:";
+    plan.lines().any(|line| {
+        line.trim()
+            .get(..LABEL.len())
+            .map(|head| head.eq_ignore_ascii_case(LABEL))
+            .unwrap_or(false)
+    })
+}
+
+/// v0.32 Unit 4 write-time scope fence. `Some(deny_json)` blocks a path-bearing write that is
+/// outside (or cannot be confined to) the reviewer-approved scope; `None` lets it proceed.
+/// Bash and `mcp__aibridge__run` are intentionally NOT fenced here (owner-accepted residual:
+/// an out-of-scope write through them is caught by the Stop-gate, not at write-time — the
+/// hardened-execution carve-out that would let them be fenced safely is a deferred follow-up).
+fn scope_fence(cwd: &str, tool_name: &str, target: WriteTarget) -> Option<String> {
+    // Only the path-bearing write tools are fenced; Bash/run pass through.
+    if !GATED_WRITE_TOOLS.contains(&tool_name) {
+        return None;
+    }
+    // Resolve what to check; `Unknown` (legacy callers) carries no tool-context → fence inert.
+    let checkable: Option<&str> = match target {
+        WriteTarget::Unknown => return None,
+        WriteTarget::Missing => None,
+        WriteTarget::Path(p) => Some(p),
+    };
+    match scope_in_force_state(cwd) {
+        ScopeState::None => None, // no active scope → inert (backward-compat)
+        // Declared-but-empty scope, or corrupt scope data → deny every write (path or not).
+        ScopeState::DenyAll | ScopeState::Corrupt => Some(deny_json(BlockReason::OutOfScopePath)),
+        ScopeState::Globs(globs) => match checkable {
+            // An authoritative write with no checkable target under an active scope: fail closed.
+            None => Some(deny_json(BlockReason::OutOfScopePath)),
+            Some(p) => {
+                let repo_root = crate::git::repo_root(cwd)
+                    .unwrap_or_else(|| root(cwd).to_string_lossy().into_owned());
+                match crate::path_scope::canonicalize_under_root(&repo_root, p) {
+                    Ok(rel) if crate::scope::path_in_allowed(&rel, &globs) => None,
+                    // uncanonicalizable / escapes root / out of scope → deny.
+                    _ => Some(deny_json(BlockReason::OutOfScopePath)),
+                }
+            }
+        },
+    }
+}
+
 /// v0.31 (P2): whether a Bash `command` is PROVEN read-only (and path-confined to `cwd`).
 /// DEFERRED — the sound implementation needs the hardened execution layer
 /// ([`read_only_execution_supported`]); until then this always returns `false` so the
@@ -748,6 +896,9 @@ pub enum BlockReason {
     WorkingTreeDelta,
     /// A read-only-orientation command the parser could not prove safe. Wired by P2.
     ReadOnlyParserDenial,
+    /// A path-bearing write targets a file outside the reviewer-approved ALLOWED-GLOBS scope
+    /// (or a path that cannot be confined to the repo root). Wired by v0.32 Unit 4.
+    OutOfScopePath,
 }
 
 impl BlockReason {
@@ -760,6 +911,7 @@ impl BlockReason {
             BlockReason::HeadMoved => "head_moved",
             BlockReason::WorkingTreeDelta => "working_tree_delta",
             BlockReason::ReadOnlyParserDenial => "read_only_parser_denial",
+            BlockReason::OutOfScopePath => "out_of_scope_path",
         }
     }
 
@@ -796,6 +948,12 @@ impl BlockReason {
             BlockReason::ReadOnlyParserDenial => {
                 "this command could not be proven read-only — run an approved plan via \
                  `mcp__aibridge__plan_gate`, or use Read/Grep/Glob for discovery."
+            }
+            BlockReason::OutOfScopePath => {
+                "this write targets a path outside the plan's approved ALLOWED-GLOBS scope (or a \
+                 path that cannot be confined to the repo root). Do NOT retry. Re-file the plan \
+                 with `mcp__aibridge__plan_gate`, adding this path to the `ALLOWED-GLOBS:` line, \
+                 to expand the approved scope."
             }
         }
     }
@@ -1675,6 +1833,15 @@ pub fn record(
             let broad = parse_risk_approved(findings).contains(&"broad-scope");
             let approved_globs = crate::scope::approved_scope(plan, findings, broad);
             set_field(&mut s, "approved_allowed_globs", json!(approved_globs));
+            // Record WHETHER the plan declared a file scope (the PRESENCE of an `ALLOWED-GLOBS:`
+            // label — NOT how many globs the reviewer ultimately approved, and NOT whether any
+            // parsed: a bare/empty `ALLOWED-GLOBS:` still counts). A declared-but-empty scope must
+            // DENY every write (the fence reads this to disambiguate empty from non-declaring).
+            set_field(
+                &mut s,
+                "approved_scope_declared",
+                json!(scope_declared_in_plan(plan)),
+            );
             set_field(&mut s, "approved_plan", json!(cap_plan(plan)));
             set_field(&mut s, "status", json!("approved"));
             set_field(&mut s, "revoked_reason", Value::Null);
@@ -1781,6 +1948,16 @@ pub fn record_resume(
     // v0.32 scoped-approval: restore the receipt's reviewer-approved scope onto state, so a
     // resume leaves the SAME authoritative scope a fresh `record` approve would.
     set_field(&mut s, "approved_allowed_globs", json!(allowed_globs));
+    // Derive the declared-scope flag from the PLAN (exactly like `record`, via label PRESENCE),
+    // NOT from the restored globs: a plan can declare `ALLOWED-GLOBS:` yet have ZERO globs
+    // approved (e.g. a recursive glob dropped for a missing broad-scope grant), and a receipt is
+    // saved even then. Inferring from `allowed_globs.is_empty()` would lose that distinction on
+    // resume and reopen the fence.
+    set_field(
+        &mut s,
+        "approved_scope_declared",
+        json!(scope_declared_in_plan(plan)),
+    );
     set_field(&mut s, "approved_plan", json!(cap_plan(plan)));
     set_field(&mut s, "status", json!("approved"));
     set_field(&mut s, "revoked_reason", Value::Null);
@@ -2581,6 +2758,22 @@ mod tests {
     }
 
     #[test]
+    fn record_resume_keeps_declared_but_empty_scope_closed() {
+        // A receipt for a DECLARED-but-empty scope (e.g. `src/**` with no broad-scope grant →
+        // [] approved) is saved on approval. A resume must NOT reopen the fence: the declared
+        // flag is derived from the PLAN, so an empty restored scope stays DenyAll, not inert.
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "task");
+        let epoch = current_epoch(&cwd);
+        begin_review(&cwd, "ALLOWED-GLOBS: src/**");
+        assert!(record_resume(&cwd, &epoch, "ALLOWED-GLOBS: src/**", &[], &[]));
+        let deny = enforce_tool_scoped(&cwd, "Write", WriteTarget::Path("src/a.rs"), "")
+            .expect("resumed declared-but-empty scope must still deny");
+        assert!(deny_code(&deny).contains("out_of_scope_path"));
+    }
+
+    #[test]
     fn record_resume_refuses_stale_epoch() {
         let cwd = tmp();
         enable(&cwd).unwrap();
@@ -2668,6 +2861,260 @@ mod tests {
         // read_only_proven is deferred → never proves anything in P2.
         assert!(!read_only_proven(&cwd, "ls"));
         assert!(!read_only_execution_supported());
+    }
+
+    // ── v0.32 Unit 4: post-approval write-time scope fence ──────────────────────────────
+    //
+    // Set up an APPROVED epoch with an explicit `approved_allowed_globs` (written directly so
+    // corrupt shapes that `record` could never produce can be exercised). The state is
+    // effectively-approved, so `enforce_tool_scoped` reaches the fence.
+    fn approve_with_globs(cwd: &str, globs: Value) {
+        enable(cwd).unwrap();
+        start_epoch(cwd, "sess", "task");
+        let epoch = current_epoch(cwd);
+        let s = json!({
+            "epoch": epoch,
+            "approved": true,
+            "approved_epoch": epoch,
+            "approved_plan_hash": hash_str("the plan"),
+            "approved_allowed_globs": globs,
+            "status": "approved",
+            "rounds": 1,
+            "same_findings": 0,
+        });
+        write_state(cwd, &s).unwrap();
+        assert!(!blocks_writes(cwd), "state should be effectively approved");
+    }
+
+    fn deny_code(deny: &str) -> String {
+        let v: Value = serde_json::from_str(deny).expect("deny is valid json");
+        v.pointer("/hookSpecificOutput/permissionDecisionReason")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    }
+
+    #[test]
+    fn scope_fence_allows_in_scope_write() {
+        let cwd = tmp();
+        approve_with_globs(&cwd, json!(["src/a.rs"]));
+        assert!(enforce_tool_scoped(&cwd, "Write", WriteTarget::Path("src/a.rs"), "").is_none());
+    }
+
+    #[test]
+    fn scope_fence_denies_out_of_scope_write() {
+        let cwd = tmp();
+        approve_with_globs(&cwd, json!(["src/a.rs"]));
+        let deny = enforce_tool_scoped(&cwd, "Write", WriteTarget::Path("src/b.rs"), "")
+            .expect("out-of-scope write must be denied");
+        assert!(deny_code(&deny).contains("out_of_scope_path"));
+    }
+
+    #[test]
+    fn scope_fence_denies_uncanonicalizable_path() {
+        // A `..` traversal can never be confined under the repo root → fail closed.
+        let cwd = tmp();
+        approve_with_globs(&cwd, json!(["src/a.rs"]));
+        let deny = enforce_tool_scoped(&cwd, "Write", WriteTarget::Path("../escape.txt"), "")
+            .expect("traversal must be denied");
+        assert!(deny_code(&deny).contains("out_of_scope_path"));
+    }
+
+    #[test]
+    fn scope_fence_denies_missing_path_under_scope() {
+        // The authoritative hook produced no usable path for a gated write under an active
+        // scope → fail closed (finding: missing path must not slip the fence).
+        let cwd = tmp();
+        approve_with_globs(&cwd, json!(["src/a.rs"]));
+        let deny = enforce_tool_scoped(&cwd, "Write", WriteTarget::Missing, "")
+            .expect("missing path under active scope must be denied");
+        assert!(deny_code(&deny).contains("out_of_scope_path"));
+    }
+
+    #[test]
+    fn scope_fence_inert_without_a_declared_scope() {
+        // Empty scope = non-declaring plan → byte-identical to pre-Unit-4 (writes flow, the
+        // Stop-gate is the backstop). Both a concrete path and a missing path are allowed.
+        let cwd = tmp();
+        approve_with_globs(&cwd, json!([]));
+        assert!(enforce_tool_scoped(&cwd, "Write", WriteTarget::Path("anywhere/x.rs"), "").is_none());
+        assert!(enforce_tool_scoped(&cwd, "Write", WriteTarget::Missing, "").is_none());
+    }
+
+    #[test]
+    fn scope_fence_denies_corrupt_scope() {
+        // PRESENT-but-malformed scope must DENY, never silently widen authorization.
+        for corrupt in [
+            json!("not-an-array"),        // non-array
+            json!([123]),                  // non-string entry
+            json!(["src/a.rs", true]),     // mixed non-string entry
+            json!([r"src\x"]),             // an entry that fails validate_glob
+        ] {
+            let cwd = tmp();
+            approve_with_globs(&cwd, corrupt.clone());
+            let deny = enforce_tool_scoped(&cwd, "Write", WriteTarget::Path("src/a.rs"), "")
+                .unwrap_or_else(|| panic!("corrupt scope {corrupt} must deny"));
+            assert!(deny_code(&deny).contains("out_of_scope_path"), "for {corrupt}");
+        }
+    }
+
+    #[test]
+    fn scope_fence_denies_all_when_scope_declared_but_empty() {
+        // A plan DECLARED a scope but the reviewer approved ZERO globs (e.g. a recursive glob
+        // dropped for a missing broad-scope grant). Nothing is in scope → EVERY write denies
+        // (path or missing), but legacy (Unknown) + Bash stay free.
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "task");
+        let epoch = current_epoch(&cwd);
+        let s = json!({
+            "epoch": epoch,
+            "approved": true,
+            "approved_epoch": epoch,
+            "approved_plan_hash": hash_str("the plan"),
+            "approved_allowed_globs": [],
+            "approved_scope_declared": true,
+            "status": "approved",
+            "rounds": 1,
+            "same_findings": 0,
+        });
+        write_state(&cwd, &s).unwrap();
+        assert!(!blocks_writes(&cwd));
+        let d1 = enforce_tool_scoped(&cwd, "Write", WriteTarget::Path("src/a.rs"), "")
+            .expect("declared-but-empty scope denies a path write");
+        assert!(deny_code(&d1).contains("out_of_scope_path"));
+        let d2 = enforce_tool_scoped(&cwd, "Write", WriteTarget::Missing, "")
+            .expect("declared-but-empty scope denies a pathless write");
+        assert!(deny_code(&d2).contains("out_of_scope_path"));
+        // legacy + Bash unaffected
+        assert!(enforce_tool_scoped(&cwd, "Write", WriteTarget::Unknown, "").is_none());
+        assert!(enforce_tool_scoped(&cwd, "Bash", WriteTarget::Unknown, "echo x > y").is_none());
+    }
+
+    #[test]
+    fn scope_fence_denies_when_declared_flag_is_malformed() {
+        // A PRESENT non-boolean `approved_scope_declared` is corrupt authority state → deny.
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "task");
+        let epoch = current_epoch(&cwd);
+        let s = json!({
+            "epoch": epoch,
+            "approved": true,
+            "approved_epoch": epoch,
+            "approved_plan_hash": hash_str("the plan"),
+            "approved_allowed_globs": [],
+            "approved_scope_declared": "true", // a string, not a bool
+            "status": "approved",
+            "rounds": 1,
+            "same_findings": 0,
+        });
+        write_state(&cwd, &s).unwrap();
+        assert!(!blocks_writes(&cwd));
+        let deny = enforce_tool_scoped(&cwd, "Write", WriteTarget::Path("src/a.rs"), "")
+            .expect("malformed declared flag must deny");
+        assert!(deny_code(&deny).contains("out_of_scope_path"));
+    }
+
+    #[test]
+    fn scope_declared_in_plan_detects_label_presence() {
+        assert!(scope_declared_in_plan("ALLOWED-GLOBS: src/a.rs"));
+        assert!(scope_declared_in_plan("intro\n  allowed-globs:\nmore")); // bare, case-insens, indented
+        assert!(scope_declared_in_plan("ALLOWED-GLOBS:"));
+        assert!(!scope_declared_in_plan("no scope\nintended_files: src/a.rs"));
+        assert!(!scope_declared_in_plan(""));
+    }
+
+    #[test]
+    fn record_with_bare_allowed_globs_label_denies_writes() {
+        // A present-but-empty `ALLOWED-GLOBS:` line is a DECLARED scope with zero approved globs
+        // → DenyAll (not mistaken for a non-declaring plan, even though no glob token parses).
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "task");
+        assert!(matches!(
+            record(
+                &cwd,
+                &current_epoch(&cwd),
+                "intro\nALLOWED-GLOBS:\nmore",
+                &crate::gate::Verdict::Approve,
+                "",
+            ),
+            Outcome::Approved
+        ));
+        let deny = enforce_tool_scoped(&cwd, "Write", WriteTarget::Path("src/a.rs"), "")
+            .expect("bare ALLOWED-GLOBS: must deny");
+        assert!(deny_code(&deny).contains("out_of_scope_path"));
+    }
+
+    #[test]
+    fn record_resume_with_bare_allowed_globs_label_denies_writes() {
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "task");
+        let epoch = current_epoch(&cwd);
+        begin_review(&cwd, "ALLOWED-GLOBS:");
+        assert!(record_resume(&cwd, &epoch, "ALLOWED-GLOBS:", &[], &[]));
+        let deny = enforce_tool_scoped(&cwd, "Write", WriteTarget::Path("src/a.rs"), "")
+            .expect("bare ALLOWED-GLOBS: resume must deny");
+        assert!(deny_code(&deny).contains("out_of_scope_path"));
+    }
+
+    #[test]
+    fn scope_fence_leaves_bash_and_run_free() {
+        // Owner-accepted residual: Bash + mcp__aibridge__run are NOT fenced (Stop-gate backstop).
+        let cwd = tmp();
+        approve_with_globs(&cwd, json!(["src/a.rs"]));
+        assert!(enforce_tool_scoped(&cwd, "Bash", WriteTarget::Unknown, "echo x > out.txt").is_none());
+        assert!(enforce_tool_scoped(&cwd, "mcp__aibridge__run", WriteTarget::Unknown, "x").is_none());
+    }
+
+    #[test]
+    fn scope_fence_is_inert_for_legacy_callers() {
+        // The legacy `enforce`/`enforce_tool` surfaces carry no tool-context (Unknown) → the
+        // fence never fires, so they stay byte-identical even under an active or corrupt scope.
+        let cwd = tmp();
+        approve_with_globs(&cwd, json!(["src/a.rs"]));
+        assert!(enforce(&cwd, "Write").is_none());
+        assert!(enforce_tool(&cwd, "Write", "").is_none());
+        let cwd2 = tmp();
+        approve_with_globs(&cwd2, json!("corrupt"));
+        assert!(enforce(&cwd2, "Write").is_none(), "legacy stays allowed even with corrupt scope");
+    }
+
+    #[test]
+    fn scope_fence_does_not_fire_before_approval() {
+        // Pre-approval, the pre-approval block (no_active_approval) wins; the scope fence (a
+        // post-approval check) is never reached, so an out-of-scope-looking path is NOT the reason.
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "task");
+        let deny = enforce_tool_scoped(&cwd, "Write", WriteTarget::Path("src/b.rs"), "")
+            .expect("pre-approval write denied");
+        let code = deny_code(&deny);
+        assert!(code.contains("no_active_approval"));
+        assert!(!code.contains("out_of_scope_path"));
+    }
+
+    #[test]
+    fn scope_fence_covers_notebook_edit() {
+        let cwd = tmp();
+        approve_with_globs(&cwd, json!(["src/*"]));
+        let deny = enforce_tool_scoped(&cwd, "NotebookEdit", WriteTarget::Path("nb/x.ipynb"), "")
+            .expect("out-of-scope notebook write denied");
+        assert!(deny_code(&deny).contains("out_of_scope_path"));
+        // ...and an in-scope notebook path is allowed.
+        let cwd2 = tmp();
+        approve_with_globs(&cwd2, json!(["nb/*"]));
+        assert!(enforce_tool_scoped(&cwd2, "NotebookEdit", WriteTarget::Path("nb/x.ipynb"), "").is_none());
+    }
+
+    #[test]
+    fn out_of_scope_block_reason_round_trips() {
+        assert_eq!(BlockReason::OutOfScopePath.code(), "out_of_scope_path");
+        assert!(BlockReason::OutOfScopePath
+            .recovery_hint()
+            .contains("ALLOWED-GLOBS"));
     }
 
     #[test]
