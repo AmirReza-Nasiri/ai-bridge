@@ -139,7 +139,7 @@ pub fn path_in_allowed(rel: &str, allowed_globs: &[String]) -> bool {
 /// is `label_lower` (which MUST include the trailing colon, lowercase). The glob payloads
 /// are taken VERBATIM (case preserved — globs are case-sensitive), trimmed, and deduped
 /// (first-seen kept). Shared by [`parse_scope_approved`] and [`declared_globs`].
-fn parse_label_globs(text: &str, label_lower: &str) -> Vec<String> {
+fn parse_label_globs(text: &str, label_lower: &str, split_commas: bool) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for line in text.lines() {
         let trimmed = line.trim();
@@ -150,7 +150,15 @@ fn parse_label_globs(text: &str, label_lower: &str) -> Vec<String> {
         if !head.eq_ignore_ascii_case(label_lower) {
             continue;
         }
-        for tok in trimmed[label_lower.len()..].split(',') {
+        let payload = &trimmed[label_lower.len()..];
+        // `declared_globs` is a single comma-separated line; a `SCOPE-APPROVED:` reviewer
+        // marker is exactly ONE glob per line (no comma splitting — narrower semantics).
+        let parts: Vec<&str> = if split_commas {
+            payload.split(',').collect()
+        } else {
+            vec![payload]
+        };
+        for tok in parts {
             let g = tok.trim();
             if !g.is_empty() && !out.iter().any(|e| e == g) {
                 out.push(g.to_string());
@@ -164,13 +172,13 @@ fn parse_label_globs(text: &str, label_lower: &str) -> Vec<String> {
 /// Label matched case-insensitively; glob payload verbatim. Reviewer-owned — never scanned
 /// from plan prose (so a plan merely mentioning a path can't self-authorize scope).
 pub fn parse_scope_approved(findings: &str) -> Vec<String> {
-    parse_label_globs(findings, "scope-approved:")
+    parse_label_globs(findings, "scope-approved:", false) // one glob per marker line
 }
 
 /// Parse Claude's machine-readable scope declaration — a standalone `ALLOWED-GLOBS: a, b, c`
 /// line in the plan. Label case-insensitive; comma-separated globs verbatim. Absent → empty.
 pub fn declared_globs(plan: &str) -> Vec<String> {
-    parse_label_globs(plan, "allowed-globs:")
+    parse_label_globs(plan, "allowed-globs:", true) // a single comma-separated declaration line
 }
 
 /// The fail-closed approved scope = globs that are BOTH declared by Claude (`ALLOWED-GLOBS:`)
@@ -325,7 +333,7 @@ mod tests {
     #[test]
     fn parse_scope_approved_reads_markers_case_insensitively_preserving_glob_case() {
         let findings = "Some prose.\nSCOPE-APPROVED: src/foo.rs\nscope-approved: Src/Bar.rs\n\
-                        Scope-Approved: tests/*, docs/x.md\nnot a marker: nope\n\
+                        Scope-Approved: tests/x.rs\nnot a marker: nope\n\
                         SCOPE-APPROVED: src/foo.rs"; // duplicate
         let got = parse_scope_approved(findings);
         assert_eq!(
@@ -333,10 +341,24 @@ mod tests {
             vec![
                 "src/foo.rs".to_string(),
                 "Src/Bar.rs".to_string(), // glob case PRESERVED
-                "tests/*".to_string(),
-                "docs/x.md".to_string(),
+                "tests/x.rs".to_string(),
             ],
             "labels case-insensitive, glob payloads verbatim + deduped"
+        );
+    }
+
+    #[test]
+    fn scope_approved_is_exactly_one_glob_per_marker_line() {
+        // A `SCOPE-APPROVED:` line is ONE glob — commas are NOT a separator here (narrower
+        // reviewer-approval semantics than the comma-separated `ALLOWED-GLOBS:` declaration).
+        assert_eq!(
+            parse_scope_approved("SCOPE-APPROVED: a.rs, b.rs"),
+            vec!["a.rs, b.rs".to_string()]
+        );
+        // ...whereas the Claude declaration DOES split on commas.
+        assert_eq!(
+            declared_globs("ALLOWED-GLOBS: a.rs, b.rs"),
+            vec!["a.rs".to_string(), "b.rs".to_string()]
         );
     }
 
