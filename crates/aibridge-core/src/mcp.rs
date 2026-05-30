@@ -815,6 +815,9 @@ impl Server {
             );
         }
         let bundle = ctx.bundle;
+        // v0.32: orphaned/diverged base ⇒ net base↔HEAD diff (may span earlier separately-gated
+        // tasks) ⇒ soften the latest-plan breadth check in the review prompt.
+        let reconstructed_base = ctx.committed_warning.is_some();
 
         if bundle.is_empty {
             // Nothing committed-since-base AND a clean tree ⇒ nothing to review.
@@ -871,6 +874,7 @@ impl Server {
             cwd,
             approved_plan.as_deref(),
             active_fp,
+            reconstructed_base,
         );
         // Map the outcome to the frontier status so the NEXT task start won't advance
         // the base over unresolved debt. CRUCIAL: an allow is only a genuine APPROVE
@@ -938,10 +942,12 @@ impl Server {
     /// - session cannot be derived from plan-gate state
     /// - no Stop-review frontier was recorded (UserPromptSubmit hook never ran)
     /// - working tree is dirty (use `review_diff` for uncommitted-only feedback)
-    /// - `committed_delta` returned a warning (ambiguous base)
     /// - Codex returns Blocked/Unparseable/transport error
     ///
-    /// On the bundle-empty path (clean tree + no committed-since-base), sets
+    /// A reconstructed/ambiguous base (a `committed_delta` warning) does NOT refuse: the warned
+    /// net base↔HEAD diff is still reviewed (v0.32 softens only the latest-plan breadth check,
+    /// since the diff may span earlier separately-gated tasks), and the frontier advances ONLY on
+    /// APPROVE. On the bundle-empty path (clean tree + no committed-since-base), sets
     /// `STATUS_APPROVED` and returns without calling Codex — clears any prior
     /// blocked/needs_user that lingered from a Stop refusal.
     fn review_checkpoint(&mut self, msg: &Value) -> String {
@@ -994,7 +1000,13 @@ impl Server {
         // ticks for checkpoint reviews).
         self.tick_gate_reset();
         let approved_plan = crate::plan_gate::approved_plan(&cwd);
-        let prompt = gate::prompt_with_scope(&ctx.bundle.text, approved_plan.as_deref());
+        // v0.32: when the review base is reconstructed (orphaned/diverged → net base↔HEAD diff
+        // spanning earlier separately-gated tasks), soften the latest-plan breadth check.
+        let prompt = gate::prompt_with_scope(
+            &ctx.bundle.text,
+            approved_plan.as_deref(),
+            ctx.committed_warning.is_some(),
+        );
         let review = match self.ask_topic(TopicKey::Gate, &prompt, &cwd) {
             Ok(r) if !r.trim().is_empty() => r,
             Ok(_) | Err(_) => {
@@ -1027,6 +1039,14 @@ impl Server {
         } else {
             ""
         };
+        // The scope softening ACTUALLY applied only when the base was reconstructed AND a
+        // non-empty plan was present (the same condition `prompt_with_scope` injects on) — so a
+        // malformed/legacy approval with no plan text never emits a misleading scope-note.
+        let scope_softened = ctx.committed_warning.is_some()
+            && approved_plan
+                .as_deref()
+                .map(|p| !p.trim().is_empty())
+                .unwrap_or(false);
         let out = match final_outcome {
             CheckpointFinal::Advanced => format_checkpoint_approve(
                 reason,
@@ -1037,6 +1057,7 @@ impl Server {
                 ctx.bundle.text.len(),
                 Some(trace.as_str()),
                 ctx.committed_warning.as_deref(),
+                scope_softened,
             ),
             CheckpointFinal::Blocked => format_checkpoint_request_changes(
                 reason,
@@ -1045,6 +1066,7 @@ impl Server {
                 &gate::findings(&review),
                 Some(trace.as_str()),
                 ctx.committed_warning.as_deref(),
+                scope_softened,
             ),
             CheckpointFinal::Refused(m) => m,
         };
@@ -1089,6 +1111,7 @@ impl Server {
         cwd: &str,
         approved_plan: Option<&str>,
         active_fp: u64,
+        reconstructed_base: bool,
     ) -> String {
         let dh = bundle.hash;
 
@@ -1124,7 +1147,7 @@ impl Server {
         // The pre-approved plan (read once by the caller) lets the reviewer flag changes
         // that fall outside the approved scope or high-risk actions the plan never named
         // — the soft-telemetry half of plan-gate v2 (we don't hard-fence files).
-        let prompt = gate::prompt_with_scope(&bundle.text, approved_plan);
+        let prompt = gate::prompt_with_scope(&bundle.text, approved_plan, reconstructed_base);
         // Periodic anti-anchoring reset of the reserved review thread (shared bound
         // with manual review_diff; warm-cache speed is kept for the runs between).
         self.tick_gate_reset();
@@ -1584,6 +1607,20 @@ fn push_base_note(out: &mut String, base_note: Option<&str>) {
     }
 }
 
+/// v0.32: emit the `scope-note:` line when the reconstructed-base softening ACTUALLY applied to
+/// this review (base reconstructed AND a non-empty plan was present, so the latest-plan breadth
+/// mismatch was ignored while correctness/safety stayed strict). `scope_softened` is computed by
+/// the caller. Emitted ONLY by the post-review formatters (approve / request_changes), NOT the
+/// empty-diff no-op-advance path (which runs NO review).
+fn push_scope_note(out: &mut String, scope_softened: bool) {
+    if scope_softened {
+        out.push_str(
+            "scope-note: review base was reconstructed; reviewer ignored latest-plan breadth \
+             mismatch and reviewed the net final state for correctness/safety.\n",
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // distinct display fields for one output block
 fn format_checkpoint_approve(
     reason: &str,
@@ -1594,6 +1631,7 @@ fn format_checkpoint_approve(
     bytes: usize,
     trace: Option<&str>,
     base_note: Option<&str>,
+    scope_softened: bool,
 ) -> String {
     let old_base = checkpoint_base_label(old_frontier);
     let mut out = String::new();
@@ -1602,6 +1640,7 @@ fn format_checkpoint_approve(
     out.push_str(&format!("session: {session}\n"));
     out.push_str(&format!("frontier: {old_base} -> {new_head}\n"));
     push_base_note(&mut out, base_note);
+    push_scope_note(&mut out, scope_softened);
     out.push_str(&format!(
         "reviewed: {} file(s), {bytes} bytes\n",
         files.len()
@@ -1661,6 +1700,7 @@ fn format_checkpoint_no_op_advanced(
 }
 
 /// v0.23.0: Format the REQUEST_CHANGES output for `review_checkpoint`.
+#[allow(clippy::too_many_arguments)] // distinct display fields for one output block
 fn format_checkpoint_request_changes(
     reason: &str,
     session: &str,
@@ -1668,6 +1708,7 @@ fn format_checkpoint_request_changes(
     findings: &str,
     trace: Option<&str>,
     base_note: Option<&str>,
+    scope_softened: bool,
 ) -> String {
     let base = checkpoint_base_label(frontier);
     let mut out = String::new();
@@ -1677,6 +1718,7 @@ fn format_checkpoint_request_changes(
     out.push_str("review_checkpoint did not advance the frontier.\n");
     out.push_str(&format!("frontier remains: {base}\n"));
     push_base_note(&mut out, base_note);
+    push_scope_note(&mut out, scope_softened);
     out.push_str("findings:\n");
     out.push_str(findings);
     if !findings.ends_with('\n') {
@@ -2644,6 +2686,7 @@ mod tests {
             1024,
             Some(".ai-bridge/reviews/123/review.txt"),
             None,
+            false,
         );
         assert!(out.contains("<AI-BRIDGE-CHECKPOINT-APPROVE/>"));
         assert!(out.contains("reason: P1.1 done"));
@@ -2672,8 +2715,40 @@ mod tests {
             10,
             None,
             Some("review base 25f2e53 is no longer an ancestor of HEAD"),
+            true,
         );
         assert!(out.contains("base-note: review base 25f2e53 is no longer an ancestor"));
+        // A reconstructed-base APPROVE also explains the softened scope review.
+        assert!(
+            out.contains("scope-note: review base was reconstructed"),
+            "post-review approve with a reconstructed base emits the scope-note"
+        );
+    }
+
+    #[test]
+    fn format_checkpoint_approve_base_note_without_softening_omits_scope_note() {
+        // Reconstructed-base WARNING present but the softening did NOT apply (e.g. no approved
+        // plan text) → show the base-note but NOT a misleading scope-note.
+        let frontier = crate::review_frontier::Frontier {
+            base: crate::review_frontier::BaseKind::Commit("oldsha".into()),
+            status: crate::review_frontier::STATUS_OPEN.into(),
+        };
+        let out = format_checkpoint_approve(
+            "post squash-merge, no plan text",
+            "s",
+            Some(&frontier),
+            "newsha",
+            &[],
+            10,
+            None,
+            Some("review base abc is no longer an ancestor of HEAD"),
+            false,
+        );
+        assert!(out.contains("base-note: review base abc is no longer an ancestor"));
+        assert!(
+            !out.contains("scope-note:"),
+            "no softening applied → no scope-note even with a base-note"
+        );
     }
 
     #[test]
@@ -2691,8 +2766,10 @@ mod tests {
             0,
             None,
             None,
+            false,
         );
         assert!(out.contains("frontier: <empty tree> -> abc"));
+        assert!(!out.contains("scope-note:"), "no reconstructed base → no scope-note");
     }
 
     #[test]
@@ -2712,6 +2789,8 @@ mod tests {
         assert!(out.contains("frontier: orphan -> newhead (orphaned base cleared"));
         assert!(out.contains("base-note: review base orphan"));
         assert!(out.contains("status: approved"));
+        // The empty-diff advance ran NO review → it must NOT claim a softened scope review.
+        assert!(!out.contains("scope-note:"), "no-op advance ran no review → no scope-note");
     }
 
     #[test]
@@ -2740,12 +2819,39 @@ mod tests {
             "FINDINGS:\n- bug in foo.rs",
             Some(".ai-bridge/reviews/xx/review.txt"),
             None,
+            false,
         );
         assert!(out.contains("<AI-BRIDGE-REQUEST-CHANGES/>"));
         assert!(out.contains("did not advance the frontier"));
         assert!(out.contains("frontier remains: c1"));
         assert!(out.contains("FINDINGS:\n- bug in foo.rs"));
         assert!(out.contains("trace: .ai-bridge/reviews/xx/review.txt"));
+        assert!(!out.contains("scope-note:"), "scope_softened=false → no scope-note");
+    }
+
+    #[test]
+    fn format_checkpoint_request_changes_emits_scope_note_when_softened() {
+        // A reconstructed-base REQUEST_CHANGES (a real bug found despite the softened scope) still
+        // emits the scope-note — symmetric with the approve path.
+        let frontier = crate::review_frontier::Frontier {
+            base: crate::review_frontier::BaseKind::Commit("c1".into()),
+            status: crate::review_frontier::STATUS_OPEN.into(),
+        };
+        let out = format_checkpoint_request_changes(
+            "phase 2 (reconstructed base)",
+            "s",
+            Some(&frontier),
+            "FINDINGS:\n- real bug",
+            None,
+            Some("review base c1 is no longer an ancestor of HEAD"),
+            true,
+        );
+        assert!(out.contains("<AI-BRIDGE-REQUEST-CHANGES/>"));
+        assert!(out.contains("base-note: review base c1"));
+        assert!(
+            out.contains("scope-note: review base was reconstructed"),
+            "a softened request_changes still emits the scope-note"
+        );
     }
 
     // ───── checkpoint_prepare / checkpoint_finalize state-machine tests ─────

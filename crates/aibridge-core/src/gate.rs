@@ -37,7 +37,7 @@ pub const NO_PROGRESS_THRESHOLD: u32 = 2;
 
 /// The review prompt: review the CURRENT diff only, end with exactly one tag.
 pub fn prompt(diff_bundle: &str) -> String {
-    prompt_with_scope(diff_bundle, None)
+    prompt_with_scope(diff_bundle, None, false)
 }
 
 /// Like [`prompt`], but when a pre-approved plan exists for the task, also asks the
@@ -45,8 +45,32 @@ pub fn prompt(diff_bundle: &str) -> String {
 /// actions. This is the soft-telemetry half of plan-gate v2 — AI Bridge never
 /// hard-fences files; the Stop gate compares the approved plan against the real
 /// diff instead.
-pub fn prompt_with_scope(diff_bundle: &str, approved_plan: Option<&str>) -> String {
+///
+/// `reconstructed_base`: set when the review base is orphaned (rebase/squash-merge → the
+/// change set is the NET base↔HEAD diff, possibly spanning EARLIER separately-approved tasks
+/// whose plans are not shown). In that mode the breadth/"outside this scope" check is SOFTENED
+/// — strict attribution is impossible — while correctness/safety, missing-required-outcome, and
+/// unplanned high-risk review stay strict. A deliberate, bounded degraded mode.
+pub fn prompt_with_scope(
+    diff_bundle: &str,
+    approved_plan: Option<&str>,
+    reconstructed_base: bool,
+) -> String {
     let scope = match approved_plan {
+        Some(p) if !p.trim().is_empty() && reconstructed_base => format!(
+            "\nThis task had a PRE-APPROVED plan/scope (shown below), BUT the review base was \
+             RECONSTRUCTED (rebase/squash-merge), so the change set below is the NET base↔HEAD diff \
+             and may include work COMMITTED by EARLIER, separately-approved tasks whose plans are \
+             NOT shown here. Therefore do NOT REQUEST-CHANGES merely because the diff's files or \
+             breadth EXCEED this latest plan — that breadth is expected and not reviewable here. \
+             STILL require blocking findings for: a correctness/safety bug; a required outcome this \
+             plan claimed that is MISSING from the final state; or any unplanned high-risk action \
+             (publish/deploy/migrations/destructive shell/data loss). IMPORTANT: PROCESS/meta steps \
+             the plan may list — commit, push, checkpoint, advancing the review frontier, running \
+             gates/tests — are NOT review criteria; judge the CODE/outcome, and never flag such \
+             process steps as 'missing' (the diff cannot show them):\n\
+             === APPROVED PLAN ===\n{p}\n=== END APPROVED PLAN ===\n"
+        ),
         Some(p) if !p.trim().is_empty() => format!(
             "\nThis task had a PRE-APPROVED plan/scope; treat it as the INTENDED scope — a \
              reference, NOT a brittle whitelist (necessary implementation detail that serves the \
@@ -305,7 +329,7 @@ mod tests {
 
     #[test]
     fn prompt_with_scope_has_process_and_compile_clauses() {
-        let p = prompt_with_scope("DIFF", Some("commit then push"));
+        let p = prompt_with_scope("DIFF", Some("commit then push"), false);
         assert!(p.contains("PROCESS/meta steps"), "process-steps exemption");
         assert!(p.contains("NOT review criteria"));
         assert!(
@@ -316,5 +340,45 @@ mod tests {
             p.contains("high-risk action"),
             "still flags high-risk actions"
         );
+    }
+
+    #[test]
+    fn normal_scope_uses_the_strict_outside_scope_clause() {
+        // reconstructed_base = false → byte-identical strict behavior (regression guard).
+        let p = prompt_with_scope("DIFF", Some("PLAN-TEXT"), false);
+        assert!(p.contains("clearly OUTSIDE this scope"), "strict breadth clause present");
+        assert!(p.contains("=== APPROVED PLAN ===\nPLAN-TEXT"), "plan embedded");
+        assert!(p.contains("PROCESS/meta steps"), "process exemption kept");
+        assert!(p.contains("high-risk action"), "high-risk clause kept");
+        // The softened wording must NOT leak into the normal path.
+        assert!(!p.contains("RECONSTRUCTED"), "no reconstructed-base wording in normal mode");
+    }
+
+    #[test]
+    fn reconstructed_base_softens_only_the_breadth_clause() {
+        // reconstructed_base = true → drop the hard "clearly OUTSIDE this scope" breadth check,
+        // keep the plan, the high-risk clause, the missing-outcome requirement, and the process
+        // exemption. (Codex-validated degraded mode for an orphaned/squash-merge base.)
+        let p = prompt_with_scope("DIFF", Some("PLAN-TEXT"), true);
+        assert!(!p.contains("clearly OUTSIDE this scope"), "hard breadth clause suppressed");
+        assert!(p.contains("RECONSTRUCTED"), "explains the reconstructed base");
+        assert!(
+            p.contains("do NOT REQUEST-CHANGES merely because"),
+            "softened breadth instruction present"
+        );
+        assert!(p.contains("=== APPROVED PLAN ===\nPLAN-TEXT"), "plan still shown");
+        assert!(p.contains("MISSING from the final state"), "missing-outcome still required");
+        assert!(p.contains("high-risk action"), "high-risk clause kept");
+        assert!(p.contains("PROCESS/meta steps"), "process exemption kept");
+    }
+
+    #[test]
+    fn no_plan_means_no_scope_block_regardless_of_reconstructed_flag() {
+        for recon in [false, true] {
+            let p = prompt_with_scope("DIFF", None, recon);
+            assert!(!p.contains("=== APPROVED PLAN ==="), "no scope block without a plan");
+            assert!(!p.contains("clearly OUTSIDE this scope"));
+            assert!(!p.contains("RECONSTRUCTED"));
+        }
     }
 }
