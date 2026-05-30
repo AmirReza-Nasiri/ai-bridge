@@ -135,6 +135,67 @@ pub fn path_in_allowed(rel: &str, allowed_globs: &[String]) -> bool {
     allowed_globs.iter().any(|g| glob_matches(g, rel))
 }
 
+/// Collect the comma-separated glob payloads of every line whose label (case-insensitive)
+/// is `label_lower` (which MUST include the trailing colon, lowercase). The glob payloads
+/// are taken VERBATIM (case preserved — globs are case-sensitive), trimmed, and deduped
+/// (first-seen kept). Shared by [`parse_scope_approved`] and [`declared_globs`].
+fn parse_label_globs(text: &str, label_lower: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        // Match only the LABEL case-insensitively; never lowercase the glob payload.
+        let Some(head) = trimmed.get(..label_lower.len()) else {
+            continue;
+        };
+        if !head.eq_ignore_ascii_case(label_lower) {
+            continue;
+        }
+        for tok in trimmed[label_lower.len()..].split(',') {
+            let g = tok.trim();
+            if !g.is_empty() && !out.iter().any(|e| e == g) {
+                out.push(g.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Parse reviewer-owned `SCOPE-APPROVED: <glob>` markers from Codex's review FINDINGS.
+/// Label matched case-insensitively; glob payload verbatim. Reviewer-owned — never scanned
+/// from plan prose (so a plan merely mentioning a path can't self-authorize scope).
+pub fn parse_scope_approved(findings: &str) -> Vec<String> {
+    parse_label_globs(findings, "scope-approved:")
+}
+
+/// Parse Claude's machine-readable scope declaration — a standalone `ALLOWED-GLOBS: a, b, c`
+/// line in the plan. Label case-insensitive; comma-separated globs verbatim. Absent → empty.
+pub fn declared_globs(plan: &str) -> Vec<String> {
+    parse_label_globs(plan, "allowed-globs:")
+}
+
+/// The fail-closed approved scope = globs that are BOTH declared by Claude (`ALLOWED-GLOBS:`)
+/// AND echoed by the reviewer (`SCOPE-APPROVED:`), then kept only if they pass [`validate_glob`]
+/// and the breadth policy: `RepoWide` is ALWAYS dropped (no repo-wide scope in v0.32 even if
+/// echoed); `Broad` (recursive) is kept ONLY when `broad_scope_granted`; `Narrow`/`Moderate`
+/// are kept. Intersection is case-SENSITIVE (globs are case-sensitive paths).
+///
+/// `broad_scope_granted` is supplied by the caller; deriving it from a reviewer
+/// `RISK-APPROVED: broad-scope` grant (plus the `RISK_CLASSES`/prompt change) is DEFERRED to
+/// the storage/wiring unit. Nothing here is stored or enforced yet — this is pure policy.
+pub fn approved_scope(plan: &str, findings: &str, broad_scope_granted: bool) -> Vec<String> {
+    let echoed = parse_scope_approved(findings);
+    declared_globs(plan)
+        .into_iter()
+        .filter(|g| echoed.iter().any(|e| e == g)) // case-sensitive intersection
+        .filter(|g| validate_glob(g).is_ok())
+        .filter(|g| match classify_glob(g) {
+            ScopeRisk::Narrow | ScopeRisk::Moderate => true,
+            ScopeRisk::Broad => broad_scope_granted,
+            ScopeRisk::RepoWide => false,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,5 +320,81 @@ mod tests {
         assert!(!path_in_allowed("src/main.rs", &s(&["**.rs", "src/[ab].rs"])));
         // ...but a valid glob alongside the invalid ones still admits a match.
         assert!(path_in_allowed("src/main.rs", &s(&["**.rs", "src/**"])));
+    }
+
+    #[test]
+    fn parse_scope_approved_reads_markers_case_insensitively_preserving_glob_case() {
+        let findings = "Some prose.\nSCOPE-APPROVED: src/foo.rs\nscope-approved: Src/Bar.rs\n\
+                        Scope-Approved: tests/*, docs/x.md\nnot a marker: nope\n\
+                        SCOPE-APPROVED: src/foo.rs"; // duplicate
+        let got = parse_scope_approved(findings);
+        assert_eq!(
+            got,
+            vec![
+                "src/foo.rs".to_string(),
+                "Src/Bar.rs".to_string(), // glob case PRESERVED
+                "tests/*".to_string(),
+                "docs/x.md".to_string(),
+            ],
+            "labels case-insensitive, glob payloads verbatim + deduped"
+        );
+    }
+
+    #[test]
+    fn declared_globs_parses_the_line_case_preserving() {
+        assert_eq!(
+            declared_globs("plan...\nALLOWED-GLOBS: src/Foo.rs, tests/*\nmore"),
+            vec!["src/Foo.rs".to_string(), "tests/*".to_string()]
+        );
+        assert_eq!(
+            declared_globs("allowed-globs: a.rs"),
+            vec!["a.rs".to_string()]
+        );
+        assert!(declared_globs("no declaration here").is_empty());
+    }
+
+    #[test]
+    fn approved_scope_is_the_policy_filtered_intersection() {
+        // declared ∩ echoed, then breadth policy.
+        let plan = "ALLOWED-GLOBS: src/a.rs, src/b.rs, src/**, only_declared.rs, big/**";
+        let findings = "SCOPE-APPROVED: src/a.rs\nSCOPE-APPROVED: src/b.rs\n\
+                        SCOPE-APPROVED: src/**\nSCOPE-APPROVED: only_echoed.rs\n\
+                        SCOPE-APPROVED: big/**";
+        // Without a broad-scope grant: Narrow kept, recursive (Broad) dropped, declared-only
+        // and echoed-only dropped.
+        assert_eq!(
+            approved_scope(plan, findings, false),
+            vec!["src/a.rs".to_string(), "src/b.rs".to_string()]
+        );
+        // With a broad-scope grant: the recursive globs (in BOTH) are kept too.
+        assert_eq!(
+            approved_scope(plan, findings, true),
+            vec![
+                "src/a.rs".to_string(),
+                "src/b.rs".to_string(),
+                "src/**".to_string(),
+                "big/**".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn approved_scope_intersection_is_case_sensitive_and_drops_repo_wide() {
+        // case mismatch → not in the intersection.
+        assert!(approved_scope("ALLOWED-GLOBS: src/x.rs", "SCOPE-APPROVED: Src/X.rs", true).is_empty());
+        // a repo-wide glob declared AND echoed AND broad-granted is STILL dropped.
+        assert!(approved_scope("ALLOWED-GLOBS: **", "SCOPE-APPROVED: **", true).is_empty());
+        // an invalid glob in both is dropped.
+        assert!(approved_scope("ALLOWED-GLOBS: src/[ab].rs", "SCOPE-APPROVED: src/[ab].rs", true).is_empty());
+    }
+
+    #[test]
+    fn approved_scope_keeps_moderate_regardless_of_broad_grant() {
+        // A `Moderate` (single-level wildcard) glob is its own policy tier — it must be kept
+        // whether or not a broad-scope grant is present (it must NOT ride the Broad tier).
+        let plan = "ALLOWED-GLOBS: tests/*";
+        let findings = "SCOPE-APPROVED: tests/*";
+        assert_eq!(approved_scope(plan, findings, false), vec!["tests/*".to_string()]);
+        assert_eq!(approved_scope(plan, findings, true), vec!["tests/*".to_string()]);
     }
 }
