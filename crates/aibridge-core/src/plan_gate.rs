@@ -418,10 +418,16 @@ fn start_epoch_inner(cwd: &str, session: &str, prompt: &str, reset_on_user_turn:
         )
     {
         // Preserve the approval; record the pending user-turn for PreToolUse to reconcile.
-        // A failed marker write must FAIL CLOSED — revoke so a preserved-but-unreconciled
-        // turn can never leave stale approval live.
+        // A failed marker write must FAIL CLOSED. `revoke` preserves `approved_plan` for the
+        // Stop gate, but it ignores its OWN write failure — so if it did not persist (the state
+        // still reads as approved), DELETE the state outright so a stale approval cannot remain
+        // effective for the new turn (mirrors the fresh-epoch write-failure path below). The
+        // next prompt then re-approves from scratch.
         if !set_pending_user_turn(cwd, class) {
             revoke(cwd, "pending_user_turn_write_failed");
+            if is_approved(cwd) {
+                let _ = std::fs::remove_file(state_path(cwd));
+            }
         }
         return;
     }
