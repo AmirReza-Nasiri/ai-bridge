@@ -1571,6 +1571,11 @@ pub fn record(
             set_field(&mut s, "status", json!("approved"));
             set_field(&mut s, "revoked_reason", Value::Null);
             set_field(&mut s, "same_findings", json!(0));
+            // v0.31 P1: a fresh real APPROVE for THIS epoch is the new authority — drop any
+            // pending user-turn marker so a stale marker can't suspend/revoke this approval.
+            if let Some(o) = s.as_object_mut() {
+                o.remove("pending_user_turn");
+            }
             let _ = write_state(cwd, &s);
             Outcome::Approved
         }
@@ -1638,6 +1643,20 @@ pub fn record_resume(cwd: &str, expected_epoch: &str, plan: &str, grants: &[Risk
     // The task changed under us (a new prompt started a new epoch) → refuse.
     if epoch != expected_epoch {
         return false;
+    }
+    // v0.31 P1: a pending user-turn marker is a prompt the PreToolUse authority has NOT
+    // reconciled, and a receipt fast-path has NOT reviewed it. Refuse the fast-path for any
+    // NON-TRIVIAL (or malformed) marker so a resume cannot bypass a scope delta; a trivial
+    // continuation is cleared and the resume proceeds (just like a real `record` approve).
+    if let Some(v) = s.get("pending_user_turn").filter(|v| !v.is_null()).cloned() {
+        let trivial = v.get("classification").and_then(Value::as_str)
+            == Some(TurnClass::TrivialContinue.as_marker());
+        if !trivial {
+            return false;
+        }
+        if let Some(o) = s.as_object_mut() {
+            o.remove("pending_user_turn");
+        }
     }
     // Legacy flat class list derived from the structured grants (back-compat/display).
     let classes: Vec<String> = grants.iter().map(|g| g.class.clone()).collect();
@@ -2756,6 +2775,50 @@ mod tests {
         let deny = enforce(&cwd, "Write").expect("escalated marker must re-gate");
         assert!(deny.contains("user_scope_delta"), "{deny}");
         assert!(!is_approved(&cwd));
+    }
+
+    #[test]
+    fn real_approve_clears_a_stale_pending_marker() {
+        // Codex-flagged lifecycle bug: a fresh real APPROVE for the epoch is the NEW authority
+        // and must drop any pending user-turn marker — else the stale marker keeps writes
+        // suspended (or revokes the new approval on the next gated tool).
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "task");
+        approve(&cwd, "plan");
+        set_pending_user_turn(&cwd, TurnClass::UnknownDelta);
+        assert!(!is_effectively_approved(&cwd), "marker suspends approval");
+        approve(&cwd, "plan"); // a fresh real APPROVE for this epoch
+        assert!(!has_pending_user_turn(&cwd), "real approve clears the stale marker");
+        assert!(is_effectively_approved(&cwd), "fresh approval is effective");
+    }
+
+    #[test]
+    fn record_resume_refuses_a_pending_scope_delta() {
+        // A receipt fast-path has NOT reviewed a pending scope-delta turn → it must refuse
+        // (forcing a full review) rather than resume past it.
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "task");
+        approve(&cwd, "plan");
+        set_pending_user_turn(&cwd, TurnClass::UnknownDelta);
+        assert!(
+            !record_resume(&cwd, &current_epoch(&cwd), "plan", &[]),
+            "resume must refuse past an unreconciled scope delta"
+        );
+    }
+
+    #[test]
+    fn record_resume_clears_a_trivial_marker_and_resumes() {
+        // A trivial continuation may resume (like a real approve) — the marker is consumed.
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "task");
+        approve(&cwd, "plan");
+        set_pending_user_turn(&cwd, TurnClass::TrivialContinue);
+        assert!(record_resume(&cwd, &current_epoch(&cwd), "plan", &[]));
+        assert!(!has_pending_user_turn(&cwd), "trivial marker consumed on resume");
+        assert!(is_effectively_approved(&cwd));
     }
 
     #[test]
