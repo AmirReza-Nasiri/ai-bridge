@@ -6,6 +6,36 @@ versioning is semver.
 
 ## [Unreleased]
 
+## [0.32.0] - 2026-05-29
+
+The first step of "Bridge orchestration mode": a **shadow execution router** that, when
+enabled, observes each full plan review and records what an orchestration decision *would*
+have been — plus the real outcome it should be judged against. It is **log-only with zero
+authority**: it never gates, approves, delays, or alters any output, and it is **OFF by
+default**. Nothing about the gate's behavior changes unless you opt in.
+
+### Added
+- **Shadow execution router (log-only).** On a full plan review (never on an instant receipt
+  resume), a pure `analyze(plan, repo_files, max_fanout)` classifies the task as `Single`
+  (the default) or `Orchestrated` (low-confidence; only for clearly-separated, low-risk
+  breadth — ≥3 areas, ≥4 paths, no risk/serial/shared-core signal). The recommendation is
+  appended as one JSON line to `.ai-bridge/router.jsonl`. Enable with `"router": {"shadow":
+  true}` in `review-mcp.json`; cap the hypothetical fan-out with `router.maxFanout` (default
+  4, clamped 1–16). Disabled → not a single extra byte of work on the gate path.
+- **Outcome telemetry (log-only).** With shadow on, two more events join each recommendation
+  by epoch: `plan_gate_outcome` (the plan-review verdict) and `stop_outcome` (whether the
+  Stop review allowed/blocked and how large the reviewed bundle was). This is the signal that
+  will let the router's recommendation quality be measured against reality **before** any
+  advisory surfacing is built (the next phase is deliberately data-gated).
+
+### Internal
+- The shadow call is placed AFTER the receipt fast-path, so an instant resume is never
+  delayed by the `git ls-files` repo scan; only the full-review path logs. The router's
+  log-path discovery walks the filesystem for the `.ai-bridge` ancestor (NO git shell-out on
+  the Stop critical path), and event logging protects reserved keys from caller-supplied
+  fields. Codex `review_diff` on both phases; fixes applied (fast-path ordering, fs-walk
+  log-path, reserved-key protection, Windows-path token matching). Workspace `clippy -D` clean.
+
 ## [0.31.0] - 2026-05-29
 
 Plan-gate Fix Spec v2 (partial): the risk model is tightened, blocks are machine-readable,
