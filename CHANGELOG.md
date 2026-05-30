@@ -6,6 +6,42 @@ versioning is semver.
 
 ## [Unreleased]
 
+## [0.33.0] - 2026-05-30
+
+**Scoped approval** — the plan gate can now confine *where* an approved task writes and let
+read-only repo inspection run without a plan round, plus a fix for the squash-merge checkpoint
+false-positive. Everything is **backward-compatible and opt-in**: with no `ALLOWED-GLOBS:` in
+your plan and the new config flags off (the defaults), the gate behaves exactly as in 0.32.
+
+### Added
+- **Write-time scope fence.** A plan may declare an `ALLOWED-GLOBS:` line; the reviewer echoes
+  `SCOPE-APPROVED:` markers, and only their intersection (breadth-policed: repo-wide rejected,
+  recursive needs an explicit grant) becomes the approved scope. While that scope is in force,
+  `Write`/`Edit`/`MultiEdit`/`NotebookEdit` are confined to it — a target is canonicalized
+  (hardened against `..`/symlink/junction/UNC/ADS/drive escapes) and must match an approved glob,
+  else the write is denied. Fail-closed throughout: a missing target path, corrupt stored scope,
+  or an un-canonicalizable path all deny. Non-declaring plans are unaffected.
+- **Cross-turn approval preservation (`planGate.resetOnUserTurn`, default `true`).** Set it to
+  `false` and a trivial mid-task continuation ("ok", "continue") no longer re-arms the gate; the
+  approval is preserved and the revoke defers to the first out-of-scope write. A contentful
+  message still re-plans.
+- **Read-only discovery carve-out (`planGate.readOnlyOrientation`, default `false`).** Opt in and
+  a tight allowlist of proven read-only commands (`git status`/`log`/summary-`diff`/`show`,
+  `find` without mutating actions, `ls`/`cat`/`head`/`tail`/`wc`) may run *pre-approval*, so
+  inspecting a repo no longer forces a plan round. A positive safe-character gate bars every shell
+  metacharacter; absolute/`..`/option-embedded-path reads and content-rendering git flags are
+  denied. (Owner-accepted residual: lexical, so it grants no write capability and the Stop-gate
+  still reviews the final diff.)
+- Receipt schema **v5** (stores the approved scope so a reload-resume restores the same fence,
+  fail-closed on any malformed field).
+
+### Fixed
+- **Squash-merge checkpoint false-positive.** When the review base is reconstructed (orphaned by a
+  rebase/squash-merge, so the diff spans earlier separately-gated PRs), `review_checkpoint` and the
+  Stop gate now soften *only* the "exceeds the latest plan" breadth check — correctness/safety,
+  missing-required-outcome, and unplanned high-risk review stay strict, and the frontier still only
+  advances on APPROVE. A `scope-note:` records when the softening applied.
+
 ## [0.32.0] - 2026-05-29
 
 The first step of "Bridge orchestration mode": a **shadow execution router** that, when
