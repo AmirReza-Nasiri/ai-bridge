@@ -191,16 +191,17 @@ fn pending_path(cwd: &str) -> PathBuf {
 
 /// Record THIS review's submission (epoch + plan hash) atomically in the separate
 /// `pending` file. One write, no authority-state touch.
-fn write_pending(cwd: &str, epoch: &str, plan_hash: u64) {
+fn write_pending(cwd: &str, epoch: &str, plan_hash: u64) -> bool {
     let d = dir(cwd);
     if std::fs::create_dir_all(&d).is_err() {
-        return;
+        return false;
     }
     let body = json!({ "epoch": epoch, "plan_hash": plan_hash }).to_string();
     let tmp = d.join(format!("pending.tmp.{}", std::process::id()));
     if std::fs::write(&tmp, body).is_ok() {
-        let _ = std::fs::rename(&tmp, pending_path(cwd));
+        return std::fs::rename(&tmp, pending_path(cwd)).is_ok();
     }
+    false
 }
 
 /// The in-flight review's (epoch, plan_hash), if any.
@@ -1342,7 +1343,7 @@ pub fn begin_review(cwd: &str, plan: &str) -> ConsumedTurn {
     if !is_enabled(cwd) {
         return ConsumedTurn::None;
     }
-    write_pending(cwd, &current_epoch(cwd), hash_str(plan));
+    let pending_written = write_pending(cwd, &current_epoch(cwd), hash_str(plan));
     // v0.31 P1: submitting a plan for review IS the agent's response to the current user
     // turn, so consume any pending user-turn marker here ("at review start") and REPORT what
     // it was. A marker that re-appears AFTER this (a new prompt during the minutes-long review)
@@ -1363,6 +1364,13 @@ pub fn begin_review(cwd: &str, plan: &str) -> ConsumedTurn {
             }
         }
     };
+    // Fail closed: only consume the user-turn marker after the in-flight review marker is
+    // confirmed on disk; otherwise revoke and leave the turn pending so the next gated tool
+    // re-gates (a lost review marker must not also silently drop the user turn).
+    if !pending_written {
+        revoke(cwd, "begin_review_pending_write_failed");
+        return consumed;
+    }
     clear_pending_user_turn(cwd);
     consumed
 }
