@@ -821,6 +821,23 @@ pub fn read_only_orientation() -> bool {
     read_only_orientation_from(&read_config())
 }
 
+/// Pure: the `planGate.resetOnUserTurn` flag from a policy Value. DEFAULT TRUE — i.e. the
+/// current behavior, where every user prompt re-arms a fresh PENDING epoch. Only an explicit
+/// `false` opts into v0.31 P1 state-based invalidation (a mid-task clarification/continuation
+/// preserves approval; a scope change re-gates). An absent/non-bool/malformed value reads
+/// TRUE (fail-safe: the relaxation never turns on by accident).
+fn reset_on_user_turn_from(cfg: &Value) -> bool {
+    match cfg.get("planGate").and_then(|p| p.get("resetOnUserTurn")) {
+        Some(Value::Bool(b)) => *b,
+        _ => true,
+    }
+}
+
+/// Whether each user prompt re-arms the gate (on-disk config). DEFAULT TRUE (current behavior).
+pub fn reset_on_user_turn() -> bool {
+    reset_on_user_turn_from(&read_config())
+}
+
 // ───────────────────────── v0.29 (O1d): review-model CLI + doctor reporting ─────────────
 //
 // Honest reporting of the PERSISTED review-model config. A hand-edited review-mcp.json can

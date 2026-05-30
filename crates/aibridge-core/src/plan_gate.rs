@@ -263,9 +263,117 @@ pub fn on_user_prompt(stdin: &str) {
     start_epoch(cwd, session, prompt);
 }
 
-/// Begin a fresh PENDING epoch for a new task (called by the UserPromptSubmit
-/// hook). The epoch id ties an approval to THIS task so a later prompt re-gates.
+// ---------------------------------------------------------------------------
+// v0.31 P1: state-based invalidation (behind `planGate.resetOnUserTurn`, default
+// TRUE = today's per-turn reset). When the flag is FALSE, a mid-task prompt no
+// longer always re-arms the gate: a TRIVIAL continuation preserves the approval,
+// while anything else (or an explicit cancel/reset) re-gates. The classification
+// is CHEAP + PURE (no LLM/IO) and runs in the short-lived UserPromptSubmit hook;
+// the PreToolUse hook makes the AUTHORITATIVE decision via [`reconcile_pending_user_turn`]
+// before any mutator. The default direction is INVALIDATE-unless-trivially-safe
+// (fail closed). High-risk commands STILL re-gate via the P3 risk-delta check even
+// under a preserved approval, so the relaxation only ever preserves ordinary writes.
+// ---------------------------------------------------------------------------
+
+/// How a mid-task user prompt relates to an in-flight approved plan (cheap, pure).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnClass {
+    /// Explicit cancel/pause/stop/reset → invalidate (fresh epoch).
+    ExplicitReset,
+    /// A pure affirmation/continuation from a tiny exact allowlist → may preserve.
+    TrivialContinue,
+    /// Anything else → unknown scope delta → invalidate (fail closed).
+    UnknownDelta,
+}
+
+impl TurnClass {
+    fn as_marker(self) -> &'static str {
+        match self {
+            TurnClass::ExplicitReset => "explicit_reset",
+            TurnClass::TrivialContinue => "trivial_continue",
+            TurnClass::UnknownDelta => "unknown_delta",
+        }
+    }
+}
+
+/// Cheap, pure classification of a mid-task prompt — NO LLM, NO IO (safe for the
+/// short-lived UserPromptSubmit hook). Default is [`TurnClass::UnknownDelta`] so any
+/// free-form text re-gates; only an explicit reset word or an EXACT trivial-continue
+/// token is special-cased. NOTE: because a bare affirmation ("yes") could in principle
+/// answer a scope-broadening question, this MVP relies on two backstops that remain
+/// active under a preserved approval — the P3 risk-delta re-gate for any high-risk
+/// command, and the Stop-hook diff review — and the relaxation ships behind a flag that
+/// defaults OFF. Recording the clarification question + a tool-context file-scope check
+/// (to also re-gate ordinary out-of-scope writes) is the required follow-up before the
+/// default may flip.
+fn classify_turn(prompt: &str) -> TurnClass {
+    let p = prompt.trim().to_lowercase();
+    if p.is_empty() {
+        return TurnClass::TrivialContinue; // an empty re-prompt is a no-op continuation
+    }
+    // Explicit cancel/reset. Broad matching here is SAFE because it only ever invalidates.
+    const RESET: &[&str] = &[
+        "cancel",
+        "abort",
+        "reset",
+        "stop",
+        "pause",
+        "start over",
+        "never mind",
+        "nevermind",
+        "forget it",
+        "scrap that",
+    ];
+    if RESET
+        .iter()
+        .any(|w| p == *w || p.starts_with(&format!("{w} ")) || p.starts_with(&format!("{w},")))
+    {
+        return TurnClass::ExplicitReset;
+    }
+    // Tiny EXACT-match trivial-continue allowlist (pure affirmations with no scope content).
+    // A trailing run of `!.?,` is stripped so "ok." / "yes!" still match.
+    let pp = p.trim_end_matches(|c: char| "!.?,".contains(c)).trim();
+    const CONTINUE: &[&str] = &[
+        "ok", "okay", "yes", "yeah", "yep", "y", "continue", "proceed", "go ahead", "go on",
+    ];
+    if CONTINUE.contains(&pp) {
+        return TurnClass::TrivialContinue;
+    }
+    TurnClass::UnknownDelta
+}
+
+/// Pure decision for [`start_epoch`]: given the flag + whether a plan is currently
+/// approved + the prompt's class, should we PRESERVE the approved epoch (recording a
+/// pending user-turn marker for the PreToolUse authority) or start a FRESH epoch?
+/// `true` = preserve. Kept pure so the policy is unit-testable without config/IO.
+fn preserve_epoch_decision(reset_on_user_turn: bool, currently_approved: bool, class: TurnClass) -> bool {
+    if reset_on_user_turn || !currently_approved {
+        return false; // default behavior: every prompt re-arms a fresh epoch
+    }
+    // Flag OFF + an approved plan in flight: preserve unless the user explicitly reset.
+    !matches!(class, TurnClass::ExplicitReset)
+}
+
+/// Begin a fresh PENDING epoch for a new task (called by the UserPromptSubmit hook),
+/// UNLESS `planGate.resetOnUserTurn` is false AND a plan is currently approved AND the
+/// prompt is not an explicit reset — in which case the approved epoch is PRESERVED and a
+/// pending user-turn marker is recorded for the PreToolUse authority to reconcile before
+/// the next mutator. The epoch id ties an approval to THIS task so a later prompt re-gates.
 pub fn start_epoch(cwd: &str, session: &str, prompt: &str) {
+    let class = classify_turn(prompt);
+    if preserve_epoch_decision(
+        crate::review_mcp::reset_on_user_turn(),
+        is_approved(cwd),
+        class,
+    ) {
+        // Preserve the approval; record the pending user-turn for PreToolUse to reconcile.
+        // A failed marker write must FAIL CLOSED — revoke so a preserved-but-unreconciled
+        // turn can never leave stale approval live.
+        if !set_pending_user_turn(cwd, class) {
+            revoke(cwd, "pending_user_turn_write_failed");
+        }
+        return;
+    }
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
@@ -291,6 +399,67 @@ pub fn start_epoch(cwd: &str, session: &str, prompt: &str) {
         // rather than letting a stale approval unlock this new task.
         let _ = std::fs::remove_file(state_path(cwd));
     }
+}
+
+/// Record a pending user-turn marker on the current (preserved) approved epoch. Returns
+/// `false` if state can't be read/written (caller fails closed). Stored INSIDE `state.json`
+/// (not the separate review `pending` file) as a nullable object so it travels with the
+/// authority state and a corrupt/missing value reads as "present" → fail closed.
+fn set_pending_user_turn(cwd: &str, class: TurnClass) -> bool {
+    let Some(mut s) = read_state(cwd) else {
+        return false;
+    };
+    set_field(
+        &mut s,
+        "pending_user_turn",
+        json!({ "classification": class.as_marker() }),
+    );
+    write_state(cwd, &s).is_ok()
+}
+
+/// Whether an UNCONSUMED pending user-turn marker is present (any non-null value, incl.
+/// malformed → treated as present so [`effectively_approved`] fails closed).
+fn has_pending_user_turn(cwd: &str) -> bool {
+    read_state(cwd)
+        .and_then(|s| s.get("pending_user_turn").cloned())
+        .map(|v| !v.is_null())
+        .unwrap_or(false)
+}
+
+/// Drop the pending user-turn marker (best-effort; the marker was consumed by reconcile).
+fn clear_pending_user_turn(cwd: &str) {
+    if let Some(mut s) = read_state(cwd) {
+        if let Some(o) = s.as_object_mut() {
+            o.remove("pending_user_turn");
+        }
+        let _ = write_state(cwd, &s);
+    }
+}
+
+/// PreToolUse authority (v0.31 P1): consume any pending user-turn marker BEFORE a mutator
+/// runs. `None` → nothing pending, or a trivial continuation was preserved (approval stands).
+/// `Some(deny_json)` → the prompt was a scope delta (or the marker is malformed): the approval
+/// is revoked and the write is denied with `user_scope_delta` so the plan is re-reviewed.
+/// Idempotent: clears the marker either way so it cannot loop. A no-op when the flag is on
+/// (no marker is ever written) — so default behavior is byte-identical.
+pub fn reconcile_pending_user_turn(cwd: &str) -> Option<String> {
+    let class = match read_state(cwd).and_then(|s| s.get("pending_user_turn").cloned()) {
+        None | Some(Value::Null) => return None, // nothing pending
+        Some(v) => v
+            .get("classification")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    };
+    // Trivial continuation → preserve approval (just consume the marker).
+    if class.as_deref() == Some(TurnClass::TrivialContinue.as_marker()) {
+        clear_pending_user_turn(cwd);
+        return None;
+    }
+    // Anything else (unknown delta, explicit_reset that slipped through, or a malformed/
+    // missing classification) → re-gate. Fail closed.
+    revoke(cwd, "user_scope_delta");
+    clear_pending_user_turn(cwd);
+    Some(deny_json(BlockReason::UserScopeDelta))
 }
 
 /// The current epoch id (or a synthesized "manual" one if no prompt started a
@@ -377,6 +546,13 @@ fn effectively_approved(cwd: &str) -> bool {
     if !is_approved(cwd) {
         return false;
     }
+    // v0.31 P1: an UNCONSUMED pending user-turn marker suspends effective approval until a
+    // PreToolUse [`reconcile_pending_user_turn`] resolves it. Fail closed: a present-but-
+    // malformed marker also reads as pending. (No marker is ever written when the flag is on,
+    // so this is a no-op in the default per-turn-reset mode.)
+    if has_pending_user_turn(cwd) {
+        return false;
+    }
     if !pending_path(cwd).exists() {
         return true; // no in-flight review → approval stands
     }
@@ -441,7 +617,20 @@ fn read_only_execution_supported() -> bool {
 /// handling for Bash). The command is only consulted on the Bash read-only-orientation
 /// path; for every other tool (and an empty command) the decision is exactly as before.
 pub fn enforce_tool(cwd: &str, tool_name: &str, command: &str) -> Option<String> {
-    if !is_gated_tool(tool_name) || !blocks_writes(cwd) {
+    if !is_gated_tool(tool_name) {
+        return None;
+    }
+    // v0.31 P1: when the gate is actually enforcing, consume any pending user-turn marker
+    // BEFORE deciding. A scope-delta turn revokes + denies here (user_scope_delta); a trivial
+    // continuation just clears the marker so `blocks_writes` below sees the preserved approval.
+    // Skipped when bypassed/disabled (don't re-gate a turn while the gate is off), and a no-op
+    // when `resetOnUserTurn` is on (no marker is ever written).
+    if is_enabled(cwd) && !bypassed() {
+        if let Some(deny) = reconcile_pending_user_turn(cwd) {
+            return Some(deny);
+        }
+    }
+    if !blocks_writes(cwd) {
         return None;
     }
     // v0.31 (P2) read-only orientation carve-out (DEFAULT OFF; currently INERT). When the
@@ -2383,6 +2572,132 @@ mod tests {
                 "widened push in a chain must still re-gate: {cmd}"
             );
         }
+    }
+
+    // --- v0.31 P1: state-based invalidation (behind resetOnUserTurn, default TRUE) -------
+
+    #[test]
+    fn classify_turn_only_trivial_affirmations_preserve() {
+        use TurnClass::*;
+        for t in ["ok", "okay", "OK", "Yes", "yes!", "yeah", "yep", "y", "continue", "proceed", "go ahead", "go on", ""] {
+            assert_eq!(classify_turn(t), TrivialContinue, "{t:?} must be trivial");
+        }
+        for t in ["cancel", "stop", "reset", "pause", "abort", "never mind", "start over", "stop, do something else"] {
+            assert_eq!(classify_turn(t), ExplicitReset, "{t:?} must be explicit reset");
+        }
+        for t in [
+            "also add a delete endpoint",
+            "actually use postgres instead",
+            "yes but also push to prod",
+            "ok now migrate the db",
+            "do it", // not in the tiny allowlist → fail closed to delta
+        ] {
+            assert_eq!(classify_turn(t), UnknownDelta, "{t:?} must be unknown delta");
+        }
+    }
+
+    #[test]
+    fn preserve_epoch_decision_is_invalidate_unless_trivially_safe() {
+        use TurnClass::*;
+        // Flag ON (default) → never preserve (today's per-turn reset).
+        assert!(!preserve_epoch_decision(true, true, TrivialContinue));
+        // No current approval → nothing to preserve.
+        assert!(!preserve_epoch_decision(false, false, TrivialContinue));
+        // Flag OFF + approved: preserve for trivial AND unknown (the marker defers the
+        // authoritative decision to reconcile), but NOT for an explicit reset.
+        assert!(preserve_epoch_decision(false, true, TrivialContinue));
+        assert!(preserve_epoch_decision(false, true, UnknownDelta));
+        assert!(!preserve_epoch_decision(false, true, ExplicitReset));
+    }
+
+    #[test]
+    fn default_reset_mode_still_re_gates_every_prompt() {
+        // With the flag at its default (TRUE) — the config reader returns true in tests —
+        // start_epoch must re-arm a fresh epoch even for a trivial "yes", and write NO marker.
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "task");
+        approve(&cwd, "plan");
+        assert!(is_approved(&cwd));
+        start_epoch(&cwd, "sess", "yes"); // a trivial continuation, but flag is ON
+        assert!(!is_approved(&cwd), "default mode re-gates every prompt");
+        assert!(!has_pending_user_turn(&cwd), "no marker in per-turn-reset mode");
+        assert!(blocks_writes(&cwd));
+    }
+
+    #[test]
+    fn pending_turn_suspends_approval_until_reconciled() {
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "task");
+        approve(&cwd, "plan");
+        assert!(!blocks_writes(&cwd));
+        // Simulate the flag-OFF preserve path: a marker is recorded on the approved epoch.
+        assert!(set_pending_user_turn(&cwd, TurnClass::TrivialContinue));
+        // Effective approval is SUSPENDED until a PreToolUse reconciles it (fail-safe).
+        assert!(!effectively_approved(&cwd));
+        assert!(blocks_writes(&cwd));
+    }
+
+    #[test]
+    fn trivial_continuation_auto_reconciles_and_allows() {
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "task");
+        approve(&cwd, "plan");
+        set_pending_user_turn(&cwd, TurnClass::TrivialContinue);
+        // enforce (PreToolUse) reconciles the trivial marker → approval restored → allowed.
+        assert!(enforce(&cwd, "Write").is_none(), "trivial continuation must auto-allow");
+        assert!(!has_pending_user_turn(&cwd), "marker consumed");
+        assert!(is_approved(&cwd), "approval preserved across a trivial continuation");
+    }
+
+    #[test]
+    fn scope_delta_turn_re_gates_with_user_scope_delta() {
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "task");
+        approve(&cwd, "plan");
+        set_pending_user_turn(&cwd, TurnClass::UnknownDelta);
+        let deny = enforce(&cwd, "Write").expect("scope delta must deny");
+        let reason = serde_json::from_str::<Value>(&deny)
+            .unwrap()
+            .pointer("/hookSpecificOutput/permissionDecisionReason")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+        assert!(reason.contains("user_scope_delta"), "{reason}");
+        assert!(!is_approved(&cwd), "scope delta revokes approval");
+        assert!(blocks_writes(&cwd));
+        assert!(!has_pending_user_turn(&cwd), "marker consumed even on re-gate");
+    }
+
+    #[test]
+    fn malformed_pending_turn_fails_closed() {
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "task");
+        approve(&cwd, "plan");
+        // A present-but-malformed marker (classification not a string) must NOT preserve.
+        let mut s = read_state(&cwd).unwrap();
+        set_field(&mut s, "pending_user_turn", json!({ "classification": 123 }));
+        write_state(&cwd, &s).unwrap();
+        assert!(!effectively_approved(&cwd), "malformed marker suspends approval");
+        let deny = reconcile_pending_user_turn(&cwd);
+        assert!(deny.is_some(), "malformed marker must re-gate (fail closed)");
+        assert!(!is_approved(&cwd));
+    }
+
+    #[test]
+    fn reconcile_is_noop_without_a_marker() {
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "task");
+        approve(&cwd, "plan");
+        // No marker (default per-turn-reset mode never writes one) → reconcile does nothing.
+        assert!(reconcile_pending_user_turn(&cwd).is_none());
+        assert!(is_approved(&cwd));
+        assert!(!blocks_writes(&cwd));
     }
 
     #[test]
