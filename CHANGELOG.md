@@ -6,6 +6,44 @@ versioning is semver.
 
 ## [Unreleased]
 
+## [0.31.0] - 2026-05-29
+
+Plan-gate Fix Spec v2 (partial): the risk model is tightened, blocks are machine-readable,
+and the mid-task re-gate friction has an opt-in fix. **Default behavior is unchanged unless
+you opt in** — `planGate.resetOnUserTurn` defaults to `true` (today's per-prompt re-arm).
+
+### Added / Changed
+- **Structured risk grants (P3).** A reviewer's `RISK-APPROVED: remote-publish` now authorizes
+  only a STANDARD push; widened forms (`--force`/`-f`/`--mirror`/`--all`/`--prune`/`--delete`/
+  `--tags`/`+refspec`/`:refspec`/explicit tag push) re-gate with a `risk_policy_widened` reason
+  unless granted explicitly as `remote-publish:widened`. New risk classes added: payment,
+  refund, webhook, queue, admin-auth. `PLAN_RECEIPT_VERSION` → 4 (a one-time fresh review on
+  upgrade; old/malformed receipts fail closed).
+- **Machine-readable block reason codes (P6).** `PLAN_GATE_REQUIRED:` / `PLAN_RISK_DELTA_REQUIRED:`
+  now carry a stable snake_case code token (e.g. `no_active_approval`, `new_risk_surface=<class>`)
+  plus a recovery hint, so tooling can branch on the cause without parsing prose.
+- **Opt-in state-based invalidation (P1) — `planGate.resetOnUserTurn` (default `true`).** When set
+  to `false`, a mid-task *trivial continuation* (ok/yes/continue/…) preserves the approved plan
+  instead of re-arming the gate; a scope change or explicit cancel/reset still re-gates; and
+  high-risk commands always re-gate (the P3 risk delta is unaffected). Default `true` keeps the
+  current behavior byte-for-byte.
+
+### Fixed
+- **Widened-push detection no longer leaks across chained sub-commands** — a plain `git push …`
+  chained with a sibling `rm -f`/`git branch -d`/`chmod +x`/`echo :x` is no longer mis-flagged
+  WIDENED (shape is now analyzed only on the `git … push` segment).
+
+### Internal
+- Regression tests pinning the prior strict behavior; squash/orphan/ancestor frontier tests.
+- Four fail-open fixes in the P1 opt-in path, found by independent-model (Codex) review:
+  monotonic pending-turn marker, clear-stale-marker-on-approve, review-in-flight consume/refuse,
+  and receipt-fast-path skip for a consumed non-trivial turn; plus pending-marker IO fail-closed.
+
+### Deferred (tracked follow-ups)
+- Flipping `resetOnUserTurn` to `false` by default (needs a PreToolUse tool-context file-scope check).
+- P2 read-only orientation (only an inert default-off seam shipped; the carve-out needs a hardened
+  execution layer). P4 canonical fingerprints + delta review.
+
 ## [0.30.0] - 2026-05-29
 
 Gate workflow hardening + speed: the review frontier no longer drops committed-but-
