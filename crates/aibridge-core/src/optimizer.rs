@@ -209,37 +209,43 @@ mod tests {
     }
 
     #[test]
-    fn pretooluse_threads_command_to_plan_gate_but_p2_is_behavior_neutral() {
+    fn pretooluse_threads_bash_command_to_the_gate() {
         use std::sync::atomic::{AtomicU64, Ordering};
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
         let cwd = std::env::temp_dir().join(format!(
-            "aibridge-optimizer-p2-{}-{}",
+            "aibridge-optimizer-thread-{}-{}",
             std::process::id(),
             n
         ));
         std::fs::create_dir_all(&cwd).unwrap();
         let cwd = cwd.display().to_string();
-        // Enable an unapproved gate: a read-only-looking Bash command must STILL be
-        // denied pre-approval (the P2 carve-out is inert), and the deny carries the
-        // default no_active_approval code — proving the command is threaded through
-        // enforce_tool without yet enabling any pre-approval allowance.
+        // Enable an unapproved gate. A clearly-MUTATING Bash command is denied pre-approval
+        // regardless of the read-only carve-out's orientation config — proving the command is
+        // threaded through enforce_tool_scoped. (The carve-out's ON/OFF behavior is covered
+        // config-free in plan_gate::tests::read_only_carveout_is_opt_in_and_obeys_injected_orientation.)
         crate::plan_gate::enable(&cwd).unwrap();
         crate::plan_gate::start_epoch(&cwd, "sess", "task");
         let payload = json!({
             "tool_name": "Bash",
             "cwd": cwd,
-            "tool_input": {"command": "ls -la src"}
+            "tool_input": {"command": "npm install left-pad"}
         });
         let out = pretooluse(&payload);
         let v: Value = serde_json::from_str(&out).expect("deny is valid json");
+        assert_eq!(
+            v.pointer("/hookSpecificOutput/permissionDecision")
+                .and_then(Value::as_str),
+            Some("deny"),
+            "a mutating Bash command must be denied pre-approval, got: {out}"
+        );
         let reason = v
             .pointer("/hookSpecificOutput/permissionDecisionReason")
             .and_then(Value::as_str)
             .unwrap();
         assert!(
-            reason.contains("PLAN_GATE_REQUIRED: no_active_approval"),
-            "flag-OFF / inert carve-out keeps the strict default, got: {reason}"
+            reason.contains("PLAN_GATE_REQUIRED:"),
+            "deny carries the plan-gate tag, got: {reason}"
         );
     }
 

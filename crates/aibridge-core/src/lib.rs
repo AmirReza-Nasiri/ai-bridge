@@ -21,6 +21,7 @@ pub mod plan_gate;
 pub mod plan_receipt;
 pub mod process_cleanup;
 pub mod progress;
+pub mod read_only_exec;
 pub mod review_frontier;
 pub mod review_mcp;
 pub mod router;

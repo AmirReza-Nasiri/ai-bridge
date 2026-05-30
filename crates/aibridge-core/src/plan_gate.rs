@@ -679,21 +679,22 @@ pub fn is_gated_tool(tool_name: &str) -> bool {
 
 /// PreToolUse enforcement (legacy 2-arg surface): `Some(deny_json)` to block a write
 /// before approval, `None` to let the caller proceed. Thin wrapper over [`enforce_tool`]
-/// with an EMPTY command — so the Bash path can never satisfy the (deferred) read-only
-/// carve-out, keeping every existing 2-arg caller byte-identical to pre-P2 behavior.
+/// with an EMPTY command — which the read-only carve-out never proves read-only
+/// (`is_read_only("")` is false), keeping every existing 2-arg caller byte-identical.
 pub fn enforce(cwd: &str, tool_name: &str) -> Option<String> {
     enforce_tool(cwd, tool_name, "")
 }
 
-/// v0.31 (P2): whether the read-only orientation carve-out may EXECUTE a Bash command
-/// pre-approval. Returns `false` in P2 — the carve-out additionally requires a hardened
-/// execution layer (trusted-exe resolution, clean env, no shell startup/functions/aliases,
-/// argv execution) that does NOT yet exist; a parser-only proof can't prove read-only
-/// EXECUTION (shell functions/aliases/builtins, PATH-hijack, `BASH_ENV`). Flipped to a
-/// real capability check when that layer lands. Keeping it const-false makes the read-only
-/// branch in [`enforce_tool`] INERT, so the gate's behavior is unchanged in P2.
+/// v0.32: whether the read-only-orientation carve-out is BACKED by an implementation. Now
+/// `true` — the pre-approval carve-out is driven by the lexical [`crate::read_only_exec`]
+/// classifier (a tight allowlist behind a positive safe-character gate) and is gated by the
+/// opt-in `planGate.readOnlyOrientation` config (default off). OWNER-ACCEPTED RESIDUAL: a
+/// lexical check can't prove the resolved binary's identity / a clean exec env, and Git
+/// read-only porcelain may touch `.git`-metadata (index refresh / optional locks) — never
+/// working-tree/source content, never a file-scope bypass; the Stop-gate backstops. Kept as a
+/// function (not a literal) so a future hardened-exec layer can refine it.
 fn read_only_execution_supported() -> bool {
-    false
+    true
 }
 
 /// Tool-context for the v0.32 Unit 4 write-time scope fence. A tri-state so the fence fails
@@ -728,6 +729,25 @@ pub fn enforce_tool_scoped(
     target: WriteTarget,
     command: &str,
 ) -> Option<String> {
+    enforce_tool_scoped_with(
+        cwd,
+        tool_name,
+        target,
+        command,
+        crate::review_mcp::read_only_orientation(),
+    )
+}
+
+/// [`enforce_tool_scoped`] with the `planGate.readOnlyOrientation` flag INJECTED, so the
+/// pre-approval read-only carve-out branch is testable without reading the operator's real
+/// `review-mcp.json`. The public wrapper supplies the real config value.
+fn enforce_tool_scoped_with(
+    cwd: &str,
+    tool_name: &str,
+    target: WriteTarget,
+    command: &str,
+    orientation_on: bool,
+) -> Option<String> {
     if !is_gated_tool(tool_name) {
         return None;
     }
@@ -750,16 +770,12 @@ pub fn enforce_tool_scoped(
         }
         return None;
     }
-    // v0.31 (P2) read-only orientation carve-out (DEFAULT OFF; currently INERT). When the
-    // flag is ON *and* a hardened execution layer exists, a Bash command PROVEN read-only
-    // could run with no approved plan. In P2 `read_only_execution_supported()` is const-false,
-    // so this branch never allows — behavior is byte-identical to the strict default. The
-    // command is threaded now so the follow-up only flips the capability + adds the proof.
-    if tool_name == "Bash"
-        && read_only_execution_supported()
-        && crate::review_mcp::read_only_orientation()
-        && read_only_proven(cwd, command)
-    {
+    // v0.32 read-only discovery carve-out (opt-in via `planGate.readOnlyOrientation`, default
+    // off). A Bash command the lexical classifier proves read-only may RUN pre-approval, so
+    // inspecting a repo (`git status`/`diff`, `find`, `ls`…) does not force a plan_gate round.
+    // Owner-accepted residual (see [`crate::read_only_exec`]): no working-tree/source write
+    // capability is granted; the Stop-gate still reviews the final diff.
+    if tool_name == "Bash" && read_only_carveout(orientation_on, command) {
         return None;
     }
     // Count repeated denied writes so the operator can see a wrong-loop (Claude
@@ -771,14 +787,10 @@ pub fn enforce_tool_scoped(
         }
         let _ = write_state(cwd, &s);
     }
-    // Pre-approval block. A flag-ON Bash command the read-only carve-out could not prove
-    // safe denies with the dedicated parser reason code; everything else is the default
-    // no-active-approval block. (Both are inert-equivalent in P2 because the carve-out is
-    // disabled, but the code selection is wired for the follow-up.)
-    let reason = if tool_name == "Bash"
-        && read_only_execution_supported()
-        && crate::review_mcp::read_only_orientation()
-    {
+    // Pre-approval block. When the read-only carve-out is ENABLED, a Bash command it could not
+    // prove read-only denies with the dedicated parser reason code; everything else is the
+    // default no-active-approval block.
+    let reason = if tool_name == "Bash" && read_only_execution_supported() && orientation_on {
         BlockReason::ReadOnlyParserDenial
     } else {
         BlockReason::NoActiveApproval
@@ -901,13 +913,12 @@ fn scope_fence(cwd: &str, tool_name: &str, target: WriteTarget) -> Option<String
     }
 }
 
-/// v0.31 (P2): whether a Bash `command` is PROVEN read-only (and path-confined to `cwd`).
-/// DEFERRED — the sound implementation needs the hardened execution layer
-/// ([`read_only_execution_supported`]); until then this always returns `false` so the
-/// carve-out never allows. Threaded through [`enforce_tool`] so only this function + the
-/// capability flag change when the parser/exec layer lands.
-fn read_only_proven(_cwd: &str, _command: &str) -> bool {
-    false
+/// v0.32: whether the read-only discovery carve-out ALLOWS `command` to run pre-approval.
+/// Pure (no IO): the carve-out must be BACKED ([`read_only_execution_supported`]), ENABLED
+/// (`orientation_on`, from the opt-in config), AND the command must pass the lexical
+/// [`crate::read_only_exec::is_read_only`] classifier. Fail-closed: any `false` → still gated.
+fn read_only_carveout(orientation_on: bool, command: &str) -> bool {
+    read_only_execution_supported() && orientation_on && crate::read_only_exec::is_read_only(command)
 }
 
 /// Machine-readable block reason codes for the `PLAN_GATE_REQUIRED:` family (v0.31
@@ -2869,32 +2880,48 @@ mod tests {
     }
 
     #[test]
-    fn enforce_tool_threads_command_but_is_behavior_neutral_in_p2() {
-        // P2 wires the command through enforce_tool + an INERT read-only-orientation seam
-        // (read_only_execution_supported() is const-false), so a Bash command is STILL
-        // denied pre-approval — with the default no_active_approval code, not the parser
-        // code — and the 2-arg enforce() wrapper is identical to enforce_tool(..,"").
+    fn read_only_carveout_is_opt_in_and_obeys_injected_orientation() {
+        // v0.32: the carve-out is opt-in. With orientation OFF a read-only Bash command is
+        // still denied pre-approval (default code). With orientation ON the classifier admits
+        // a read-only command but still denies a mutating one (parser code). All exercised via
+        // the config-injected path so no test reads the operator's real review-mcp.json.
         let cwd = tmp();
         enable(&cwd).unwrap();
         start_epoch(&cwd, "sess", "task");
-        // A read-only-looking Bash command is denied (carve-out is inert in P2).
-        let deny = enforce_tool(&cwd, "Bash", "ls -la src").expect("Bash denied pre-approval");
-        let v: Value = serde_json::from_str(&deny).expect("deny is valid json");
-        let reason = v
-            .pointer("/hookSpecificOutput/permissionDecisionReason")
-            .and_then(Value::as_str)
-            .unwrap();
+        let reason_of = |deny: &str| -> String {
+            let v: Value = serde_json::from_str(deny).expect("deny is valid json");
+            v.pointer("/hookSpecificOutput/permissionDecisionReason")
+                .and_then(Value::as_str)
+                .unwrap()
+                .to_string()
+        };
+        // OFF: `git status` denied with the default no_active_approval code.
+        let deny = enforce_tool_scoped_with(&cwd, "Bash", WriteTarget::Unknown, "git status", false)
+            .expect("read-only Bash denied pre-approval when carve-out off");
+        assert!(reason_of(&deny).contains("PLAN_GATE_REQUIRED: no_active_approval"));
+        // ON: a proven read-only command is allowed to RUN pre-approval.
         assert!(
-            reason.contains("PLAN_GATE_REQUIRED: no_active_approval"),
-            "inert P2 carve-out must keep the default code, got: {reason}"
+            enforce_tool_scoped_with(&cwd, "Bash", WriteTarget::Unknown, "git status", true)
+                .is_none(),
+            "read-only `git status` should run pre-approval when carve-out on"
         );
-        // Writes are denied regardless of any command argument.
-        assert!(enforce_tool(&cwd, "Write", "ls").is_some());
-        // The wrapper and the empty-command call agree (byte-identical OFF path).
+        // ON: a mutating command is still denied, now with the parser reason code.
+        let deny = enforce_tool_scoped_with(&cwd, "Bash", WriteTarget::Unknown, "rm -rf x", true)
+            .expect("mutating Bash still denied when carve-out on");
+        assert!(reason_of(&deny).contains("PLAN_GATE_REQUIRED: read_only_parser_denial"));
+        // Writes never carve out, regardless of orientation.
+        assert!(
+            enforce_tool_scoped_with(&cwd, "Write", WriteTarget::Unknown, "", true).is_some(),
+            "Write is never admitted by the read-only carve-out"
+        );
+        // The legacy enforce() wrapper passes an EMPTY command → never read-only → stays denied.
+        assert!(enforce(&cwd, "Bash").is_some());
         assert_eq!(enforce(&cwd, "Bash"), enforce_tool(&cwd, "Bash", ""));
-        // read_only_proven is deferred → never proves anything in P2.
-        assert!(!read_only_proven(&cwd, "ls"));
-        assert!(!read_only_execution_supported());
+        // The carve-out is now backed; the pure decision helper gates on orientation + classifier.
+        assert!(read_only_execution_supported());
+        assert!(read_only_carveout(true, "git status"));
+        assert!(!read_only_carveout(false, "git status"));
+        assert!(!read_only_carveout(true, "rm -rf x"));
     }
 
     // ── v0.32 Unit 4: post-approval write-time scope fence ──────────────────────────────
