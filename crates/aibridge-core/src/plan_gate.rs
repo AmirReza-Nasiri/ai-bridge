@@ -1330,6 +1330,12 @@ pub fn begin_review(cwd: &str, plan: &str) {
         return;
     }
     write_pending(cwd, &current_epoch(cwd), hash_str(plan));
+    // v0.31 P1: submitting a plan for review IS the agent's response to the current user
+    // turn, so consume any pending user-turn marker here ("at review start"). A marker that
+    // re-appears AFTER this (a new prompt during the minutes-long review) is then detectable
+    // by `record`, which refuses to approve an unreviewed turn. No-op in default reset mode
+    // (no marker is ever written) and harmless when none exists.
+    clear_pending_user_turn(cwd);
 }
 
 /// A post-approval risk delta the approved plan did not cover (v0.31 P3). Either a
@@ -1548,6 +1554,20 @@ pub fn record(
                     _ => {}
                 }
             }
+            // v0.31 P1: a pending user-turn marker present NOW appeared AFTER begin_review
+            // consumed the prior one — i.e. a NEW user message arrived during the (minutes-long)
+            // review and was NOT reviewed. Refuse so the agent re-submits a plan accounting for it
+            // (rather than unlocking writes for an unreviewed turn). No-op in default reset mode.
+            if s.get("pending_user_turn")
+                .filter(|v| !v.is_null())
+                .is_some()
+            {
+                return Outcome::NeedsInfo(
+                    "AI Bridge: a new user message arrived while this plan was under review — \
+                     re-submit the current plan to plan_gate before proceeding."
+                        .to_string(),
+                );
+            }
             set_field(&mut s, "approved", json!(true));
             // Bind approval to THIS epoch so is_approved() can reject a stale flag.
             set_field(&mut s, "approved_epoch", json!(epoch));
@@ -1571,11 +1591,6 @@ pub fn record(
             set_field(&mut s, "status", json!("approved"));
             set_field(&mut s, "revoked_reason", Value::Null);
             set_field(&mut s, "same_findings", json!(0));
-            // v0.31 P1: a fresh real APPROVE for THIS epoch is the new authority — drop any
-            // pending user-turn marker so a stale marker can't suspend/revoke this approval.
-            if let Some(o) = s.as_object_mut() {
-                o.remove("pending_user_turn");
-            }
             let _ = write_state(cwd, &s);
             Outcome::Approved
         }
@@ -2778,19 +2793,46 @@ mod tests {
     }
 
     #[test]
-    fn real_approve_clears_a_stale_pending_marker() {
-        // Codex-flagged lifecycle bug: a fresh real APPROVE for the epoch is the NEW authority
-        // and must drop any pending user-turn marker — else the stale marker keeps writes
-        // suspended (or revokes the new approval on the next gated tool).
+    fn begin_review_consumes_the_marker_then_approve_unlocks() {
+        // The proper re-plan flow: a user turn set a marker; the agent re-submits a plan, so
+        // begin_review consumes the marker ("at review start"); the subsequent APPROVE unlocks.
         let cwd = tmp();
         enable(&cwd).unwrap();
         start_epoch(&cwd, "sess", "task");
-        approve(&cwd, "plan");
+        approve(&cwd, "plan v1");
         set_pending_user_turn(&cwd, TurnClass::UnknownDelta);
         assert!(!is_effectively_approved(&cwd), "marker suspends approval");
-        approve(&cwd, "plan"); // a fresh real APPROVE for this epoch
-        assert!(!has_pending_user_turn(&cwd), "real approve clears the stale marker");
-        assert!(is_effectively_approved(&cwd), "fresh approval is effective");
+        begin_review(&cwd, "plan v2"); // re-plan consumes the marker at review start
+        assert!(!has_pending_user_turn(&cwd), "begin_review consumed the marker");
+        record(
+            &cwd,
+            &current_epoch(&cwd),
+            "plan v2",
+            &crate::gate::Verdict::Approve,
+            "",
+        );
+        assert!(is_effectively_approved(&cwd), "re-planned approval is effective");
+    }
+
+    #[test]
+    fn user_turn_arriving_during_review_refuses_approve() {
+        // Codex-flagged race: if a NON-trivial prompt arrives AFTER begin_review (during the
+        // in-flight Codex review), the marker re-appears and `record` must REFUSE the approve —
+        // the new turn was never reviewed, so writes must not unlock.
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "task");
+        let epoch = current_epoch(&cwd);
+        begin_review(&cwd, "plan A"); // review starts (marker, if any, consumed)
+        set_pending_user_turn(&cwd, TurnClass::UnknownDelta); // a new prompt mid-review
+        assert!(
+            matches!(
+                record(&cwd, &epoch, "plan A", &crate::gate::Verdict::Approve, ""),
+                Outcome::NeedsInfo(_)
+            ),
+            "an unreviewed mid-review turn must refuse approve"
+        );
+        assert!(!is_approved(&cwd));
     }
 
     #[test]
