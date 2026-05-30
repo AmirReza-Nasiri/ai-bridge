@@ -16,6 +16,7 @@ pub mod install;
 pub mod managed_skills;
 pub mod mcp;
 pub mod optimizer;
+pub mod path_scope;
 pub mod plan_gate;
 pub mod plan_receipt;
 pub mod process_cleanup;
