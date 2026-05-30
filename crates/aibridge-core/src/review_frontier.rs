@@ -693,7 +693,7 @@ mod tests {
         let c0 = crate::git::head_oid(&repo).unwrap();
         commit_file(&repo, "a.txt", "a"); // C1
         commit_file(&repo, "b.txt", "b"); // C2 — both committed, never Stop-reviewed
-        // Squash C1+C2 into one new commit Cs (history rewrite under the base).
+                                          // Squash C1+C2 into one new commit Cs (history rewrite under the base).
         git_ok_in(&repo, &["reset", "--soft", &c0]);
         git_ok_in(&repo, &["commit", "-m", "squashed a+b"]);
         let cs = crate::git::head_oid(&repo).unwrap();

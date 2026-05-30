@@ -181,7 +181,9 @@ pub fn analyze(plan: &str, repo_files: &[String], max_fanout: u32) -> RouterReco
     for f in &matched {
         let fl = f.to_lowercase();
         let base = fl.rsplit('/').next().unwrap_or(&fl);
-        if SHARED_CORE_BASENAMES.contains(&base) || SHARED_CORE_FRAGMENTS.iter().any(|frag| fl.contains(frag)) {
+        if SHARED_CORE_BASENAMES.contains(&base)
+            || SHARED_CORE_FRAGMENTS.iter().any(|frag| fl.contains(frag))
+        {
             signals.shared_core_files += 1;
         }
         let a = area_of(f);
@@ -201,13 +203,19 @@ pub fn analyze(plan: &str, repo_files: &[String], max_fanout: u32) -> RouterReco
     };
 
     if !signals.risk_classes.is_empty() {
-        return single(85, "high-risk command class present — keep one coherent context");
+        return single(
+            85,
+            "high-risk command class present — keep one coherent context",
+        );
     }
     if signals.serial_markers >= 2 {
         return single(75, "sequential dependency markers — ordered work");
     }
     if signals.shared_core_files > 0 {
-        return single(70, "touches shared/core files — parallel edits would conflict");
+        return single(
+            70,
+            "touches shared/core files — parallel edits would conflict",
+        );
     }
     if signals.repo_area_count >= 3 && signals.mentioned_paths >= 4 && max_fanout >= 2 {
         let fanout = (signals.repo_area_count as u32).min(max_fanout).max(2);
@@ -234,7 +242,11 @@ fn append_jsonl(path: &Path, line: &str) -> bool {
             return false;
         }
     }
-    match std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
         Ok(mut f) => writeln!(f, "{line}").is_ok(),
         Err(_) => false,
     }
@@ -350,7 +362,11 @@ mod tests {
 
     #[test]
     fn high_risk_plan_is_single() {
-        let r = analyze("Refactor the deploy step and run `git push origin main`.", &files(), 8);
+        let r = analyze(
+            "Refactor the deploy step and run `git push origin main`.",
+            &files(),
+            8,
+        );
         assert_eq!(r.route, Route::Single);
         assert!(!r.signals.risk_classes.is_empty());
         assert_eq!(r.fanout, 1);
@@ -390,7 +406,10 @@ mod tests {
         );
         assert_eq!(r.route, Route::Orchestrated);
         assert!(r.fanout >= 2 && r.fanout <= 8);
-        assert!(r.confidence <= 60, "orchestrated must be low-confidence in Phase 1");
+        assert!(
+            r.confidence <= 60,
+            "orchestrated must be low-confidence in Phase 1"
+        );
         assert!(r.signals.mentioned_paths >= 4);
     }
 
@@ -403,7 +422,8 @@ mod tests {
 
     #[test]
     fn max_fanout_zero_or_one_never_orchestrates() {
-        let plan = "Audit crates/aibridge-core/src/router.rs and crates/aibridge-core/src/health.rs \
+        let plan =
+            "Audit crates/aibridge-core/src/router.rs and crates/aibridge-core/src/health.rs \
              and crates/aibridge/src/tui.rs and docs/macos-cli-detection.md.";
         assert_eq!(analyze(plan, &files(), 1).route, Route::Single);
         assert_eq!(analyze(plan, &files(), 0).route, Route::Single);
@@ -454,7 +474,9 @@ mod tests {
         // (and crucially never CREATES `.ai-bridge/` in a repo that isn't using the gate).
         let r = analyze("x", &[], 4);
         let fake = "/nonexistent-aibridge-router-xyzzy/sub/dir";
-        assert!(!log_recommendation(fake, 1, "epoch", None, "hash", None, &r));
+        assert!(!log_recommendation(
+            fake, 1, "epoch", None, "hash", None, &r
+        ));
     }
 
     #[test]
@@ -473,7 +495,10 @@ mod tests {
         ));
         let body = std::fs::read_to_string(dir.join(".ai-bridge").join("router.jsonl")).unwrap();
         let v: Value = serde_json::from_str(body.lines().next_back().unwrap()).unwrap();
-        assert_eq!(v["epoch"], "REAL-EPOCH", "reserved key must NOT be clobbered");
+        assert_eq!(
+            v["epoch"], "REAL-EPOCH",
+            "reserved key must NOT be clobbered"
+        );
         assert_eq!(v["plan_hash"], "REAL-HASH");
         assert_eq!(v["event"], "plan_gate_outcome");
         assert_eq!(v["custom"], 42, "non-reserved field merges through");

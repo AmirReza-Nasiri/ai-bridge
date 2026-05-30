@@ -1530,7 +1530,10 @@ mod tests {
     #[test]
     fn router_shadow_defaults_off_and_only_explicit_true_enables() {
         assert!(!router_shadow_from(&json!({})), "absent → off");
-        assert!(!router_shadow_from(&json!({"router": {}})), "absent flag → off");
+        assert!(
+            !router_shadow_from(&json!({"router": {}})),
+            "absent flag → off"
+        );
         assert!(
             !router_shadow_from(&json!({"router": {"shadow": "true"}})),
             "non-bool (string) → off"
@@ -1547,7 +1550,10 @@ mod tests {
             4,
             "non-number → default 4"
         );
-        assert_eq!(router_max_fanout_from(&json!({"router": {"maxFanout": 8}})), 8);
+        assert_eq!(
+            router_max_fanout_from(&json!({"router": {"maxFanout": 8}})),
+            8
+        );
         assert_eq!(
             router_max_fanout_from(&json!({"router": {"maxFanout": 0}})),
             1,

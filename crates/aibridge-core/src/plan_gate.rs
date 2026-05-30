@@ -347,7 +347,11 @@ fn classify_turn(prompt: &str) -> TurnClass {
 /// approved + the prompt's class, should we PRESERVE the approved epoch (recording a
 /// pending user-turn marker for the PreToolUse authority) or start a FRESH epoch?
 /// `true` = preserve. Kept pure so the policy is unit-testable without config/IO.
-fn preserve_epoch_decision(reset_on_user_turn: bool, currently_approved: bool, class: TurnClass) -> bool {
+fn preserve_epoch_decision(
+    reset_on_user_turn: bool,
+    currently_approved: bool,
+    class: TurnClass,
+) -> bool {
     if reset_on_user_turn || !currently_approved {
         return false; // default behavior: every prompt re-arms a fresh epoch
     }
@@ -1113,8 +1117,13 @@ fn scan_risk_grants(text: &str) -> Vec<RiskGrant> {
         "payout",
         "transfers",
         "transfer",
-    ]) || (has_cmd("stripe") && has("capture") && has_any(&["charges", "charge", "payment_intents", "payment_intent"]))
-        || (has_cmd("stripe") && has("checkout") && has_any(&["sessions", "session"]) && has("create"))
+    ]) || (has_cmd("stripe")
+        && has("capture")
+        && has_any(&["charges", "charge", "payment_intents", "payment_intent"]))
+        || (has_cmd("stripe")
+            && has("checkout")
+            && has_any(&["sessions", "session"])
+            && has("create"))
         || (has_cmd("braintree") && has("transaction") && has("sale"))
     {
         push(RiskGrant::standard("payment"));
@@ -1130,7 +1139,9 @@ fn scan_risk_grants(text: &str) -> Vec<RiskGrant> {
 
     // webhook: triggering/sending or creating webhook endpoints.
     if (has_cmd("stripe") && has("trigger"))
-        || (has_cmd("stripe") && has_any(&["webhook_endpoints", "webhook_endpoint"]) && has("create"))
+        || (has_cmd("stripe")
+            && has_any(&["webhook_endpoints", "webhook_endpoint"])
+            && has("create"))
         || (has_cmd("svix") && has_any(&["create", "send"]))
         || (has("webhook") && has_any(&["create", "trigger", "send"]))
     {
@@ -2594,8 +2605,8 @@ mod tests {
         for cmd in [
             "git push --force origin main",
             "git push -f origin main",
-            "git push -uf origin main",     // clustered force
-            "git push -fu origin main",     // clustered force (reordered)
+            "git push -uf origin main", // clustered force
+            "git push -fu origin main", // clustered force (reordered)
             "git push --force-with-lease",
             "git push --force-with-lease=origin/main",
             "git push --force-if-includes origin main",
@@ -2606,9 +2617,9 @@ mod tests {
             "git push --all origin",
             "git push --delete origin x",
             "git push -d origin x",
-            "git push origin :stale",       // delete refspec
-            "git push origin +main",        // leading-+ (force-update) refspec
-            "git push origin tag v1.2.3",   // explicit tag push
+            "git push origin :stale",     // delete refspec
+            "git push origin +main",      // leading-+ (force-update) refspec
+            "git push origin tag v1.2.3", // explicit tag push
             "git push origin refs/tags/v1.2.3",
         ] {
             assert_eq!(
@@ -2704,11 +2715,27 @@ mod tests {
     #[test]
     fn classify_turn_only_trivial_affirmations_preserve() {
         use TurnClass::*;
-        for t in ["ok", "okay", "OK", "Yes", "yes!", "yeah", "yep", "y", "continue", "proceed", "go ahead", "go on", ""] {
+        for t in [
+            "ok", "okay", "OK", "Yes", "yes!", "yeah", "yep", "y", "continue", "proceed",
+            "go ahead", "go on", "",
+        ] {
             assert_eq!(classify_turn(t), TrivialContinue, "{t:?} must be trivial");
         }
-        for t in ["cancel", "stop", "reset", "pause", "abort", "never mind", "start over", "stop, do something else"] {
-            assert_eq!(classify_turn(t), ExplicitReset, "{t:?} must be explicit reset");
+        for t in [
+            "cancel",
+            "stop",
+            "reset",
+            "pause",
+            "abort",
+            "never mind",
+            "start over",
+            "stop, do something else",
+        ] {
+            assert_eq!(
+                classify_turn(t),
+                ExplicitReset,
+                "{t:?} must be explicit reset"
+            );
         }
         for t in [
             "also add a delete endpoint",
@@ -2717,7 +2744,11 @@ mod tests {
             "ok now migrate the db",
             "do it", // not in the tiny allowlist → fail closed to delta
         ] {
-            assert_eq!(classify_turn(t), UnknownDelta, "{t:?} must be unknown delta");
+            assert_eq!(
+                classify_turn(t),
+                UnknownDelta,
+                "{t:?} must be unknown delta"
+            );
         }
     }
 
@@ -2746,7 +2777,10 @@ mod tests {
         assert!(is_approved(&cwd));
         start_epoch(&cwd, "sess", "yes"); // a trivial continuation, but flag is ON
         assert!(!is_approved(&cwd), "default mode re-gates every prompt");
-        assert!(!has_pending_user_turn(&cwd), "no marker in per-turn-reset mode");
+        assert!(
+            !has_pending_user_turn(&cwd),
+            "no marker in per-turn-reset mode"
+        );
         assert!(blocks_writes(&cwd));
     }
 
@@ -2772,9 +2806,15 @@ mod tests {
         approve(&cwd, "plan");
         set_pending_user_turn(&cwd, TurnClass::TrivialContinue);
         // enforce (PreToolUse) reconciles the trivial marker → approval restored → allowed.
-        assert!(enforce(&cwd, "Write").is_none(), "trivial continuation must auto-allow");
+        assert!(
+            enforce(&cwd, "Write").is_none(),
+            "trivial continuation must auto-allow"
+        );
         assert!(!has_pending_user_turn(&cwd), "marker consumed");
-        assert!(is_approved(&cwd), "approval preserved across a trivial continuation");
+        assert!(
+            is_approved(&cwd),
+            "approval preserved across a trivial continuation"
+        );
     }
 
     #[test]
@@ -2794,7 +2834,10 @@ mod tests {
         assert!(reason.contains("user_scope_delta"), "{reason}");
         assert!(!is_approved(&cwd), "scope delta revokes approval");
         assert!(blocks_writes(&cwd));
-        assert!(!has_pending_user_turn(&cwd), "marker consumed even on re-gate");
+        assert!(
+            !has_pending_user_turn(&cwd),
+            "marker consumed even on re-gate"
+        );
     }
 
     #[test]
@@ -2805,11 +2848,21 @@ mod tests {
         approve(&cwd, "plan");
         // A present-but-malformed marker (classification not a string) must NOT preserve.
         let mut s = read_state(&cwd).unwrap();
-        set_field(&mut s, "pending_user_turn", json!({ "classification": 123 }));
+        set_field(
+            &mut s,
+            "pending_user_turn",
+            json!({ "classification": 123 }),
+        );
         write_state(&cwd, &s).unwrap();
-        assert!(!effectively_approved(&cwd), "malformed marker suspends approval");
+        assert!(
+            !effectively_approved(&cwd),
+            "malformed marker suspends approval"
+        );
         let deny = reconcile_pending_user_turn(&cwd);
-        assert!(deny.is_some(), "malformed marker must re-gate (fail closed)");
+        assert!(
+            deny.is_some(),
+            "malformed marker must re-gate (fail closed)"
+        );
         assert!(!is_approved(&cwd));
     }
 
@@ -2835,7 +2888,7 @@ mod tests {
         approve(&cwd, "plan");
         set_pending_user_turn(&cwd, TurnClass::UnknownDelta); // "also update the API"
         assert!(set_pending_user_turn(&cwd, TurnClass::TrivialContinue)); // a following "ok"
-        // The marker stays non-trivial → the write re-gates with user_scope_delta.
+                                                                          // The marker stays non-trivial → the write re-gates with user_scope_delta.
         let deny = enforce(&cwd, "Write").expect("downgraded marker must still re-gate");
         assert!(deny.contains("user_scope_delta"), "{deny}");
         assert!(!is_approved(&cwd));
@@ -2867,7 +2920,10 @@ mod tests {
         set_pending_user_turn(&cwd, TurnClass::UnknownDelta);
         assert!(!is_effectively_approved(&cwd), "marker suspends approval");
         begin_review(&cwd, "plan v2"); // re-plan consumes the marker at review start
-        assert!(!has_pending_user_turn(&cwd), "begin_review consumed the marker");
+        assert!(
+            !has_pending_user_turn(&cwd),
+            "begin_review consumed the marker"
+        );
         record(
             &cwd,
             &current_epoch(&cwd),
@@ -2875,7 +2931,10 @@ mod tests {
             &crate::gate::Verdict::Approve,
             "",
         );
-        assert!(is_effectively_approved(&cwd), "re-planned approval is effective");
+        assert!(
+            is_effectively_approved(&cwd),
+            "re-planned approval is effective"
+        );
     }
 
     #[test]
@@ -2922,7 +2981,10 @@ mod tests {
             begin_review(&cwd, "plan"),
             ReviewStart::Ready(ConsumedTurn::NonTrivial)
         ));
-        assert!(!has_pending_user_turn(&cwd), "begin_review consumed the marker");
+        assert!(
+            !has_pending_user_turn(&cwd),
+            "begin_review consumed the marker"
+        );
     }
 
     #[test]
@@ -2949,7 +3011,10 @@ mod tests {
         approve(&cwd, "plan");
         set_pending_user_turn(&cwd, TurnClass::TrivialContinue);
         assert!(record_resume(&cwd, &current_epoch(&cwd), "plan", &[]));
-        assert!(!has_pending_user_turn(&cwd), "trivial marker consumed on resume");
+        assert!(
+            !has_pending_user_turn(&cwd),
+            "trivial marker consumed on resume"
+        );
         assert!(is_effectively_approved(&cwd));
     }
 
@@ -2981,7 +3046,11 @@ mod tests {
             assert_eq!(high_risk_class(cmd), Some("queue"), "queue: {cmd}");
         }
         for cmd in ["aws iam create-access-key --user-name bob", "gh auth login"] {
-            assert_eq!(high_risk_class(cmd), Some("admin-auth"), "admin-auth: {cmd}");
+            assert_eq!(
+                high_risk_class(cmd),
+                Some("admin-auth"),
+                "admin-auth: {cmd}"
+            );
         }
         // Ordinary lookalikes must NOT classify.
         for cmd in [
@@ -2991,7 +3060,11 @@ mod tests {
             "celery -A app worker",
             "stripe products list",
         ] {
-            assert_eq!(high_risk_class(cmd), None, "lookalike must not classify: {cmd}");
+            assert_eq!(
+                high_risk_class(cmd),
+                None,
+                "lookalike must not classify: {cmd}"
+            );
         }
     }
 
@@ -3018,9 +3091,7 @@ mod tests {
         // Unknown class → ignored.
         assert!(parse_risk_grants("RISK-APPROVED: launch-missiles").is_empty());
         // The tag merely QUOTED inside prose does NOT grant anything.
-        assert!(
-            parse_risk_grants("Do not add a RISK-APPROVED: remote-publish line.").is_empty()
-        );
+        assert!(parse_risk_grants("Do not add a RISK-APPROVED: remote-publish line.").is_empty());
         // Two tokens for the same class: widened wins (can't be downgraded).
         assert_eq!(
             parse_risk_grants("RISK-APPROVED: remote-publish, remote-publish:widened"),
@@ -3052,7 +3123,8 @@ mod tests {
             .and_then(Value::as_str)
             .unwrap();
         assert!(
-            reason.starts_with("PLAN_RISK_DELTA_REQUIRED: risk_policy_widened class=remote-publish"),
+            reason
+                .starts_with("PLAN_RISK_DELTA_REQUIRED: risk_policy_widened class=remote-publish"),
             "{reason}"
         );
         // Re-approve (revoked by the prior enforce_risk) then hit a brand-NEW class.
@@ -3064,8 +3136,8 @@ mod tests {
             &crate::gate::Verdict::Approve,
             "ok\nRISK-APPROVED: remote-publish",
         );
-        let newclass = enforce_risk(&cwd, "Bash", "terraform apply")
-            .expect("new class must re-gate");
+        let newclass =
+            enforce_risk(&cwd, "Bash", "terraform apply").expect("new class must re-gate");
         let v2: Value = serde_json::from_str(&newclass).unwrap();
         let reason2 = v2
             .pointer("/hookSpecificOutput/permissionDecisionReason")
@@ -3083,7 +3155,10 @@ mod tests {
         for class in ["payment", "refund", "webhook", "queue", "admin-auth"] {
             assert!(p.contains(class), "prompt must list new class {class}");
         }
-        assert!(p.contains("class:widened"), "prompt must document the :widened shape");
+        assert!(
+            p.contains("class:widened"),
+            "prompt must document the :widened shape"
+        );
         assert!(
             p.contains("remote-publish:widened"),
             "prompt must give the widened example"
@@ -3125,8 +3200,13 @@ mod tests {
     fn block_message_carries_tag_then_code() {
         // `PLAN_GATE_REQUIRED: <code> — <hint>` so the code is the first token after the tag.
         let m = block_message(BlockReason::NoActiveApproval);
-        assert!(m.starts_with("PLAN_GATE_REQUIRED: no_active_approval — "), "{m}");
-        assert!(block_message(BlockReason::HeadMoved).starts_with("PLAN_GATE_REQUIRED: head_moved — "));
+        assert!(
+            m.starts_with("PLAN_GATE_REQUIRED: no_active_approval — "),
+            "{m}"
+        );
+        assert!(
+            block_message(BlockReason::HeadMoved).starts_with("PLAN_GATE_REQUIRED: head_moved — ")
+        );
     }
 
     #[test]
