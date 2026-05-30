@@ -1205,6 +1205,10 @@ pub const RISK_CLASSES: &[&str] = &[
     "webhook",
     "queue",
     "admin-auth",
+    // v0.32 scoped-approval: authorizes a RECURSIVE (Broad) scope glob in `approved_scope`.
+    // Not a command class — consumed by `crate::scope::approved_scope` (broad_scope_granted),
+    // not by the command-risk delta check.
+    "broad-scope",
 ];
 
 /// Parse the high-risk command classes the REVIEWER explicitly authorized, from a
@@ -1662,6 +1666,14 @@ pub fn record(
                 "approved_risk_grants",
                 RiskGrant::vec_to_value(&parse_risk_grants(findings)),
             );
+            // v0.32 scoped-approval: derive + store the reviewer-approved file scope from the
+            // SAME findings just approved — Claude's `ALLOWED-GLOBS:` ∩ the reviewer's
+            // `SCOPE-APPROVED:` echoes ∩ the breadth policy. The AUTHORITATIVE approve transition
+            // owns it (unit 4's write-time check reads it). EMPTY until the reviewer prompt emits
+            // SCOPE-APPROVED markers (unit 3B-ii) → inert today.
+            let broad = parse_risk_approved(findings).contains(&"broad-scope");
+            let approved_globs = crate::scope::approved_scope(plan, findings, broad);
+            set_field(&mut s, "approved_allowed_globs", json!(approved_globs));
             set_field(&mut s, "approved_plan", json!(cap_plan(plan)));
             set_field(&mut s, "status", json!("approved"));
             set_field(&mut s, "revoked_reason", Value::Null);
@@ -1716,7 +1728,13 @@ pub fn record(
 /// Same fail-safe state contract + epoch TOCTOU guard as `record`. Returns `true` only
 /// if approval was actually recorded; `false` (task changed / missing state) means the
 /// caller must run a full review.
-pub fn record_resume(cwd: &str, expected_epoch: &str, plan: &str, grants: &[RiskGrant]) -> bool {
+pub fn record_resume(
+    cwd: &str,
+    expected_epoch: &str,
+    plan: &str,
+    grants: &[RiskGrant],
+    allowed_globs: &[String],
+) -> bool {
     // Fail-safe: when enabled, never approve from missing/unparseable state.
     let mut s = match read_state(cwd) {
         Some(s) => s,
@@ -1759,6 +1777,9 @@ pub fn record_resume(cwd: &str, expected_epoch: &str, plan: &str, grants: &[Risk
         "approved_risk_grants",
         RiskGrant::vec_to_value(grants),
     );
+    // v0.32 scoped-approval: restore the receipt's reviewer-approved scope onto state, so a
+    // resume leaves the SAME authoritative scope a fresh `record` approve would.
+    set_field(&mut s, "approved_allowed_globs", json!(allowed_globs));
     set_field(&mut s, "approved_plan", json!(cap_plan(plan)));
     set_field(&mut s, "status", json!("approved"));
     set_field(&mut s, "revoked_reason", Value::Null);
@@ -2401,7 +2422,8 @@ mod tests {
             &cwd,
             &epoch,
             "plan A",
-            &[RiskGrant::standard("remote-publish")]
+            &[RiskGrant::standard("remote-publish")],
+            &[],
         ));
         assert!(is_approved(&cwd));
         // Writes must ACTUALLY unlock — guards that record_resume's approved_plan_hash
@@ -2424,6 +2446,98 @@ mod tests {
     }
 
     #[test]
+    fn record_stores_approved_allowed_globs_intersection() {
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "task");
+        let epoch = current_epoch(&cwd);
+        // The plan DECLARES two globs; the reviewer ECHOES only one → the intersection is stored.
+        let plan = "do work\nALLOWED-GLOBS: src/a.rs, src/b.rs";
+        begin_review(&cwd, plan);
+        let findings = "ok\nSCOPE-APPROVED: src/a.rs";
+        assert!(matches!(
+            record(&cwd, &epoch, plan, &crate::gate::Verdict::Approve, findings),
+            Outcome::Approved
+        ));
+        assert_eq!(
+            read_state(&cwd).unwrap()["approved_allowed_globs"],
+            json!(["src/a.rs"])
+        );
+    }
+
+    #[test]
+    fn record_stores_empty_scope_without_markers() {
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "task");
+        let epoch = current_epoch(&cwd);
+        begin_review(&cwd, "plain plan");
+        assert!(matches!(
+            record(&cwd, &epoch, "plain plan", &crate::gate::Verdict::Approve, "ok"),
+            Outcome::Approved
+        ));
+        // No ALLOWED-GLOBS / SCOPE-APPROVED markers → empty stored scope (inert, fail-safe).
+        assert_eq!(read_state(&cwd).unwrap()["approved_allowed_globs"], json!([]));
+    }
+
+    #[test]
+    fn record_stores_broad_scope_only_with_grant() {
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "task");
+        let epoch = current_epoch(&cwd);
+        let plan = "wide work\nALLOWED-GLOBS: src/**";
+        begin_review(&cwd, plan);
+        // Declared + echoed recursive glob, WITH the reviewer's broad-scope grant → kept.
+        let findings = "ok\nSCOPE-APPROVED: src/**\nRISK-APPROVED: broad-scope";
+        assert!(matches!(
+            record(&cwd, &epoch, plan, &crate::gate::Verdict::Approve, findings),
+            Outcome::Approved
+        ));
+        assert_eq!(
+            read_state(&cwd).unwrap()["approved_allowed_globs"],
+            json!(["src/**"])
+        );
+    }
+
+    #[test]
+    fn record_drops_broad_scope_without_grant() {
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "task");
+        let epoch = current_epoch(&cwd);
+        let plan = "wide work\nALLOWED-GLOBS: src/**";
+        begin_review(&cwd, plan);
+        // Same recursive glob declared + echoed but NO broad-scope grant → dropped (empty).
+        let findings = "ok\nSCOPE-APPROVED: src/**";
+        assert!(matches!(
+            record(&cwd, &epoch, plan, &crate::gate::Verdict::Approve, findings),
+            Outcome::Approved
+        ));
+        assert_eq!(read_state(&cwd).unwrap()["approved_allowed_globs"], json!([]));
+    }
+
+    #[test]
+    fn record_resume_stores_passed_allowed_globs() {
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "task");
+        let epoch = current_epoch(&cwd);
+        begin_review(&cwd, "plan");
+        assert!(record_resume(
+            &cwd,
+            &epoch,
+            "plan",
+            &[],
+            &["src/x.rs".to_string()]
+        ));
+        assert_eq!(
+            read_state(&cwd).unwrap()["approved_allowed_globs"],
+            json!(["src/x.rs"])
+        );
+    }
+
+    #[test]
     fn record_resume_refuses_stale_epoch() {
         let cwd = tmp();
         enable(&cwd).unwrap();
@@ -2431,7 +2545,7 @@ mod tests {
         let stale = current_epoch(&cwd);
         start_epoch(&cwd, "sess", "task two"); // a new task → new epoch
                                                // A resume bound to the OLD epoch must not unlock the new task.
-        assert!(!record_resume(&cwd, &stale, "plan A", &[]));
+        assert!(!record_resume(&cwd, &stale, "plan A", &[], &[]));
         assert!(!is_approved(&cwd));
         assert!(blocks_writes(&cwd));
     }
@@ -2997,7 +3111,7 @@ mod tests {
         approve(&cwd, "plan");
         set_pending_user_turn(&cwd, TurnClass::UnknownDelta);
         assert!(
-            !record_resume(&cwd, &current_epoch(&cwd), "plan", &[]),
+            !record_resume(&cwd, &current_epoch(&cwd), "plan", &[], &[]),
             "resume must refuse past an unreconciled scope delta"
         );
     }
@@ -3010,7 +3124,7 @@ mod tests {
         start_epoch(&cwd, "sess", "task");
         approve(&cwd, "plan");
         set_pending_user_turn(&cwd, TurnClass::TrivialContinue);
-        assert!(record_resume(&cwd, &current_epoch(&cwd), "plan", &[]));
+        assert!(record_resume(&cwd, &current_epoch(&cwd), "plan", &[], &[]));
         assert!(
             !has_pending_user_turn(&cwd),
             "trivial marker consumed on resume"

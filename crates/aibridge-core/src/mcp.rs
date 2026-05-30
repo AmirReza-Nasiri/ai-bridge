@@ -634,10 +634,16 @@ impl Server {
         // resuming would unlock writes for a turn that was never reviewed. Force a full
         // review in that case (a trivial continuation or no marker still fast-paths).
         if !matches!(consumed_turn, crate::plan_gate::ConsumedTurn::NonTrivial) {
-            if let Some(grants) =
+            if let Some(resume) =
                 crate::plan_receipt::matching_classes(&cwd, plan, &self.plan_effort)
             {
-                if crate::plan_gate::record_resume(&cwd, &epoch, plan, &grants) {
+                if crate::plan_gate::record_resume(
+                    &cwd,
+                    &epoch,
+                    plan,
+                    &resume.grants,
+                    &resume.allowed_globs,
+                ) {
                     return "<AI-BRIDGE-APPROVE/> Plan APPROVED from a saved receipt — an identical \
                          plan was Codex-approved for this repo at this HEAD within the last 24h, so no \
                          fresh review was run (reload-resume). Writes/Bash are unlocked for this task. \
@@ -693,6 +699,14 @@ impl Server {
         };
         let verdict = gate::parse_verdict(&review);
         let findings = gate::findings(&review);
+        // v0.32 scoped-approval: the reviewer-approved file scope = Claude's declared
+        // ALLOWED-GLOBS ∩ the reviewer's SCOPE-APPROVED echoes ∩ the breadth policy. Computed
+        // BEFORE record() so the AUTHORITATIVE approve transition stores it (and reused for the
+        // receipt). Broad (recursive) globs require a `RISK-APPROVED: broad-scope` grant. EMPTY
+        // until the reviewer prompt emits SCOPE-APPROVED markers (unit 3B-ii) → inert today.
+        let broad_scope =
+            crate::plan_gate::parse_risk_approved(&findings).contains(&"broad-scope");
+        let allowed_globs = crate::scope::approved_scope(plan, &findings, broad_scope);
         let outcome = crate::plan_gate::record(&cwd, &epoch, plan, &verdict, &findings);
         // v0.32 Phase 2: outcome telemetry (shadow, log-only) — pairs the router recommendation
         // (same epoch) with the plan-review verdict so the recommendation can be evaluated later.
@@ -729,7 +743,13 @@ impl Server {
                 // source record() used), NOT read back from mutable state — so the receipt
                 // can't drift from what was approved. Reached only on a real APPROVE.
                 let approved_grants = crate::plan_gate::parse_risk_grants(&findings);
-                crate::plan_receipt::write(&cwd, plan, &approved_grants, &self.plan_effort);
+                crate::plan_receipt::write(
+                    &cwd,
+                    plan,
+                    &approved_grants,
+                    &allowed_globs,
+                    &self.plan_effort,
+                );
                 format!(
                     "<AI-BRIDGE-APPROVE/> Codex APPROVED the plan — writes/Bash are now unlocked \
                      for this task. Proceed with execution.\n\n{findings}"
@@ -2741,7 +2761,7 @@ mod tests {
         crate::plan_gate::start_epoch(&cwd, session, "checkpoint task");
         let epoch = crate::plan_gate::current_epoch(&cwd);
         assert!(
-            crate::plan_gate::record_resume(&cwd, &epoch, "checkpoint plan", &[]),
+            crate::plan_gate::record_resume(&cwd, &epoch, "checkpoint plan", &[], &[]),
             "test setup: plan-gate approval must record"
         );
         assert!(
@@ -2844,7 +2864,7 @@ mod tests {
         let cwd = make_repo_with_commit();
         crate::plan_gate::start_epoch(&cwd, session, "task");
         let epoch = crate::plan_gate::current_epoch(&cwd);
-        crate::plan_gate::record_resume(&cwd, &epoch, "plan", &[]);
+        crate::plan_gate::record_resume(&cwd, &epoch, "plan", &[], &[]);
         // NOTE: no on_task_start → no frontier recorded.
         let prep = checkpoint_prepare(&cwd, "phase A");
         assert!(

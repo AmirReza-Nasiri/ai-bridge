@@ -38,8 +38,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// resume too (guarded; see `head_match` / `receipt_authorizes`).
 /// v4 (v0.31 P3): risk grants are STRUCTURED (class+shape), so a flat-class v3 receipt
 /// must NOT silently authorize a WIDENED variant — every pre-v4 receipt fails closed
-/// (full review), and a v4 receipt carries a `risk_grants` array.
-pub const PLAN_RECEIPT_VERSION: u32 = 4;
+/// (full review), a v4 receipt carries a `risk_grants` array, and a v5 receipt ALSO carries
+/// a validated `allowed_globs` array (v0.32 scoped-approval).
+pub const PLAN_RECEIPT_VERSION: u32 = 5;
+
+/// What a valid receipt authorizes restoring on a fast-path resume: the reviewer's risk
+/// grants (v0.31 P3) AND the reviewer-approved file scope (v0.32 scoped-approval).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceiptResume {
+    pub grants: Vec<crate::plan_gate::RiskGrant>,
+    pub allowed_globs: Vec<String>,
+}
 
 /// How long after approval a receipt may fast-path a reload-resume (24h — long
 /// enough to survive a reload/restart, short enough to bound replay).
@@ -122,7 +131,7 @@ fn receipt_authorizes(
     head_match: HeadMatch,
     want_effort: &str,
     now: u128,
-) -> Option<Vec<crate::plan_gate::RiskGrant>> {
+) -> Option<ReceiptResume> {
     if v.get("plan_receipt_version").and_then(Value::as_u64) != Some(PLAN_RECEIPT_VERSION as u64) {
         return None;
     }
@@ -165,6 +174,32 @@ fn receipt_authorizes(
             grants.push(g); // dedupe
         }
     }
+    // v5 (v0.32 scoped-approval): `allowed_globs` MUST be present, an ARRAY of STRINGS, each
+    // passing `scope::validate_glob` — else FAIL CLOSED (→ None, full review). An EMPTY array
+    // is valid (a plan that declared no scope). A missing field (a v4 receipt the version gate
+    // already rejected, or a truncated/forged v5), a non-array, a non-string element, or an
+    // invalid glob all fail safe — so a resume can never restore an unvalidated scope.
+    // A resume must enforce the SAME breadth policy as a fresh `scope::approved_scope`, not
+    // merely syntactic validity — otherwise a forged/stale receipt could restore a broader
+    // scope than a real approve could have stored. `RepoWide` is ALWAYS rejected; `Broad`
+    // (recursive) is rejected UNLESS the receipt's own validated grants include `broad-scope`.
+    let broad_granted = grants.iter().any(|g| g.class == "broad-scope");
+    let globs_arr = v.get("allowed_globs").and_then(Value::as_array)?;
+    let mut allowed_globs: Vec<String> = Vec::new();
+    for item in globs_arr {
+        let g = item.as_str()?; // non-string → fail closed
+        if crate::scope::validate_glob(g).is_err() {
+            return None; // invalid glob → fail closed
+        }
+        match crate::scope::classify_glob(g) {
+            crate::scope::ScopeRisk::RepoWide => return None, // never resumable
+            crate::scope::ScopeRisk::Broad if !broad_granted => return None,
+            _ => {}
+        }
+        if !allowed_globs.iter().any(|e| e == g) {
+            allowed_globs.push(g.to_string()); // dedupe
+        }
+    }
     // HEAD relation gate (v3, extended for v4). Exact resumes with any grants (v1
     // behavior); an Ancestor (my own commits atop the reviewed base) resumes ONLY when NO
     // high-risk grants were authorized — a plan that authorized publish/migrate/destructive
@@ -175,8 +210,8 @@ fn receipt_authorizes(
     // exact HEAD.
     match head_match {
         HeadMatch::No => None,
-        HeadMatch::Exact => Some(grants),
-        HeadMatch::Ancestor if grants.is_empty() => Some(grants),
+        HeadMatch::Exact => Some(ReceiptResume { grants, allowed_globs }),
+        HeadMatch::Ancestor if grants.is_empty() => Some(ReceiptResume { grants, allowed_globs }),
         HeadMatch::Ancestor => None,
     }
 }
@@ -207,7 +242,7 @@ pub fn matching_classes(
     cwd: &str,
     plan: &str,
     want_effort: &str,
-) -> Option<Vec<crate::plan_gate::RiskGrant>> {
+) -> Option<ReceiptResume> {
     let head = crate::git::head_oid(cwd)?; // unborn repo → nothing to bind → full review
     let path = receipt_path(cwd)?;
     let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).ok()?).ok()?;
@@ -228,7 +263,13 @@ pub fn matching_classes(
 /// review. Atomic temp+rename. Best-effort: an unborn repo / non-repo / unwritable home
 /// simply means no future fast-path. The legacy flat `command_classes` is written too
 /// (back-compat / display); the authoritative resume field is `risk_grants`.
-pub fn write(cwd: &str, plan: &str, grants: &[crate::plan_gate::RiskGrant], effort: &str) {
+pub fn write(
+    cwd: &str,
+    plan: &str,
+    grants: &[crate::plan_gate::RiskGrant],
+    allowed_globs: &[String],
+    effort: &str,
+) {
     let Some(head) = crate::git::head_oid(cwd) else {
         return;
     };
@@ -245,6 +286,7 @@ pub fn write(cwd: &str, plan: &str, grants: &[crate::plan_gate::RiskGrant], effo
         "plan_hash": plan_hash(plan),
         "command_classes": command_classes,
         "risk_grants": crate::plan_gate::RiskGrant::vec_to_value(grants),
+        "allowed_globs": allowed_globs,
         "base_head": head,
         "plan_receipt_version": PLAN_RECEIPT_VERSION,
         "plan_review_effort": effort,
@@ -289,6 +331,7 @@ mod tests {
             "plan_hash": plan_hash_val,
             "command_classes": ["remote-publish"],
             "risk_grants": [{ "class": "remote-publish", "shape": "standard" }],
+            "allowed_globs": [],
             "base_head": head,
             "plan_receipt_version": ver,
             "created_ms": created_ms,
@@ -304,7 +347,7 @@ mod tests {
 
         // Exact HEAD + all bindings → returns the approved grants.
         assert_eq!(
-            receipt_authorizes(&good, &ph, HeadMatch::Exact, "xhigh", now),
+            receipt_authorizes(&good, &ph, HeadMatch::Exact, "xhigh", now).map(|r| r.grants),
             Some(vec![grant("remote-publish", "standard")])
         );
         // No usable HEAD relation → no resume.
@@ -380,6 +423,7 @@ mod tests {
                 "plan_receipt_version": PLAN_RECEIPT_VERSION,
                 "created_ms": now as u64,
                 "risk_grants": grants,
+                "allowed_globs": [],
             })
         };
         // Missing risk_grants entirely (truncated/old-shape receipt) → no resume.
@@ -433,11 +477,11 @@ mod tests {
         // Empty array is VALID (a plan that needs no high-risk command) → authorized at
         // BOTH Exact and Ancestor (the empty-grants case is the lenient-resume path).
         assert_eq!(
-            receipt_authorizes(&base(json!([])), &ph, HeadMatch::Exact, "xhigh", now),
+            receipt_authorizes(&base(json!([])), &ph, HeadMatch::Exact, "xhigh", now).map(|r| r.grants),
             Some(vec![])
         );
         assert_eq!(
-            receipt_authorizes(&base(json!([])), &ph, HeadMatch::Ancestor, "xhigh", now),
+            receipt_authorizes(&base(json!([])), &ph, HeadMatch::Ancestor, "xhigh", now).map(|r| r.grants),
             Some(vec![])
         );
         // Duplicate known grants are deduped (Exact).
@@ -451,7 +495,8 @@ mod tests {
                 HeadMatch::Exact,
                 "xhigh",
                 now
-            ),
+            )
+            .map(|r| r.grants),
             Some(vec![grant("db-migration", "standard")])
         );
         // A WIDENED grant round-trips through the receipt (Exact).
@@ -462,14 +507,71 @@ mod tests {
                 HeadMatch::Exact,
                 "xhigh",
                 now
-            ),
+            )
+            .map(|r| r.grants),
             Some(vec![grant("remote-publish", "widened")])
         );
     }
 
     #[test]
-    fn plan_receipt_version_is_four() {
-        assert_eq!(PLAN_RECEIPT_VERSION, 4);
+    fn plan_receipt_version_is_five() {
+        assert_eq!(PLAN_RECEIPT_VERSION, 5);
+    }
+
+    #[test]
+    fn receipt_allowed_globs_validated_and_breadth_policed() {
+        let now: u128 = 1_000_000_000_000;
+        let ph = plan_hash("p");
+        let head = "abc123";
+        // a v5 receipt with the given risk_grants + allowed_globs
+        let mk = |grants: Value, globs: Value| {
+            json!({
+                "plan_hash": ph,
+                "base_head": head,
+                "plan_receipt_version": PLAN_RECEIPT_VERSION,
+                "created_ms": now as u64,
+                "risk_grants": grants,
+                "allowed_globs": globs,
+            })
+        };
+        let exact = |v: &Value| receipt_authorizes(v, &ph, HeadMatch::Exact, "xhigh", now);
+        let broad_grant = json!([{ "class": "broad-scope", "shape": "standard" }]);
+
+        // Valid narrow/moderate globs (no grant) round-trip.
+        assert_eq!(
+            exact(&mk(json!([]), json!(["src/a.rs", "tests/*"]))).map(|r| r.allowed_globs),
+            Some(vec!["src/a.rs".to_string(), "tests/*".to_string()])
+        );
+        // MISSING allowed_globs → fail closed.
+        assert_eq!(
+            receipt_authorizes(
+                &json!({
+                    "plan_hash": ph, "base_head": head,
+                    "plan_receipt_version": PLAN_RECEIPT_VERSION, "created_ms": now as u64,
+                    "risk_grants": [],
+                }),
+                &ph,
+                HeadMatch::Exact,
+                "xhigh",
+                now
+            ),
+            None
+        );
+        // non-array → fail closed.
+        assert_eq!(exact(&mk(json!([]), json!("src/a.rs"))), None);
+        // non-string entry → fail closed.
+        assert_eq!(exact(&mk(json!([]), json!([123]))), None);
+        // invalid glob → fail closed.
+        assert_eq!(exact(&mk(json!([]), json!(["src/[ab].rs"]))), None);
+        // RepoWide `**` → fail closed even WITH a broad-scope grant (never resumable).
+        assert_eq!(exact(&mk(broad_grant.clone(), json!(["**"]))), None);
+        // Broad `src/**` WITHOUT a broad-scope grant → fail closed.
+        assert_eq!(exact(&mk(json!([]), json!(["src/**"]))), None);
+        // Broad `src/**` WITH a broad-scope grant → kept (Exact HEAD: non-empty grants need it).
+        assert_eq!(
+            exact(&mk(broad_grant, json!(["src/**"]))).map(|r| r.allowed_globs),
+            Some(vec!["src/**".to_string()])
+        );
     }
 
     #[test]
@@ -498,12 +600,12 @@ mod tests {
         );
         // Minted "high", want "high" → match → resume.
         assert_eq!(
-            receipt_authorizes(&mk(json!("high")), &ph, HeadMatch::Exact, "high", now),
+            receipt_authorizes(&mk(json!("high")), &ph, HeadMatch::Exact, "high", now).map(|r| r.grants),
             Some(vec![])
         );
         // ABSENT field (pre-#4 receipt) → legacy xhigh: resumes ONLY when want == xhigh.
         assert_eq!(
-            receipt_authorizes(&mk(json!(null)), &ph, HeadMatch::Exact, "xhigh", now),
+            receipt_authorizes(&mk(json!(null)), &ph, HeadMatch::Exact, "xhigh", now).map(|r| r.grants),
             Some(vec![])
         );
         assert_eq!(
