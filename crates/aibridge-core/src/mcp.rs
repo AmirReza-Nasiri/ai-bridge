@@ -611,7 +611,16 @@ impl Server {
         // If this epoch is already approved but the plan materially changed, revoke
         // up front so writes re-block while the new plan is under review (the
         // minutes-long Codex call must not run with stale approval still open).
-        let consumed_turn = crate::plan_gate::begin_review(&cwd, plan);
+        let consumed_turn = match crate::plan_gate::begin_review(&cwd, plan) {
+            crate::plan_gate::ReviewStart::Ready(consumed_turn) => consumed_turn,
+            // The in-flight review marker could not be persisted — the stale/superseded-plan
+            // guard in `record` relies on it, so FAIL CLOSED: do not resume or review.
+            crate::plan_gate::ReviewStart::MarkerWriteFailed => {
+                return "AI Bridge: could not persist the in-flight review marker (filesystem \
+                     error); approval is held. Retry plan_gate."
+                    .to_string();
+            }
+        };
         // RELOAD-RESUME fast-path: if a saved receipt shows this EXACT plan was
         // Codex-approved for this repo at the CURRENT HEAD within TTL, re-approve
         // instantly — no minutes-long re-review. Bound to plan+repo+HEAD+policy, so

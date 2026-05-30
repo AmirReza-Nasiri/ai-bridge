@@ -355,18 +355,36 @@ fn preserve_epoch_decision(reset_on_user_turn: bool, currently_approved: bool, c
     !matches!(class, TurnClass::ExplicitReset)
 }
 
+/// v0.31 P1: whether state-based invalidation may actually PRESERVE an approval across a
+/// user turn. Returns `false` in v0.31 — the preserve path is sound for high-risk (P3 still
+/// re-gates) but NOT for ordinary out-of-scope writes, because a short-lived hook cannot tell
+/// a bare affirmation ("yes"/"ok") that CONTINUES the plan from one that ANSWERS a
+/// scope-broadening question ("also update X?") — it has no prior-assistant context. Until a
+/// PreToolUse tool-context file-scope check (re-gate writes outside the approved files) lands,
+/// keeping this const-false makes the `resetOnUserTurn=false` preserve path INERT, so the gate
+/// never fails open. The classify/reconcile machinery + tests stay so the follow-up only flips
+/// this const + adds the scope check. (Mirrors P2's `read_only_execution_supported`.)
+fn p1_state_invalidation_supported() -> bool {
+    false
+}
+
 /// Begin a fresh PENDING epoch for a new task (called by the UserPromptSubmit hook),
-/// UNLESS `planGate.resetOnUserTurn` is false AND a plan is currently approved AND the
-/// prompt is not an explicit reset — in which case the approved epoch is PRESERVED and a
-/// pending user-turn marker is recorded for the PreToolUse authority to reconcile before
-/// the next mutator. The epoch id ties an approval to THIS task so a later prompt re-gates.
+/// UNLESS state-based invalidation is supported AND `planGate.resetOnUserTurn` is false AND a
+/// plan is currently approved AND the prompt is not an explicit reset — in which case the
+/// approved epoch is PRESERVED and a pending user-turn marker is recorded for the PreToolUse
+/// authority to reconcile before the next mutator. The epoch id ties an approval to THIS task
+/// so a later prompt re-gates. In v0.31 the preserve path is INERT (see
+/// [`p1_state_invalidation_supported`]), so this always re-arms a fresh epoch — byte-identical
+/// to pre-P1 regardless of the `resetOnUserTurn` config.
 pub fn start_epoch(cwd: &str, session: &str, prompt: &str) {
     let class = classify_turn(prompt);
-    if preserve_epoch_decision(
-        crate::review_mcp::reset_on_user_turn(),
-        is_approved(cwd),
-        class,
-    ) {
+    if p1_state_invalidation_supported()
+        && preserve_epoch_decision(
+            crate::review_mcp::reset_on_user_turn(),
+            is_approved(cwd),
+            class,
+        )
+    {
         // Preserve the approval; record the pending user-turn for PreToolUse to reconcile.
         // A failed marker write must FAIL CLOSED — revoke so a preserved-but-unreconciled
         // turn can never leave stale approval live.
@@ -1339,9 +1357,18 @@ pub enum ConsumedTurn {
     NonTrivial,
 }
 
-pub fn begin_review(cwd: &str, plan: &str) -> ConsumedTurn {
+/// Outcome of starting a review: `Ready` carries the consumed user-turn class; `MarkerWriteFailed`
+/// means the in-flight review marker could not be persisted, so the caller MUST fail closed (the
+/// stale/superseded-plan guard relies on that marker existing).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewStart {
+    Ready(ConsumedTurn),
+    MarkerWriteFailed,
+}
+
+pub fn begin_review(cwd: &str, plan: &str) -> ReviewStart {
     if !is_enabled(cwd) {
-        return ConsumedTurn::None;
+        return ReviewStart::Ready(ConsumedTurn::None);
     }
     let pending_written = write_pending(cwd, &current_epoch(cwd), hash_str(plan));
     // v0.31 P1: submitting a plan for review IS the agent's response to the current user
@@ -1369,10 +1396,10 @@ pub fn begin_review(cwd: &str, plan: &str) -> ConsumedTurn {
     // re-gates (a lost review marker must not also silently drop the user turn).
     if !pending_written {
         revoke(cwd, "begin_review_pending_write_failed");
-        return consumed;
+        return ReviewStart::MarkerWriteFailed;
     }
     clear_pending_user_turn(cwd);
-    consumed
+    ReviewStart::Ready(consumed)
 }
 
 /// A post-approval risk delta the approved plan did not cover (v0.31 P3). Either a
@@ -2880,11 +2907,21 @@ mod tests {
         enable(&cwd).unwrap();
         start_epoch(&cwd, "sess", "task");
         approve(&cwd, "plan");
-        assert!(matches!(begin_review(&cwd, "plan"), ConsumedTurn::None));
+        // Successful review starts wrap the consumed marker class in ReviewStart::Ready.
+        assert!(matches!(
+            begin_review(&cwd, "plan"),
+            ReviewStart::Ready(ConsumedTurn::None)
+        ));
         set_pending_user_turn(&cwd, TurnClass::TrivialContinue);
-        assert!(matches!(begin_review(&cwd, "plan"), ConsumedTurn::Trivial));
+        assert!(matches!(
+            begin_review(&cwd, "plan"),
+            ReviewStart::Ready(ConsumedTurn::Trivial)
+        ));
         set_pending_user_turn(&cwd, TurnClass::UnknownDelta);
-        assert!(matches!(begin_review(&cwd, "plan"), ConsumedTurn::NonTrivial));
+        assert!(matches!(
+            begin_review(&cwd, "plan"),
+            ReviewStart::Ready(ConsumedTurn::NonTrivial)
+        ));
         assert!(!has_pending_user_turn(&cwd), "begin_review consumed the marker");
     }
 

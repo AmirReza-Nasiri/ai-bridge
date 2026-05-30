@@ -22,11 +22,12 @@ you opt in** — `planGate.resetOnUserTurn` defaults to `true` (today's per-prom
 - **Machine-readable block reason codes (P6).** `PLAN_GATE_REQUIRED:` / `PLAN_RISK_DELTA_REQUIRED:`
   now carry a stable snake_case code token (e.g. `no_active_approval`, `new_risk_surface=<class>`)
   plus a recovery hint, so tooling can branch on the cause without parsing prose.
-- **Opt-in state-based invalidation (P1) — `planGate.resetOnUserTurn` (default `true`).** When set
-  to `false`, a mid-task *trivial continuation* (ok/yes/continue/…) preserves the approved plan
-  instead of re-arming the gate; a scope change or explicit cancel/reset still re-gates; and
-  high-risk commands always re-gate (the P3 risk delta is unaffected). Default `true` keeps the
-  current behavior byte-for-byte.
+- **State-based invalidation scaffolding (P1) — INERT in this release.** The classify/reconcile
+  machinery + the `planGate.resetOnUserTurn` config reader landed, but the preserve path is gated
+  behind a const-false capability check, so the gate's behavior is **unchanged** (every prompt
+  still re-arms a fresh epoch). It is intentionally inert because a short-lived hook cannot tell a
+  bare affirmation that *continues* a plan from one that *answers a scope-broadening question* — a
+  PreToolUse tool-context file-scope check is required first (deferred). Nothing to enable yet.
 
 ### Fixed
 - **Widened-push detection no longer leaks across chained sub-commands** — a plain `git push …`
@@ -40,7 +41,9 @@ you opt in** — `planGate.resetOnUserTurn` defaults to `true` (today's per-prom
   and receipt-fast-path skip for a consumed non-trivial turn; plus pending-marker IO fail-closed.
 
 ### Deferred (tracked follow-ups)
-- Flipping `resetOnUserTurn` to `false` by default (needs a PreToolUse tool-context file-scope check).
+- **Activating P1** (`resetOnUserTurn=false` preserve path): needs a PreToolUse tool-context
+  file-scope check so a preserved approval can't allow ordinary out-of-scope writes. Until then P1
+  is inert. This is what will actually relieve the mid-task re-gate friction (v0.31.1).
 - P2 read-only orientation (only an inert default-off seam shipped; the carve-out needs a hardened
   execution layer). P4 canonical fingerprints + delta review.
 
