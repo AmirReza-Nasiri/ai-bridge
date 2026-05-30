@@ -838,6 +838,40 @@ pub fn reset_on_user_turn() -> bool {
     reset_on_user_turn_from(&read_config())
 }
 
+// ───────────────────────── v0.32 (Phase 1): shadow execution router ─────────────────────
+//
+// LOG-ONLY telemetry, default OFF. `router.shadow` gates whether plan_gate appends a
+// recommendation to `.ai-bridge/router.jsonl`; it never affects gating, approval, or output.
+
+/// Pure: the `router.shadow` flag. DEFAULT FALSE; only an explicit `true` enables telemetry
+/// (absent/non-bool/malformed → false, fail-safe).
+fn router_shadow_from(cfg: &Value) -> bool {
+    matches!(
+        cfg.get("router").and_then(|r| r.get("shadow")),
+        Some(Value::Bool(true))
+    )
+}
+
+/// Whether the shadow router logs telemetry (on-disk config). DEFAULT OFF.
+pub fn router_shadow() -> bool {
+    router_shadow_from(&read_config())
+}
+
+/// Pure: the `router.maxFanout` cap for a suggested orchestrated degree. DEFAULT 4; an
+/// absent/invalid value → 4; clamped to `[1, 16]`.
+fn router_max_fanout_from(cfg: &Value) -> u32 {
+    cfg.get("router")
+        .and_then(|r| r.get("maxFanout"))
+        .and_then(Value::as_u64)
+        .map(|n| n.clamp(1, 16) as u32)
+        .unwrap_or(4)
+}
+
+/// The max fan-out the shadow router may suggest (on-disk config). DEFAULT 4.
+pub fn router_max_fanout() -> u32 {
+    router_max_fanout_from(&read_config())
+}
+
 // ───────────────────────── v0.29 (O1d): review-model CLI + doctor reporting ─────────────
 //
 // Honest reporting of the PERSISTED review-model config. A hand-edited review-mcp.json can
@@ -1490,6 +1524,39 @@ mod tests {
         assert_eq!(
             plan_effort_from(&json!({"codex": {"plan_review_effort": 5}})),
             None
+        );
+    }
+
+    #[test]
+    fn router_shadow_defaults_off_and_only_explicit_true_enables() {
+        assert!(!router_shadow_from(&json!({})), "absent → off");
+        assert!(!router_shadow_from(&json!({"router": {}})), "absent flag → off");
+        assert!(
+            !router_shadow_from(&json!({"router": {"shadow": "true"}})),
+            "non-bool (string) → off"
+        );
+        assert!(!router_shadow_from(&json!({"router": {"shadow": false}})));
+        assert!(router_shadow_from(&json!({"router": {"shadow": true}})));
+    }
+
+    #[test]
+    fn router_max_fanout_defaults_and_clamps() {
+        assert_eq!(router_max_fanout_from(&json!({})), 4, "absent → default 4");
+        assert_eq!(
+            router_max_fanout_from(&json!({"router": {"maxFanout": "8"}})),
+            4,
+            "non-number → default 4"
+        );
+        assert_eq!(router_max_fanout_from(&json!({"router": {"maxFanout": 8}})), 8);
+        assert_eq!(
+            router_max_fanout_from(&json!({"router": {"maxFanout": 0}})),
+            1,
+            "clamp up to 1"
+        );
+        assert_eq!(
+            router_max_fanout_from(&json!({"router": {"maxFanout": 999}})),
+            16,
+            "clamp down to 16"
         );
     }
 

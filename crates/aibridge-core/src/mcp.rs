@@ -647,6 +647,34 @@ impl Server {
                 // record_resume refused (task changed / unwritable state) → full review.
             }
         }
+        // v0.32 Phase 1: SHADOW router telemetry — log-only, default OFF, ZERO authority over
+        // gating/approval/output. Placed AFTER the receipt fast-path so an instant resume is
+        // never delayed by the `git ls-files` call; only the full-review path (the case worth
+        // correlating against a Stop outcome) logs. Best-effort — any failure is swallowed.
+        if crate::review_mcp::router_shadow() {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            plan.hash(&mut h);
+            let plan_hash = format!("{:x}", h.finish());
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            let rec = crate::router::analyze(
+                plan,
+                &crate::router::repo_files(&cwd),
+                crate::review_mcp::router_max_fanout(),
+            );
+            let _ = crate::router::log_recommendation(
+                &cwd,
+                ts,
+                &epoch,
+                crate::plan_gate::current_session(&cwd).as_deref(),
+                &plan_hash,
+                crate::git::head_oid(&cwd).as_deref(),
+                &rec,
+            );
+        }
         // New task epoch → drop the prior plan dialogue so it can't anchor.
         if self.plan_epoch.as_deref() != Some(epoch.as_str()) {
             self.threads.remove(&TopicKey::PlanGate);

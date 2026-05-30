@@ -22,6 +22,7 @@ pub mod process_cleanup;
 pub mod progress;
 pub mod review_frontier;
 pub mod review_mcp;
+pub mod router;
 pub mod rtk;
 pub mod skills;
 pub mod staged_update;
