@@ -116,7 +116,10 @@ fn write_target_for<'a>(
     } else {
         "file_path"
     };
-    match tool_input.and_then(|t| t.get(field)).and_then(Value::as_str) {
+    match tool_input
+        .and_then(|t| t.get(field))
+        .and_then(Value::as_str)
+    {
         Some(p) if !p.is_empty() => crate::plan_gate::WriteTarget::Path(p),
         _ => crate::plan_gate::WriteTarget::Missing,
     }
@@ -186,31 +189,79 @@ mod tests {
         // that would disable the scope fence → fail-open). Iterating GATED_WRITE_TOOLS means a
         // FUTURE-ADDED write tool is automatically covered and cannot slip the invariant.
         for &tool in GATED_WRITE_TOOLS {
-            assert!(matches!(write_target_for(tool, None), WriteTarget::Missing), "{tool} no input");
-            assert!(matches!(write_target_for(tool, Some(&json!({}))), WriteTarget::Missing), "{tool} absent");
+            assert!(
+                matches!(write_target_for(tool, None), WriteTarget::Missing),
+                "{tool} no input"
+            );
+            assert!(
+                matches!(
+                    write_target_for(tool, Some(&json!({}))),
+                    WriteTarget::Missing
+                ),
+                "{tool} absent"
+            );
             // a field this tool does not read (incl. any future tool reading `file_path`) → Missing.
-            assert!(matches!(write_target_for(tool, Some(&json!({"totally_unused": "x"}))), WriteTarget::Missing), "{tool} unrelated field");
+            assert!(
+                matches!(
+                    write_target_for(tool, Some(&json!({"totally_unused": "x"}))),
+                    WriteTarget::Missing
+                ),
+                "{tool} unrelated field"
+            );
         }
         // Field-specific empty / non-string cases (representative: file_path tools + NotebookEdit),
         // plus the cross-field ignore (each tool reads ONLY its own field).
-        assert!(matches!(write_target_for("Write", Some(&json!({"file_path": ""}))), WriteTarget::Missing));
-        assert!(matches!(write_target_for("Write", Some(&json!({"file_path": 5}))), WriteTarget::Missing));
-        assert!(matches!(write_target_for("Write", Some(&json!({"notebook_path": "x.ipynb"}))), WriteTarget::Missing));
-        assert!(matches!(write_target_for("NotebookEdit", Some(&json!({"notebook_path": ""}))), WriteTarget::Missing));
-        assert!(matches!(write_target_for("NotebookEdit", Some(&json!({"notebook_path": 5}))), WriteTarget::Missing));
-        assert!(matches!(write_target_for("NotebookEdit", Some(&json!({"file_path": "x.rs"}))), WriteTarget::Missing));
+        assert!(matches!(
+            write_target_for("Write", Some(&json!({"file_path": ""}))),
+            WriteTarget::Missing
+        ));
+        assert!(matches!(
+            write_target_for("Write", Some(&json!({"file_path": 5}))),
+            WriteTarget::Missing
+        ));
+        assert!(matches!(
+            write_target_for("Write", Some(&json!({"notebook_path": "x.ipynb"}))),
+            WriteTarget::Missing
+        ));
+        assert!(matches!(
+            write_target_for("NotebookEdit", Some(&json!({"notebook_path": ""}))),
+            WriteTarget::Missing
+        ));
+        assert!(matches!(
+            write_target_for("NotebookEdit", Some(&json!({"notebook_path": 5}))),
+            WriteTarget::Missing
+        ));
+        assert!(matches!(
+            write_target_for("NotebookEdit", Some(&json!({"file_path": "x.rs"}))),
+            WriteTarget::Missing
+        ));
     }
 
     #[test]
     fn write_target_for_valid_path_is_path_and_non_write_is_unknown() {
         use crate::plan_gate::WriteTarget;
         for tool in ["Write", "Edit", "MultiEdit"] {
-            assert!(matches!(write_target_for(tool, Some(&json!({"file_path": "src/a.rs"}))), WriteTarget::Path("src/a.rs")), "{tool} path");
+            assert!(
+                matches!(
+                    write_target_for(tool, Some(&json!({"file_path": "src/a.rs"}))),
+                    WriteTarget::Path("src/a.rs")
+                ),
+                "{tool} path"
+            );
         }
-        assert!(matches!(write_target_for("NotebookEdit", Some(&json!({"notebook_path": "n.ipynb"}))), WriteTarget::Path("n.ipynb")));
+        assert!(matches!(
+            write_target_for("NotebookEdit", Some(&json!({"notebook_path": "n.ipynb"}))),
+            WriteTarget::Path("n.ipynb")
+        ));
         // Non-gated tools never carry a write target (so the fence ignores them).
         for tool in ["Bash", "Read", "Grep", "mcp__aibridge__run"] {
-            assert!(matches!(write_target_for(tool, Some(&json!({"file_path": "src/a.rs"}))), WriteTarget::Unknown), "{tool} unknown");
+            assert!(
+                matches!(
+                    write_target_for(tool, Some(&json!({"file_path": "src/a.rs"}))),
+                    WriteTarget::Unknown
+                ),
+                "{tool} unknown"
+            );
         }
     }
 
@@ -300,11 +351,8 @@ mod tests {
         use std::sync::atomic::{AtomicU64, Ordering};
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let cwd = std::env::temp_dir().join(format!(
-            "aibridge-opt-scope-{}-{}",
-            std::process::id(),
-            n
-        ));
+        let cwd =
+            std::env::temp_dir().join(format!("aibridge-opt-scope-{}-{}", std::process::id(), n));
         std::fs::create_dir_all(&cwd).unwrap();
         let cwd = cwd.display().to_string();
         crate::plan_gate::enable(&cwd).unwrap();
@@ -379,7 +427,10 @@ mod tests {
             "cwd": cwd,
             "tool_input": {"command": "echo hello"}
         }));
-        assert!(!out.contains("out_of_scope_path"), "Bash must not be scope-fenced, got: {out}");
+        assert!(
+            !out.contains("out_of_scope_path"),
+            "Bash must not be scope-fenced, got: {out}"
+        );
         assert!(!out.contains("\"deny\""), "got: {out}");
     }
 
@@ -416,7 +467,10 @@ mod tests {
             "cwd": cwd,
             "tool_input": {"file_path": "secrets.txt"}
         }));
-        assert!(out.contains("out_of_scope_path"), "declared-but-empty scope must deny, got: {out}");
+        assert!(
+            out.contains("out_of_scope_path"),
+            "declared-but-empty scope must deny, got: {out}"
+        );
     }
 
     #[test]
@@ -429,6 +483,9 @@ mod tests {
             "cwd": cwd,
             "tool_input": {"file_path": "src/a.rs", "notebook_path": "outside.ipynb"}
         }));
-        assert!(out.contains("out_of_scope_path"), "must check notebook_path, not file_path; got: {out}");
+        assert!(
+            out.contains("out_of_scope_path"),
+            "must check notebook_path, not file_path; got: {out}"
+        );
     }
 }

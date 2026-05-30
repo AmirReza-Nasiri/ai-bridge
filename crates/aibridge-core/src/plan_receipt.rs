@@ -210,8 +210,14 @@ fn receipt_authorizes(
     // exact HEAD.
     match head_match {
         HeadMatch::No => None,
-        HeadMatch::Exact => Some(ReceiptResume { grants, allowed_globs }),
-        HeadMatch::Ancestor if grants.is_empty() => Some(ReceiptResume { grants, allowed_globs }),
+        HeadMatch::Exact => Some(ReceiptResume {
+            grants,
+            allowed_globs,
+        }),
+        HeadMatch::Ancestor if grants.is_empty() => Some(ReceiptResume {
+            grants,
+            allowed_globs,
+        }),
         HeadMatch::Ancestor => None,
     }
 }
@@ -238,11 +244,7 @@ fn head_match(cwd: &str, base_head: &str, head: &str) -> HeadMatch {
 /// (class+shape) to restore. `None` → the caller runs a full plan review. Fail-safe: an
 /// unborn repo (no HEAD to bind), a missing/corrupt receipt, or any binding mismatch all
 /// yield `None`.
-pub fn matching_classes(
-    cwd: &str,
-    plan: &str,
-    want_effort: &str,
-) -> Option<ReceiptResume> {
+pub fn matching_classes(cwd: &str, plan: &str, want_effort: &str) -> Option<ReceiptResume> {
     let head = crate::git::head_oid(cwd)?; // unborn repo → nothing to bind → full review
     let path = receipt_path(cwd)?;
     let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).ok()?).ok()?;
@@ -477,11 +479,13 @@ mod tests {
         // Empty array is VALID (a plan that needs no high-risk command) → authorized at
         // BOTH Exact and Ancestor (the empty-grants case is the lenient-resume path).
         assert_eq!(
-            receipt_authorizes(&base(json!([])), &ph, HeadMatch::Exact, "xhigh", now).map(|r| r.grants),
+            receipt_authorizes(&base(json!([])), &ph, HeadMatch::Exact, "xhigh", now)
+                .map(|r| r.grants),
             Some(vec![])
         );
         assert_eq!(
-            receipt_authorizes(&base(json!([])), &ph, HeadMatch::Ancestor, "xhigh", now).map(|r| r.grants),
+            receipt_authorizes(&base(json!([])), &ph, HeadMatch::Ancestor, "xhigh", now)
+                .map(|r| r.grants),
             Some(vec![])
         );
         // Duplicate known grants are deduped (Exact).
@@ -600,12 +604,14 @@ mod tests {
         );
         // Minted "high", want "high" → match → resume.
         assert_eq!(
-            receipt_authorizes(&mk(json!("high")), &ph, HeadMatch::Exact, "high", now).map(|r| r.grants),
+            receipt_authorizes(&mk(json!("high")), &ph, HeadMatch::Exact, "high", now)
+                .map(|r| r.grants),
             Some(vec![])
         );
         // ABSENT field (pre-#4 receipt) → legacy xhigh: resumes ONLY when want == xhigh.
         assert_eq!(
-            receipt_authorizes(&mk(json!(null)), &ph, HeadMatch::Exact, "xhigh", now).map(|r| r.grants),
+            receipt_authorizes(&mk(json!(null)), &ph, HeadMatch::Exact, "xhigh", now)
+                .map(|r| r.grants),
             Some(vec![])
         );
         assert_eq!(

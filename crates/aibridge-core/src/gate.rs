@@ -346,12 +346,21 @@ mod tests {
     fn normal_scope_uses_the_strict_outside_scope_clause() {
         // reconstructed_base = false → byte-identical strict behavior (regression guard).
         let p = prompt_with_scope("DIFF", Some("PLAN-TEXT"), false);
-        assert!(p.contains("clearly OUTSIDE this scope"), "strict breadth clause present");
-        assert!(p.contains("=== APPROVED PLAN ===\nPLAN-TEXT"), "plan embedded");
+        assert!(
+            p.contains("clearly OUTSIDE this scope"),
+            "strict breadth clause present"
+        );
+        assert!(
+            p.contains("=== APPROVED PLAN ===\nPLAN-TEXT"),
+            "plan embedded"
+        );
         assert!(p.contains("PROCESS/meta steps"), "process exemption kept");
         assert!(p.contains("high-risk action"), "high-risk clause kept");
         // The softened wording must NOT leak into the normal path.
-        assert!(!p.contains("RECONSTRUCTED"), "no reconstructed-base wording in normal mode");
+        assert!(
+            !p.contains("RECONSTRUCTED"),
+            "no reconstructed-base wording in normal mode"
+        );
     }
 
     #[test]
@@ -360,14 +369,26 @@ mod tests {
         // keep the plan, the high-risk clause, the missing-outcome requirement, and the process
         // exemption. (Codex-validated degraded mode for an orphaned/squash-merge base.)
         let p = prompt_with_scope("DIFF", Some("PLAN-TEXT"), true);
-        assert!(!p.contains("clearly OUTSIDE this scope"), "hard breadth clause suppressed");
-        assert!(p.contains("RECONSTRUCTED"), "explains the reconstructed base");
+        assert!(
+            !p.contains("clearly OUTSIDE this scope"),
+            "hard breadth clause suppressed"
+        );
+        assert!(
+            p.contains("RECONSTRUCTED"),
+            "explains the reconstructed base"
+        );
         assert!(
             p.contains("do NOT REQUEST-CHANGES merely because"),
             "softened breadth instruction present"
         );
-        assert!(p.contains("=== APPROVED PLAN ===\nPLAN-TEXT"), "plan still shown");
-        assert!(p.contains("MISSING from the final state"), "missing-outcome still required");
+        assert!(
+            p.contains("=== APPROVED PLAN ===\nPLAN-TEXT"),
+            "plan still shown"
+        );
+        assert!(
+            p.contains("MISSING from the final state"),
+            "missing-outcome still required"
+        );
         assert!(p.contains("high-risk action"), "high-risk clause kept");
         assert!(p.contains("PROCESS/meta steps"), "process exemption kept");
     }
@@ -376,7 +397,10 @@ mod tests {
     fn no_plan_means_no_scope_block_regardless_of_reconstructed_flag() {
         for recon in [false, true] {
             let p = prompt_with_scope("DIFF", None, recon);
-            assert!(!p.contains("=== APPROVED PLAN ==="), "no scope block without a plan");
+            assert!(
+                !p.contains("=== APPROVED PLAN ==="),
+                "no scope block without a plan"
+            );
             assert!(!p.contains("clearly OUTSIDE this scope"));
             assert!(!p.contains("RECONSTRUCTED"));
         }

@@ -60,8 +60,13 @@ const GIT_LOG_DIFF_FLAGS: &[&str] = &[
 /// Summary flags that make a `git diff`/`show` print file NAMES/STATS rather than content —
 /// so no textconv/ext-diff helper runs. `diff`/`show` are allowed ONLY with one of these
 /// present (a bare content `git diff`/`git show` is denied).
-const GIT_SUMMARY_FLAGS: &[&str] =
-    &["--stat", "--shortstat", "--numstat", "--name-only", "--name-status"];
+const GIT_SUMMARY_FLAGS: &[&str] = &[
+    "--stat",
+    "--shortstat",
+    "--numstat",
+    "--name-only",
+    "--name-status",
+];
 
 /// Option flags that read an arbitrary FILE given as their value (separately or via `=`).
 /// They can read outside the cwd (e.g. `wc --files0-from=/etc/passwd`,
@@ -76,15 +81,7 @@ const OPTION_PATH_READERS: &[&str] = &[
 /// `find` predicates/actions that execute a command or mutate the filesystem. Their presence
 /// disqualifies an otherwise read-only `find` traversal.
 const FIND_MUTATING_ACTIONS: &[&str] = &[
-    "-delete",
-    "-exec",
-    "-execdir",
-    "-ok",
-    "-okdir",
-    "-fprint",
-    "-fprintf",
-    "-fls",
-    "-fprint0",
+    "-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprintf", "-fls", "-fprint0",
 ];
 
 /// True iff `command` is a proven read-only discovery command (see module docs). Fail-closed:
@@ -106,7 +103,9 @@ pub fn is_read_only(command: &str) -> bool {
     //   `main..dev` rev-range); rejecting it confines every operand under the cwd (fail-closed).
     if tokens.contains(&"--help")
         || tokens.contains(&"-")
-        || tokens.iter().any(|t| is_absolute_path(t) || t.contains(".."))
+        || tokens
+            .iter()
+            .any(|t| is_absolute_path(t) || t.contains(".."))
     {
         return false;
     }
@@ -257,15 +256,27 @@ mod tests {
 
     #[test]
     fn denies_help_exec_vector() {
-        for c in ["git status --help", "git log --help", "git --help", "find --help"] {
+        for c in [
+            "git status --help",
+            "git log --help",
+            "git --help",
+            "find --help",
+        ] {
             assert!(!is_read_only(c), "{c} (--help) must be denied");
         }
     }
 
     #[test]
     fn denies_git_global_option_before_subcommand() {
-        for c in ["git -c core.pager=x status", "git -C dir status", "git --exec-path=p status"] {
-            assert!(!is_read_only(c), "{c} (pre-subcommand global option) must be denied");
+        for c in [
+            "git -c core.pager=x status",
+            "git -C dir status",
+            "git --exec-path=p status",
+        ] {
+            assert!(
+                !is_read_only(c),
+                "{c} (pre-subcommand global option) must be denied"
+            );
         }
     }
 
@@ -341,7 +352,10 @@ mod tests {
             "git diff --stat -- ../secret",
             "git log main..dev",
         ] {
-            assert!(!is_read_only(c), "{c} (absolute/escape path) must be denied");
+            assert!(
+                !is_read_only(c),
+                "{c} (absolute/escape path) must be denied"
+            );
         }
     }
 
@@ -356,15 +370,29 @@ mod tests {
             "wc --files0-from=../list",
             "git diff --stat --foo=/etc/x",
         ] {
-            assert!(!is_read_only(c), "{c} (option-embedded path read) must be denied");
+            assert!(
+                !is_read_only(c),
+                "{c} (option-embedded path read) must be denied"
+            );
         }
     }
 
     #[test]
     fn requires_a_file_operand_for_content_readers() {
         // No file operand → reads stdin → would block the hook.
-        for c in ["cat", "wc", "wc -l", "head -n 5", "tail -n 5", "cat -", "head -"] {
-            assert!(!is_read_only(c), "{c} (stdin / no file operand) must be denied");
+        for c in [
+            "cat",
+            "wc",
+            "wc -l",
+            "head -n 5",
+            "tail -n 5",
+            "cat -",
+            "head -",
+        ] {
+            assert!(
+                !is_read_only(c),
+                "{c} (stdin / no file operand) must be denied"
+            );
         }
         // With a file operand they are allowed.
         for c in ["cat f", "wc -l f", "head -n 5 f", "tail -n 5 f.log"] {
@@ -402,14 +430,25 @@ mod tests {
             "git checkout main",
             "git",
         ] {
-            assert!(!is_read_only(c), "{c} (mutating/unknown git) must be denied");
+            assert!(
+                !is_read_only(c),
+                "{c} (mutating/unknown git) must be denied"
+            );
         }
     }
 
     #[test]
     fn denies_find_mutating_actions() {
-        for c in ["find . -delete", "find . -exec ls", "find . -execdir rm", "find . -fls out"] {
-            assert!(!is_read_only(c), "{c} (find mutating action) must be denied");
+        for c in [
+            "find . -delete",
+            "find . -exec ls",
+            "find . -execdir rm",
+            "find . -fls out",
+        ] {
+            assert!(
+                !is_read_only(c),
+                "{c} (find mutating action) must be denied"
+            );
         }
     }
 
@@ -449,7 +488,10 @@ mod tests {
             "",
             "   ",
         ] {
-            assert!(!is_read_only(c), "{c:?} (shell metasyntax) must be denied by the char gate");
+            assert!(
+                !is_read_only(c),
+                "{c:?} (shell metasyntax) must be denied by the char gate"
+            );
         }
     }
 }

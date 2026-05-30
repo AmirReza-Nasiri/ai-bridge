@@ -214,7 +214,14 @@ mod tests {
 
     #[test]
     fn validate_glob_accepts_supported_grammar() {
-        for g in ["src/main.rs", "dir/*", "*.rs", "dir/**", "src/**/*.rs", "a/*/b.rs"] {
+        for g in [
+            "src/main.rs",
+            "dir/*",
+            "*.rs",
+            "dir/**",
+            "src/**/*.rs",
+            "a/*/b.rs",
+        ] {
             assert!(validate_glob(g).is_ok(), "{g} should be accepted");
         }
     }
@@ -253,7 +260,17 @@ mod tests {
     #[test]
     fn classify_glob_tiers() {
         // RepoWide
-        for g in ["*", "**", "**/*", "**/foo.rs", "", "src/[ab].rs", "f?.rs", "a**b", r"src\x"] {
+        for g in [
+            "*",
+            "**",
+            "**/*",
+            "**/foo.rs",
+            "",
+            "src/[ab].rs",
+            "f?.rs",
+            "a**b",
+            r"src\x",
+        ] {
             assert_eq!(classify_glob(g), ScopeRisk::RepoWide, "{g} → RepoWide");
         }
         // Broad
@@ -272,7 +289,11 @@ mod tests {
 
     #[test]
     fn scope_risk_of_takes_the_max_and_defines_empty() {
-        assert_eq!(scope_risk_of(&[]), ScopeRisk::Narrow, "empty scope = deny-all = Narrow");
+        assert_eq!(
+            scope_risk_of(&[]),
+            ScopeRisk::Narrow,
+            "empty scope = deny-all = Narrow"
+        );
         assert_eq!(scope_risk_of(&s(&["src/main.rs"])), ScopeRisk::Narrow);
         assert_eq!(
             scope_risk_of(&s(&["src/main.rs", "dir/*"])),
@@ -282,7 +303,10 @@ mod tests {
             scope_risk_of(&s(&["src/main.rs", "dir/**"])),
             ScopeRisk::Broad
         );
-        assert_eq!(scope_risk_of(&s(&["src/main.rs", "**"])), ScopeRisk::RepoWide);
+        assert_eq!(
+            scope_risk_of(&s(&["src/main.rs", "**"])),
+            ScopeRisk::RepoWide
+        );
     }
 
     #[test]
@@ -322,10 +346,16 @@ mod tests {
         assert!(!path_in_allowed("lib/x.rs", &s(&["docs/*", "src/**"])));
         // an invalid glob in the list contributes NO match (but a valid sibling still works).
         assert!(!path_in_allowed("src/main.rs", &s(&[r"src\*"])));
-        assert!(path_in_allowed("src/main.rs", &s(&[r"src\*", "src/main.rs"])));
+        assert!(path_in_allowed(
+            "src/main.rs",
+            &s(&[r"src\*", "src/main.rs"])
+        ));
         // malformed `**` and bracket syntax are rejected through the public API too —
         // a list of ONLY invalid globs admits nothing.
-        assert!(!path_in_allowed("src/main.rs", &s(&["**.rs", "src/[ab].rs"])));
+        assert!(!path_in_allowed(
+            "src/main.rs",
+            &s(&["**.rs", "src/[ab].rs"])
+        ));
         // ...but a valid glob alongside the invalid ones still admits a match.
         assert!(path_in_allowed("src/main.rs", &s(&["**.rs", "src/**"])));
     }
@@ -403,11 +433,18 @@ mod tests {
     #[test]
     fn approved_scope_intersection_is_case_sensitive_and_drops_repo_wide() {
         // case mismatch → not in the intersection.
-        assert!(approved_scope("ALLOWED-GLOBS: src/x.rs", "SCOPE-APPROVED: Src/X.rs", true).is_empty());
+        assert!(
+            approved_scope("ALLOWED-GLOBS: src/x.rs", "SCOPE-APPROVED: Src/X.rs", true).is_empty()
+        );
         // a repo-wide glob declared AND echoed AND broad-granted is STILL dropped.
         assert!(approved_scope("ALLOWED-GLOBS: **", "SCOPE-APPROVED: **", true).is_empty());
         // an invalid glob in both is dropped.
-        assert!(approved_scope("ALLOWED-GLOBS: src/[ab].rs", "SCOPE-APPROVED: src/[ab].rs", true).is_empty());
+        assert!(approved_scope(
+            "ALLOWED-GLOBS: src/[ab].rs",
+            "SCOPE-APPROVED: src/[ab].rs",
+            true
+        )
+        .is_empty());
     }
 
     #[test]
@@ -416,7 +453,13 @@ mod tests {
         // whether or not a broad-scope grant is present (it must NOT ride the Broad tier).
         let plan = "ALLOWED-GLOBS: tests/*";
         let findings = "SCOPE-APPROVED: tests/*";
-        assert_eq!(approved_scope(plan, findings, false), vec!["tests/*".to_string()]);
-        assert_eq!(approved_scope(plan, findings, true), vec!["tests/*".to_string()]);
+        assert_eq!(
+            approved_scope(plan, findings, false),
+            vec!["tests/*".to_string()]
+        );
+        assert_eq!(
+            approved_scope(plan, findings, true),
+            vec!["tests/*".to_string()]
+        );
     }
 }

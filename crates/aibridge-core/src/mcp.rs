@@ -704,8 +704,7 @@ impl Server {
         // BEFORE record() so the AUTHORITATIVE approve transition stores it (and reused for the
         // receipt). Broad (recursive) globs require a `RISK-APPROVED: broad-scope` grant. EMPTY
         // until the reviewer prompt emits SCOPE-APPROVED markers (unit 3B-ii) → inert today.
-        let broad_scope =
-            crate::plan_gate::parse_risk_approved(&findings).contains(&"broad-scope");
+        let broad_scope = crate::plan_gate::parse_risk_approved(&findings).contains(&"broad-scope");
         let allowed_globs = crate::scope::approved_scope(plan, &findings, broad_scope);
         let outcome = crate::plan_gate::record(&cwd, &epoch, plan, &verdict, &findings);
         // v0.32 Phase 2: outcome telemetry (shadow, log-only) — pairs the router recommendation
@@ -2769,7 +2768,10 @@ mod tests {
             false,
         );
         assert!(out.contains("frontier: <empty tree> -> abc"));
-        assert!(!out.contains("scope-note:"), "no reconstructed base → no scope-note");
+        assert!(
+            !out.contains("scope-note:"),
+            "no reconstructed base → no scope-note"
+        );
     }
 
     #[test]
@@ -2790,7 +2792,10 @@ mod tests {
         assert!(out.contains("base-note: review base orphan"));
         assert!(out.contains("status: approved"));
         // The empty-diff advance ran NO review → it must NOT claim a softened scope review.
-        assert!(!out.contains("scope-note:"), "no-op advance ran no review → no scope-note");
+        assert!(
+            !out.contains("scope-note:"),
+            "no-op advance ran no review → no scope-note"
+        );
     }
 
     #[test]
@@ -2826,7 +2831,10 @@ mod tests {
         assert!(out.contains("frontier remains: c1"));
         assert!(out.contains("FINDINGS:\n- bug in foo.rs"));
         assert!(out.contains("trace: .ai-bridge/reviews/xx/review.txt"));
-        assert!(!out.contains("scope-note:"), "scope_softened=false → no scope-note");
+        assert!(
+            !out.contains("scope-note:"),
+            "scope_softened=false → no scope-note"
+        );
     }
 
     #[test]

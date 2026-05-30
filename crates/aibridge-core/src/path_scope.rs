@@ -127,7 +127,10 @@ pub fn canonicalize_under_root(repo_root: &str, raw_target: &str) -> Result<Stri
     // Validate each segment of the RAW input directly — robust against later `Path`
     // normalization that can silently drop a trailing dot/space. Reject `..` traversal,
     // and on Windows reserved device names + trailing dot/space.
-    for seg in raw.split(['/', '\\']).filter(|s| !s.is_empty() && *s != ".") {
+    for seg in raw
+        .split(['/', '\\'])
+        .filter(|s| !s.is_empty() && *s != ".")
+    {
         if seg == ".." {
             return Err(ScopeReject::Traversal);
         }
@@ -167,8 +170,8 @@ pub fn canonicalize_under_root(repo_root: &str, raw_target: &str) -> Result<Stri
     }
 
     // 4. Canonicalize the repo root once, by components.
-    let root_canon = fs_canonicalize_stripped(Path::new(repo_root))
-        .ok_or(ScopeReject::NonCanonicalizable)?;
+    let root_canon =
+        fs_canonicalize_stripped(Path::new(repo_root)).ok_or(ScopeReject::NonCanonicalizable)?;
     let root_comps = components_str(&root_canon)?;
 
     // 5. Walk up to the NEAREST EXISTING DIRECTORY ENTRY, collecting the trailing (new)
@@ -204,8 +207,7 @@ pub fn canonicalize_under_root(repo_root: &str, raw_target: &str) -> Result<Stri
     trailing.reverse(); // collected leaf-first; restore root→leaf order.
 
     // 6. Canonicalize the existing ancestor (resolves symlinks/junctions → catches escapes).
-    let anc_canon =
-        fs_canonicalize_stripped(&existing).ok_or(ScopeReject::NonCanonicalizable)?;
+    let anc_canon = fs_canonicalize_stripped(&existing).ok_or(ScopeReject::NonCanonicalizable)?;
     let anc_comps = components_str(&anc_canon)?;
 
     // 7. CONTAINMENT by component boundary (case-folded on Windows). The ancestor's
@@ -342,8 +344,7 @@ mod tests {
         fn new() -> Self {
             let n = COUNTER.fetch_add(1, Ordering::Relaxed);
             let pid = std::process::id();
-            let dir =
-                std::env::temp_dir().join(format!("aibridge-pathscope-{pid}-{n}"));
+            let dir = std::env::temp_dir().join(format!("aibridge-pathscope-{pid}-{n}"));
             std::fs::create_dir_all(&dir).unwrap();
             // Strip the Windows `\\?\` verbatim prefix that `fs::canonicalize` adds, so
             // the root mimics a real `git rev-parse --show-toplevel` (a clean path) —
@@ -378,11 +379,8 @@ mod tests {
         let repo = TempDir::new();
         std::fs::create_dir_all(repo.join("src")).unwrap();
         // src/new.rs does not exist yet; src/ does.
-        let rel = canonicalize_under_root(
-            &repo.root(),
-            &repo.join("src/new.rs").to_string_lossy(),
-        )
-        .unwrap();
+        let rel = canonicalize_under_root(&repo.root(), &repo.join("src/new.rs").to_string_lossy())
+            .unwrap();
         assert_eq!(rel, "src/new.rs");
     }
 

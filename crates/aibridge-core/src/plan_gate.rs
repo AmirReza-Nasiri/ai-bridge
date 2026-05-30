@@ -963,7 +963,9 @@ fn scope_fence(cwd: &str, tool_name: &str, target: WriteTarget) -> Option<String
 /// (`orientation_on`, from the opt-in config), AND the command must pass the lexical
 /// [`crate::read_only_exec::is_read_only`] classifier. Fail-closed: any `false` → still gated.
 fn read_only_carveout(orientation_on: bool, command: &str) -> bool {
-    read_only_execution_supported() && orientation_on && crate::read_only_exec::is_read_only(command)
+    read_only_execution_supported()
+        && orientation_on
+        && crate::read_only_exec::is_read_only(command)
 }
 
 /// Machine-readable block reason codes for the `PLAN_GATE_REQUIRED:` family (v0.31
@@ -2123,7 +2125,10 @@ mod tests {
     fn prompt_includes_file_scope_protocol() {
         let p = prompt("ALLOWED-GLOBS: src/a.rs");
         // The reviewer is told to echo each approved glob.
-        assert!(p.contains("SCOPE-APPROVED"), "prompt must instruct SCOPE-APPROVED echoes");
+        assert!(
+            p.contains("SCOPE-APPROVED"),
+            "prompt must instruct SCOPE-APPROVED echoes"
+        );
         // `broad-scope` is framed as a scope-breadth grant (FILE SCOPE section), and the
         // command-class RISK-APPROVED list must NOT be polluted with it.
         assert!(p.contains("broad-scope"));
@@ -2140,7 +2145,10 @@ mod tests {
         assert!(p.contains("**/*"));
         assert!(p.contains("LEADING"));
         // The brace example renders literally (guards the `{{` format-string escaping).
-        assert!(p.contains("`{`"), "the brace glob example must render as a literal `{{`");
+        assert!(
+            p.contains("`{`"),
+            "the brace glob example must render as a literal `{{`"
+        );
     }
 
     #[test]
@@ -2783,11 +2791,20 @@ mod tests {
         let epoch = current_epoch(&cwd);
         begin_review(&cwd, "plain plan");
         assert!(matches!(
-            record(&cwd, &epoch, "plain plan", &crate::gate::Verdict::Approve, "ok"),
+            record(
+                &cwd,
+                &epoch,
+                "plain plan",
+                &crate::gate::Verdict::Approve,
+                "ok"
+            ),
             Outcome::Approved
         ));
         // No ALLOWED-GLOBS / SCOPE-APPROVED markers → empty stored scope (inert, fail-safe).
-        assert_eq!(read_state(&cwd).unwrap()["approved_allowed_globs"], json!([]));
+        assert_eq!(
+            read_state(&cwd).unwrap()["approved_allowed_globs"],
+            json!([])
+        );
     }
 
     #[test]
@@ -2824,7 +2841,10 @@ mod tests {
             record(&cwd, &epoch, plan, &crate::gate::Verdict::Approve, findings),
             Outcome::Approved
         ));
-        assert_eq!(read_state(&cwd).unwrap()["approved_allowed_globs"], json!([]));
+        assert_eq!(
+            read_state(&cwd).unwrap()["approved_allowed_globs"],
+            json!([])
+        );
     }
 
     #[test]
@@ -2857,7 +2877,13 @@ mod tests {
         start_epoch(&cwd, "sess", "task");
         let epoch = current_epoch(&cwd);
         begin_review(&cwd, "ALLOWED-GLOBS: src/**");
-        assert!(record_resume(&cwd, &epoch, "ALLOWED-GLOBS: src/**", &[], &[]));
+        assert!(record_resume(
+            &cwd,
+            &epoch,
+            "ALLOWED-GLOBS: src/**",
+            &[],
+            &[]
+        ));
         let deny = enforce_tool_scoped(&cwd, "Write", WriteTarget::Path("src/a.rs"), "")
             .expect("resumed declared-but-empty scope must still deny");
         assert!(deny_code(&deny).contains("out_of_scope_path"));
@@ -2941,8 +2967,9 @@ mod tests {
                 .to_string()
         };
         // OFF: `git status` denied with the default no_active_approval code.
-        let deny = enforce_tool_scoped_with(&cwd, "Bash", WriteTarget::Unknown, "git status", false)
-            .expect("read-only Bash denied pre-approval when carve-out off");
+        let deny =
+            enforce_tool_scoped_with(&cwd, "Bash", WriteTarget::Unknown, "git status", false)
+                .expect("read-only Bash denied pre-approval when carve-out off");
         assert!(reason_of(&deny).contains("PLAN_GATE_REQUIRED: no_active_approval"));
         // ON: a proven read-only command is allowed to RUN pre-approval.
         assert!(
@@ -2991,7 +3018,11 @@ mod tests {
         // The first WRITE now lands the revoke with `user_scope_delta`.
         let deny = enforce_tool_scoped_with(&cwd, "Write", WriteTarget::Path("src/x.rs"), "", true)
             .expect("the first write after a scope delta must re-gate");
-        assert!(deny_code(&deny).contains("user_scope_delta"), "{}", deny_code(&deny));
+        assert!(
+            deny_code(&deny).contains("user_scope_delta"),
+            "{}",
+            deny_code(&deny)
+        );
 
         // With orientation OFF the bypass does not apply: a scope-delta + read-only Bash still
         // hits reconcile and is denied with `user_scope_delta` (byte-identical to pre-carve-out).
@@ -3001,7 +3032,11 @@ mod tests {
         let deny =
             enforce_tool_scoped_with(&cwd2, "Bash", WriteTarget::Unknown, "git status", false)
                 .expect("carve-out off: read-only Bash still reconciles the scope delta");
-        assert!(deny_code(&deny).contains("user_scope_delta"), "{}", deny_code(&deny));
+        assert!(
+            deny_code(&deny).contains("user_scope_delta"),
+            "{}",
+            deny_code(&deny)
+        );
     }
 
     #[test]
@@ -3013,7 +3048,10 @@ mod tests {
         approve_with_globs(&cwd, json!(["src/*.rs"]));
         assert!(set_pending_user_turn(&cwd, TurnClass::TrivialContinue));
         assert!(has_pending_user_turn(&cwd));
-        assert!(blocks_writes(&cwd), "a pending marker makes the approval not-yet-effective");
+        assert!(
+            blocks_writes(&cwd),
+            "a pending marker makes the approval not-yet-effective"
+        );
         // Orientation-on read-only Bash is allowed AND clears the trivial marker.
         assert!(
             enforce_tool_scoped_with(&cwd, "Bash", WriteTarget::Unknown, "git status", true)
@@ -3104,7 +3142,9 @@ mod tests {
         // Stop-gate is the backstop). Both a concrete path and a missing path are allowed.
         let cwd = tmp();
         approve_with_globs(&cwd, json!([]));
-        assert!(enforce_tool_scoped(&cwd, "Write", WriteTarget::Path("anywhere/x.rs"), "").is_none());
+        assert!(
+            enforce_tool_scoped(&cwd, "Write", WriteTarget::Path("anywhere/x.rs"), "").is_none()
+        );
         assert!(enforce_tool_scoped(&cwd, "Write", WriteTarget::Missing, "").is_none());
     }
 
@@ -3112,16 +3152,19 @@ mod tests {
     fn scope_fence_denies_corrupt_scope() {
         // PRESENT-but-malformed scope must DENY, never silently widen authorization.
         for corrupt in [
-            json!("not-an-array"),        // non-array
-            json!([123]),                  // non-string entry
-            json!(["src/a.rs", true]),     // mixed non-string entry
-            json!([r"src\x"]),             // an entry that fails validate_glob
+            json!("not-an-array"),     // non-array
+            json!([123]),              // non-string entry
+            json!(["src/a.rs", true]), // mixed non-string entry
+            json!([r"src\x"]),         // an entry that fails validate_glob
         ] {
             let cwd = tmp();
             approve_with_globs(&cwd, corrupt.clone());
             let deny = enforce_tool_scoped(&cwd, "Write", WriteTarget::Path("src/a.rs"), "")
                 .unwrap_or_else(|| panic!("corrupt scope {corrupt} must deny"));
-            assert!(deny_code(&deny).contains("out_of_scope_path"), "for {corrupt}");
+            assert!(
+                deny_code(&deny).contains("out_of_scope_path"),
+                "for {corrupt}"
+            );
         }
     }
 
@@ -3188,7 +3231,9 @@ mod tests {
         assert!(scope_declared_in_plan("ALLOWED-GLOBS: src/a.rs"));
         assert!(scope_declared_in_plan("intro\n  allowed-globs:\nmore")); // bare, case-insens, indented
         assert!(scope_declared_in_plan("ALLOWED-GLOBS:"));
-        assert!(!scope_declared_in_plan("no scope\nintended_files: src/a.rs"));
+        assert!(!scope_declared_in_plan(
+            "no scope\nintended_files: src/a.rs"
+        ));
         assert!(!scope_declared_in_plan(""));
     }
 
@@ -3232,8 +3277,12 @@ mod tests {
         // Owner-accepted residual: Bash + mcp__aibridge__run are NOT fenced (Stop-gate backstop).
         let cwd = tmp();
         approve_with_globs(&cwd, json!(["src/a.rs"]));
-        assert!(enforce_tool_scoped(&cwd, "Bash", WriteTarget::Unknown, "echo x > out.txt").is_none());
-        assert!(enforce_tool_scoped(&cwd, "mcp__aibridge__run", WriteTarget::Unknown, "x").is_none());
+        assert!(
+            enforce_tool_scoped(&cwd, "Bash", WriteTarget::Unknown, "echo x > out.txt").is_none()
+        );
+        assert!(
+            enforce_tool_scoped(&cwd, "mcp__aibridge__run", WriteTarget::Unknown, "x").is_none()
+        );
     }
 
     #[test]
@@ -3246,7 +3295,10 @@ mod tests {
         assert!(enforce_tool(&cwd, "Write", "").is_none());
         let cwd2 = tmp();
         approve_with_globs(&cwd2, json!("corrupt"));
-        assert!(enforce(&cwd2, "Write").is_none(), "legacy stays allowed even with corrupt scope");
+        assert!(
+            enforce(&cwd2, "Write").is_none(),
+            "legacy stays allowed even with corrupt scope"
+        );
     }
 
     #[test]
@@ -3273,7 +3325,10 @@ mod tests {
         // ...and an in-scope notebook path is allowed.
         let cwd2 = tmp();
         approve_with_globs(&cwd2, json!(["nb/*"]));
-        assert!(enforce_tool_scoped(&cwd2, "NotebookEdit", WriteTarget::Path("nb/x.ipynb"), "").is_none());
+        assert!(
+            enforce_tool_scoped(&cwd2, "NotebookEdit", WriteTarget::Path("nb/x.ipynb"), "")
+                .is_none()
+        );
     }
 
     #[test]
@@ -3529,9 +3584,19 @@ mod tests {
         // Flag ON (default) → never preserve (today's per-turn reset).
         assert!(!preserve_epoch_decision(true, true, true, TrivialContinue));
         // No current approval → nothing to preserve.
-        assert!(!preserve_epoch_decision(false, false, true, TrivialContinue));
+        assert!(!preserve_epoch_decision(
+            false,
+            false,
+            true,
+            TrivialContinue
+        ));
         // v0.32 Unit 5: no real enforced scope → never preserve (fail closed → re-arm).
-        assert!(!preserve_epoch_decision(false, true, false, TrivialContinue));
+        assert!(!preserve_epoch_decision(
+            false,
+            true,
+            false,
+            TrivialContinue
+        ));
         assert!(!preserve_epoch_decision(false, true, false, UnknownDelta));
         // Flag OFF + approved + enforced scope: preserve for trivial AND unknown (the marker
         // defers the authoritative decision to reconcile), but NOT for an explicit reset.
@@ -3574,10 +3639,16 @@ mod tests {
         assert!(scope_is_enforced(&g), "Globs → enforced");
         let none = tmp();
         approve_with_scope_state(&none, json!([]), false);
-        assert!(!scope_is_enforced(&none), "empty/non-declaring (None) → not enforced");
+        assert!(
+            !scope_is_enforced(&none),
+            "empty/non-declaring (None) → not enforced"
+        );
         let denyall = tmp();
         approve_with_scope_state(&denyall, json!([]), true);
-        assert!(!scope_is_enforced(&denyall), "declared-but-empty (DenyAll) → not enforced");
+        assert!(
+            !scope_is_enforced(&denyall),
+            "declared-but-empty (DenyAll) → not enforced"
+        );
         let corrupt = tmp();
         approve_with_scope_state(&corrupt, json!("oops"), false);
         assert!(!scope_is_enforced(&corrupt), "corrupt → not enforced");
@@ -3591,13 +3662,23 @@ mod tests {
         approve_with_scope_state(&cwd, json!(["src/a.rs"]), true);
         let epoch_before = current_epoch(&cwd);
         start_epoch_inner(&cwd, "sess", "ok", false);
-        assert_eq!(current_epoch(&cwd), epoch_before, "epoch preserved, not re-armed");
-        assert!(has_pending_user_turn(&cwd), "a pending user-turn marker is recorded");
+        assert_eq!(
+            current_epoch(&cwd),
+            epoch_before,
+            "epoch preserved, not re-armed"
+        );
+        assert!(
+            has_pending_user_turn(&cwd),
+            "a pending user-turn marker is recorded"
+        );
         assert_eq!(
             read_state(&cwd).unwrap()["pending_user_turn"]["classification"],
             json!(TurnClass::TrivialContinue.as_marker())
         );
-        assert!(!effectively_approved(&cwd), "suspended until PreToolUse reconciles");
+        assert!(
+            !effectively_approved(&cwd),
+            "suspended until PreToolUse reconciles"
+        );
     }
 
     #[test]
