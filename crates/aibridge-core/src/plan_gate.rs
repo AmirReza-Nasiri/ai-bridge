@@ -724,6 +724,13 @@ fn read_only_execution_supported() -> bool {
 ///   usable path (absent/non-string/empty `file_path`|`notebook_path`) → DENY under an active
 ///   non-empty scope (a write with no checkable target must not slip the fence).
 /// - `Path(p)` — a concrete extracted target → canonicalize + scope-check.
+///
+/// ⚠ SAFETY INVARIANT — `Unknown` MUST NOT be produced for any tool in [`GATED_WRITE_TOOLS`].
+/// `scope_fence` early-returns `None` (allow) for `Unknown`, so emitting it for a real write tool
+/// with an unparseable payload would DISABLE the fence → FAIL-OPEN. The authoritative caller
+/// (`optimizer::write_target_for`) maps every gated write tool to `Path` or `Missing`, never
+/// `Unknown`; `optimizer`'s `write_target_for_*` tests + `scope_fence`'s `Missing`-denies tests
+/// pin this end-to-end. A future caller change MUST preserve it.
 pub enum WriteTarget<'a> {
     Unknown,
     Missing,
@@ -932,6 +939,13 @@ fn scope_fence(cwd: &str, tool_name: &str, target: WriteTarget) -> Option<String
             // An authoritative write with no checkable target under an active scope: fail closed.
             None => Some(deny_json(BlockReason::OutOfScopePath)),
             Some(p) => {
+                // The confinement anchor: the git toplevel, else the gate's OWN repo-root anchor
+                // (`root()` walks to the `.ai-bridge`/`.git` ancestor — the same boundary the gate
+                // keys all its state on). Not a fail-open: `canonicalize_under_root` still
+                // COMPONENT-confines the target under whatever root it is given, so a write can
+                // never escape it. The fallback only matters in a missing-git environment; a
+                // declared scope normally exists only inside a real repo. (Deny-instead-of-fallback
+                // was considered but would break the legitimate non-git `.ai-bridge` case.)
                 let repo_root = crate::git::repo_root(cwd)
                     .unwrap_or_else(|| root(cwd).to_string_lossy().into_owned());
                 match crate::path_scope::canonicalize_under_root(&repo_root, p) {

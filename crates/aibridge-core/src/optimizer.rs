@@ -49,27 +49,7 @@ pub fn pretooluse(hook_input: &Value) -> String {
         .and_then(Value::as_str)
         .unwrap_or("");
     // v0.32 Unit 4: extract the authoritative write target for the post-approval scope fence.
-    // Read ONLY the field this tool actually uses (NotebookEdit → `notebook_path`; every other
-    // gated write tool → `file_path`) so a payload carrying BOTH cannot trick the fence into
-    // checking the wrong path. A present non-empty value is the target; an absent/empty/non-string
-    // one becomes `Missing` so the fence fails closed under an active scope. Non-write tools
-    // carry no target.
-    let target = if crate::plan_gate::GATED_WRITE_TOOLS.contains(&tool_name) {
-        let field = if tool_name == "NotebookEdit" {
-            "notebook_path"
-        } else {
-            "file_path"
-        };
-        match tool_input_opt
-            .and_then(|t| t.get(field))
-            .and_then(Value::as_str)
-        {
-            Some(p) if !p.is_empty() => crate::plan_gate::WriteTarget::Path(p),
-            _ => crate::plan_gate::WriteTarget::Missing,
-        }
-    } else {
-        crate::plan_gate::WriteTarget::Unknown
-    };
+    let target = write_target_for(tool_name, tool_input_opt);
     // 1. Pre-approval plan gate: deny writes/Bash until the plan is Codex-approved
     //    (deny wins; merged here so a denied pre-approval Bash is never also
     //    rtk-rewritten, per Codex review). Post-approval, the same call applies the
@@ -111,6 +91,34 @@ pub fn pretooluse(hook_input: &Value) -> String {
             .to_string()
         }
         None => no_change, // fail-open: run the original command
+    }
+}
+
+/// v0.32 Unit 4: map the PreToolUse tool-context to a [`crate::plan_gate::WriteTarget`] for the
+/// post-approval scope fence. Reads ONLY the field this tool actually uses (NotebookEdit →
+/// `notebook_path`; every other gated write tool → `file_path`) so a payload carrying BOTH cannot
+/// trick the fence into checking the wrong path. A present non-empty value → `Path`; an
+/// absent/empty/non-string value for a gated write tool → `Missing` (the fence then fails closed
+/// under an active scope); a non-gated tool → `Unknown`.
+///
+/// ⚠ SAFETY INVARIANT (see [`crate::plan_gate::WriteTarget`]): a [`crate::plan_gate::GATED_WRITE_TOOLS`]
+/// tool MUST NEVER map to `Unknown` — that would disable the fence (fail-open). Pinned by the
+/// `write_target_for_*` tests below + `scope_fence`'s `Missing`-denies tests in plan_gate.
+fn write_target_for<'a>(
+    tool_name: &str,
+    tool_input: Option<&'a Value>,
+) -> crate::plan_gate::WriteTarget<'a> {
+    if !crate::plan_gate::GATED_WRITE_TOOLS.contains(&tool_name) {
+        return crate::plan_gate::WriteTarget::Unknown;
+    }
+    let field = if tool_name == "NotebookEdit" {
+        "notebook_path"
+    } else {
+        "file_path"
+    };
+    match tool_input.and_then(|t| t.get(field)).and_then(Value::as_str) {
+        Some(p) if !p.is_empty() => crate::plan_gate::WriteTarget::Path(p),
+        _ => crate::plan_gate::WriteTarget::Missing,
     }
 }
 
@@ -169,6 +177,41 @@ mod tests {
 
     fn cmd(c: &str) -> Value {
         json!({"tool_name": "Bash", "tool_input": {"command": c}})
+    }
+
+    #[test]
+    fn write_target_for_gated_write_with_bad_path_is_missing_never_unknown() {
+        use crate::plan_gate::{WriteTarget, GATED_WRITE_TOOLS};
+        // EVERY gated write tool with no usable path MUST map to `Missing` (never `Unknown` —
+        // that would disable the scope fence → fail-open). Iterating GATED_WRITE_TOOLS means a
+        // FUTURE-ADDED write tool is automatically covered and cannot slip the invariant.
+        for &tool in GATED_WRITE_TOOLS {
+            assert!(matches!(write_target_for(tool, None), WriteTarget::Missing), "{tool} no input");
+            assert!(matches!(write_target_for(tool, Some(&json!({}))), WriteTarget::Missing), "{tool} absent");
+            // a field this tool does not read (incl. any future tool reading `file_path`) → Missing.
+            assert!(matches!(write_target_for(tool, Some(&json!({"totally_unused": "x"}))), WriteTarget::Missing), "{tool} unrelated field");
+        }
+        // Field-specific empty / non-string cases (representative: file_path tools + NotebookEdit),
+        // plus the cross-field ignore (each tool reads ONLY its own field).
+        assert!(matches!(write_target_for("Write", Some(&json!({"file_path": ""}))), WriteTarget::Missing));
+        assert!(matches!(write_target_for("Write", Some(&json!({"file_path": 5}))), WriteTarget::Missing));
+        assert!(matches!(write_target_for("Write", Some(&json!({"notebook_path": "x.ipynb"}))), WriteTarget::Missing));
+        assert!(matches!(write_target_for("NotebookEdit", Some(&json!({"notebook_path": ""}))), WriteTarget::Missing));
+        assert!(matches!(write_target_for("NotebookEdit", Some(&json!({"notebook_path": 5}))), WriteTarget::Missing));
+        assert!(matches!(write_target_for("NotebookEdit", Some(&json!({"file_path": "x.rs"}))), WriteTarget::Missing));
+    }
+
+    #[test]
+    fn write_target_for_valid_path_is_path_and_non_write_is_unknown() {
+        use crate::plan_gate::WriteTarget;
+        for tool in ["Write", "Edit", "MultiEdit"] {
+            assert!(matches!(write_target_for(tool, Some(&json!({"file_path": "src/a.rs"}))), WriteTarget::Path("src/a.rs")), "{tool} path");
+        }
+        assert!(matches!(write_target_for("NotebookEdit", Some(&json!({"notebook_path": "n.ipynb"}))), WriteTarget::Path("n.ipynb")));
+        // Non-gated tools never carry a write target (so the fence ignores them).
+        for tool in ["Bash", "Read", "Grep", "mcp__aibridge__run"] {
+            assert!(matches!(write_target_for(tool, Some(&json!({"file_path": "src/a.rs"}))), WriteTarget::Unknown), "{tool} unknown");
+        }
     }
 
     #[test]

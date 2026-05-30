@@ -33,6 +33,12 @@
 /// flags (`-p`/`--patch`/`--word-diff`) are deliberately EXCLUDED — rendering file content can
 /// invoke configured textconv/ext-diff/pager helpers (exec). Anything outside this set
 /// (`--output`, `--ext-diff`, `-O`, content flags, unknown) is denied for those subcommands.
+///
+/// ⚠ SAFETY INVARIANT — `git diff`/`show` REUSE this list, and their read-only guarantee depends
+/// on it staying CONTENT-FREE. NEVER add a content-rendering / file-writing / exec-capable flag:
+/// `-p` `--patch` `-U`/`--unified` `--word-diff` `--ext-diff` `--output` `-O`/`--output-indicator-*`
+/// `-G`/`-S` (pickaxe). A summary flag must never be able to RESCUE such a flag (see the
+/// `denies_content_and_pickaxe_flags` regression test).
 const GIT_LOG_DIFF_FLAGS: &[&str] = &[
     "--oneline",
     "--stat",
@@ -260,6 +266,30 @@ mod tests {
     fn denies_git_global_option_before_subcommand() {
         for c in ["git -c core.pager=x status", "git -C dir status", "git --exec-path=p status"] {
             assert!(!is_read_only(c), "{c} (pre-subcommand global option) must be denied");
+        }
+    }
+
+    #[test]
+    fn denies_content_and_pickaxe_flags() {
+        // A SUMMARY flag (--stat) must NOT rescue a content/pickaxe/output flag for `diff`/`show`
+        // (those would invoke textconv/ext-diff/pager exec or write a file). Both spaced and
+        // attached forms, both subcommands. Regression pin for the GIT_LOG_DIFF_FLAGS invariant.
+        for c in [
+            "git show --stat -S foo",
+            "git show --stat -Sfoo",
+            "git show --stat -G bar",
+            "git show --stat -Gbar",
+            "git diff --stat -S foo",
+            "git diff --stat -Sfoo",
+            "git diff --stat -G bar",
+            "git diff --stat -Gbar",
+            "git diff --stat --output=x",
+            "git diff --stat --output x",
+        ] {
+            assert!(
+                !is_read_only(c),
+                "{c}: a summary flag must NOT rescue a content/pickaxe/output flag"
+            );
         }
     }
 
