@@ -44,6 +44,10 @@ pub enum ScopeReject {
     ForeignSeparator,
     /// The target (or its nearest existing ancestor, or the repo root) could not be canonicalized.
     NonCanonicalizable,
+    /// A declared scope GLOB used syntax outside this module's restricted grammar
+    /// (literals, `/`, single-segment `*`, whole-segment `**`) — e.g. `?`/`[`/`{`/`\`,
+    /// a rooted/`..`/`.`/`//` form, or a malformed `**`. Used by [`crate::scope`].
+    UnsupportedGlob,
 }
 
 /// Canonicalize `raw_target` and confine it under `repo_root`, returning a

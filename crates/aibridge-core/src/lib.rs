@@ -25,6 +25,7 @@ pub mod review_frontier;
 pub mod review_mcp;
 pub mod router;
 pub mod rtk;
+pub mod scope;
 pub mod skills;
 pub mod staged_update;
 pub mod tool_discovery;
