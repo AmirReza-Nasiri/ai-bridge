@@ -546,6 +546,25 @@ pub fn reconcile_pending_user_turn(cwd: &str) -> Option<String> {
     Some(deny_json(BlockReason::UserScopeDelta))
 }
 
+/// v0.32: maintain the pending-user-turn marker for an admitted READ-ONLY discovery command.
+/// Unlike [`reconcile_pending_user_turn`] (which a mutator triggers), a read-only command never
+/// REVOKES — it writes nothing. But a TRIVIAL continuation marker is still consumed here, so the
+/// preserved approval becomes effective again (a lingering marker would keep
+/// [`effectively_approved`] false and make `review_checkpoint` refuse). A scope-delta / malformed
+/// marker is LEFT untouched so the revoke defers to the first WRITE. No-op when nothing is pending.
+fn reconcile_pending_user_turn_read_only(cwd: &str) {
+    let class = read_state(cwd)
+        .and_then(|s| s.get("pending_user_turn").cloned())
+        .and_then(|v| {
+            v.get("classification")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+    if class.as_deref() == Some(TurnClass::TrivialContinue.as_marker()) {
+        clear_pending_user_turn(cwd);
+    }
+}
+
 /// The current epoch id (or a synthesized "manual" one if no prompt started a
 /// task yet — keeps the `plan_gate` tool usable even with enforcement off).
 pub fn current_epoch(cwd: &str) -> String {
@@ -751,6 +770,24 @@ fn enforce_tool_scoped_with(
     if !is_gated_tool(tool_name) {
         return None;
     }
+    // v0.32 read-only discovery carve-out (opt-in via `planGate.readOnlyOrientation`, default
+    // off) — checked BEFORE the scope-delta reconcile below. A Bash command the lexical
+    // classifier proves read-only WRITES NOTHING, so it must never trigger the user-turn REVOKE:
+    // it just inspects the repo (`git status`/`diff`, `find`, `ls`…) without forcing a plan_gate
+    // round. The marker is maintained without revoking — a trivial continuation IS consumed (so
+    // the preserved approval is effective again), but a scope-delta / malformed marker is LEFT,
+    // so the revoke correctly defers to the first WRITE. Owner-accepted residual (see
+    // [`crate::read_only_exec`]): no working-tree/source write capability; Stop-gate reviews the diff.
+    if tool_name == "Bash" && read_only_carveout(orientation_on, command) {
+        // Maintain the user-turn marker WITHOUT revoking: a trivial continuation is consumed (so
+        // the preserved approval is effective again — a lingering marker would keep
+        // `effectively_approved` false and make `review_checkpoint` refuse), while a scope-delta /
+        // malformed marker is LEFT so the revoke defers to the first WRITE.
+        if is_enabled(cwd) && !bypassed() {
+            reconcile_pending_user_turn_read_only(cwd);
+        }
+        return None;
+    }
     // v0.31 P1: when the gate is actually enforcing, consume any pending user-turn marker
     // BEFORE deciding. A scope-delta turn revokes + denies here (user_scope_delta); a trivial
     // continuation just clears the marker so `blocks_writes` below sees the preserved approval.
@@ -770,14 +807,8 @@ fn enforce_tool_scoped_with(
         }
         return None;
     }
-    // v0.32 read-only discovery carve-out (opt-in via `planGate.readOnlyOrientation`, default
-    // off). A Bash command the lexical classifier proves read-only may RUN pre-approval, so
-    // inspecting a repo (`git status`/`diff`, `find`, `ls`…) does not force a plan_gate round.
-    // Owner-accepted residual (see [`crate::read_only_exec`]): no working-tree/source write
-    // capability is granted; the Stop-gate still reviews the final diff.
-    if tool_name == "Bash" && read_only_carveout(orientation_on, command) {
-        return None;
-    }
+    // (The read-only discovery carve-out is checked at the TOP, before the scope-delta
+    // reconcile, so a read-only command never eats a one-time deny or consumes the marker.)
     // Count repeated denied writes so the operator can see a wrong-loop (Claude
     // retrying the edit instead of calling plan_gate).
     if let Some(mut s) = read_state(cwd) {
@@ -2922,6 +2953,67 @@ mod tests {
         assert!(read_only_carveout(true, "git status"));
         assert!(!read_only_carveout(false, "git status"));
         assert!(!read_only_carveout(true, "rm -rf x"));
+    }
+
+    #[test]
+    fn read_only_command_bypasses_the_scope_delta_revoke() {
+        // The carve-out is checked BEFORE the user-turn reconcile, so a proven read-only command
+        // arriving after a scope-delta turn (a) is admitted instead of eating a one-time
+        // `user_scope_delta` deny, and (b) does NOT consume the pending marker — the revoke
+        // correctly defers to the first WRITE.
+        let cwd = tmp();
+        approve_with_globs(&cwd, json!(["src/*.rs"]));
+        assert!(set_pending_user_turn(&cwd, TurnClass::UnknownDelta));
+        // ON: read-only `git status` runs, and the marker is PRESERVED (not consumed/revoked).
+        assert!(
+            enforce_tool_scoped_with(&cwd, "Bash", WriteTarget::Unknown, "git status", true)
+                .is_none(),
+            "read-only discovery must bypass the scope-delta revoke"
+        );
+        assert!(
+            has_pending_user_turn(&cwd),
+            "a read-only command must NOT consume the pending-user-turn marker"
+        );
+        // The first WRITE now lands the revoke with `user_scope_delta`.
+        let deny = enforce_tool_scoped_with(&cwd, "Write", WriteTarget::Path("src/x.rs"), "", true)
+            .expect("the first write after a scope delta must re-gate");
+        assert!(deny_code(&deny).contains("user_scope_delta"), "{}", deny_code(&deny));
+
+        // With orientation OFF the bypass does not apply: a scope-delta + read-only Bash still
+        // hits reconcile and is denied with `user_scope_delta` (byte-identical to pre-carve-out).
+        let cwd2 = tmp();
+        approve_with_globs(&cwd2, json!(["src/*.rs"]));
+        assert!(set_pending_user_turn(&cwd2, TurnClass::UnknownDelta));
+        let deny =
+            enforce_tool_scoped_with(&cwd2, "Bash", WriteTarget::Unknown, "git status", false)
+                .expect("carve-out off: read-only Bash still reconciles the scope delta");
+        assert!(deny_code(&deny).contains("user_scope_delta"), "{}", deny_code(&deny));
+    }
+
+    #[test]
+    fn read_only_command_consumes_a_trivial_continuation_marker() {
+        // A TRIVIAL continuation marker must still be CONSUMED by an admitted read-only command,
+        // so the preserved approval becomes effective again — otherwise a lingering marker keeps
+        // `effectively_approved` false and `review_checkpoint` would refuse (regression guard).
+        let cwd = tmp();
+        approve_with_globs(&cwd, json!(["src/*.rs"]));
+        assert!(set_pending_user_turn(&cwd, TurnClass::TrivialContinue));
+        assert!(has_pending_user_turn(&cwd));
+        assert!(blocks_writes(&cwd), "a pending marker makes the approval not-yet-effective");
+        // Orientation-on read-only Bash is allowed AND clears the trivial marker.
+        assert!(
+            enforce_tool_scoped_with(&cwd, "Bash", WriteTarget::Unknown, "git status", true)
+                .is_none(),
+            "read-only `git status` should run under a trivial continuation"
+        );
+        assert!(
+            !has_pending_user_turn(&cwd),
+            "a trivial-continuation marker must be consumed by the read-only command"
+        );
+        assert!(
+            is_effectively_approved(&cwd) && !blocks_writes(&cwd),
+            "consuming the trivial marker restores the effective approval"
+        );
     }
 
     // ── v0.32 Unit 4: post-approval write-time scope fence ──────────────────────────────
