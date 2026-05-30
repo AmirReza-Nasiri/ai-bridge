@@ -12,8 +12,11 @@
 //!   committed `CLAUDE.md`.
 //! - Ownership recorded in `.ai-bridge/install-state.json`.
 //!
-//! A committed/team install (`.mcp.json` + `settings.json` + `CLAUDE.md`) is a
-//! future `--shared` mode.
+//! `aibridge init --shared` additionally writes the standing operating-model
+//! conventions to the COMMITTED `CLAUDE.md` so a team can version them (opt-in;
+//! the per-machine gate-awareness note stays untracked even then). The FULL
+//! committed/team install (committed `.mcp.json` + `settings.json` + hook wiring)
+//! is still a future expansion of `--shared`.
 
 use aibridge_platform::{DefaultPlatform, Platform};
 use anyhow::{anyhow, Context, Result};
@@ -22,6 +25,17 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const GATE_LINE: &str = "AI Bridge is installed locally in this project. If the Stop hook blocks with peer-review findings, address them before finishing. If AI Bridge asks for a user decision, stop and ask the user. Peer reviews run at high reasoning effort (xhigh), so a review can take MINUTES — especially the first (cold) one of a session — and it is NOT hung: run `aibridge status` (or `aibridge status --watch`) to watch live progress. The Stop gate reviews the WHOLE task delta — work COMMITTED since the task started PLUS the uncommitted tree — so committing does NOT skip review; commits are checkpoints, not a way past the gate. Commit at task boundaries (after a clean review) to keep the NEXT task's review small. If a review loop gets stuck, the supported escape is the no-progress prompt or an explicit user decision — never `commit` to silence the gate.";
+
+/// Header that marks the operating-model block (also used as the idempotency
+/// marker). `OPERATING_MODEL_NOTE` MUST begin with this exact string — a test
+/// guards the invariant.
+const OPERATING_MODEL_MARKER: &str = "## AI Bridge — operating model";
+
+/// Standing operating-model directives appended by `init`. Worded CONDITIONALLY
+/// (Codex topic `init-claude-md-destination`): a committed/shared copy must not
+/// order teammates WITHOUT AI Bridge to call tools that aren't connected, so the
+/// preamble scopes the whole block to "when the MCP tools are available".
+const OPERATING_MODEL_NOTE: &str = "## AI Bridge — operating model\n\nThese conventions apply when working in a project with AI Bridge installed. The `mcp__aibridge__*` tools below exist only when the AI Bridge MCP server is connected — when it isn't, treat this section as advisory.\n\n**Codex-implements loop.** When a `plan_gate` or `review_diff` finding is localized and precisely specified, call `mcp__aibridge__implement` so Codex drafts the patch, then verify + apply + test it yourself — don't re-derive the fix by hand. This cuts review round-trips.\n\n**Orchestration / shape-routing.** Route work by shape: broad, parallelizable, read-only work (audits, wide refactors, N-site migrations, research) → fan out across subagents or a workflow; deep, sequential, interdependent work (e.g. a safety-core state machine) → keep it in a single coherent context. Don't fan out a sequential dependency chain. Verify proportional to risk — dual-brain (a Claude review AND an independent Codex `review_diff`) on safety-core changes.\n\n**Caching discipline.** Keep the Codex `topic` stable across a task: a stable topic + stable prompt + transcript replay is Codex's only cache lever (AI Bridge has no Anthropic API client of its own). Claude's own prompt cache is owned by the harness (~5-min TTL) — keep model/effort/tools stable within a task and prefer append-only context.";
 
 /// What `init` did, for a human-readable report.
 pub struct InitReport {
@@ -34,7 +48,10 @@ pub struct InitReport {
 /// it wires UserPromptSubmit + a broad PreToolUse hook that denies writes/Bash
 /// until the plan is approved (that hook also does rtk, subsuming the rtk-only
 /// Bash hook). `rtk` only matters when `plan_gate` is off (wires the narrow hook).
-pub fn init(project: &Path, rtk: bool, plan_gate: bool) -> Result<InitReport> {
+/// `shared` routes the standing operating-model directives to the COMMITTED
+/// `CLAUDE.md` (team-visible) instead of the untracked `CLAUDE.local.md` default;
+/// the per-machine "installed locally" gate note is untracked in BOTH modes.
+pub fn init(project: &Path, rtk: bool, plan_gate: bool, shared: bool) -> Result<InitReport> {
     let exe = std::env::current_exe().context("resolving the aibridge executable path")?;
     let exe_str = exe.to_string_lossy().to_string();
     let mut actions = Vec::new();
@@ -62,6 +79,7 @@ pub fn init(project: &Path, rtk: bool, plan_gate: bool) -> Result<InitReport> {
         ));
     }
     add_gate_line(project, &mut actions)?;
+    add_operating_model_directives(project, shared, &mut actions)?;
     write_install_state(project, &exe_str, &mut actions)?;
     git_exclude(project, ".ai-bridge/", &mut actions);
 
@@ -518,6 +536,53 @@ fn add_gate_line(project: &Path, actions: &mut Vec<String>) -> Result<()> {
     Ok(())
 }
 
+/// Append the standing operating-model directives (Codex-implements loop, shape-
+/// routing, caching discipline). Default (`shared=false`) → the untracked
+/// `CLAUDE.local.md` (git-excluded), consistent with the gate notes and polite as
+/// a default on arbitrary repos. `--shared` (`shared=true`) → the COMMITTED
+/// `CLAUDE.md` (create-or-append; NEVER git-excluded) so a team can version the
+/// conventions. The per-machine "installed locally" note is NOT moved — it stays
+/// untracked in both modes (it's an environment fact, not a team convention).
+/// Idempotent via the `OPERATING_MODEL_MARKER` header; only ever APPENDS, never
+/// overwrites existing CLAUDE.md content.
+fn add_operating_model_directives(
+    project: &Path,
+    shared: bool,
+    actions: &mut Vec<String>,
+) -> Result<()> {
+    let path = project.join(if shared { "CLAUDE.md" } else { "CLAUDE.local.md" });
+    let existing = read_note_or_empty(&path)?;
+    if !existing.contains(OPERATING_MODEL_MARKER) {
+        let mut content = existing;
+        if !content.is_empty() {
+            // Separate the block from any preceding note with a blank line.
+            if !content.ends_with('\n') {
+                content.push('\n');
+            }
+            content.push('\n');
+        }
+        content.push_str(OPERATING_MODEL_NOTE);
+        content.push('\n');
+        // The committed CLAUDE.md is team-visible — back it up before the in-place
+        // rewrite (parity with the JSON-config installer paths). The untracked
+        // CLAUDE.local.md note is regenerable, so it's appended without a backup.
+        if shared {
+            backup_if_exists(&path, actions)?;
+        }
+        std::fs::write(&path, content).with_context(|| format!("writing {}", display(&path)))?;
+        actions.push(format!(
+            "added the operating-model directives to {}",
+            display(&path)
+        ));
+    }
+    // Only the untracked default is git-excluded; a `--shared` CLAUDE.md is meant
+    // to be committed, so leave it tracked.
+    if !shared {
+        git_exclude(project, "CLAUDE.local.md", actions);
+    }
+    Ok(())
+}
+
 /// Best-effort: add `entry` to the repo's `.git/info/exclude` so a local-only
 /// file stays untracked without editing the committed `.gitignore`.
 ///
@@ -602,6 +667,18 @@ fn read_json(path: &Path) -> Result<Value> {
             serde_json::from_str(&s).with_context(|| format!("parsing {}", display(path)))
         }
         _ => Ok(json!({})),
+    }
+}
+
+/// Read an existing markdown note, treating ONLY a missing file as empty. Any
+/// other error (invalid UTF-8 → `InvalidData`, locked, permission denied)
+/// propagates so a caller never overwrites an unreadable existing file — matters
+/// for the COMMITTED `CLAUDE.md` in `--shared` mode.
+fn read_note_or_empty(path: &Path) -> Result<String> {
+    match std::fs::read_to_string(path) {
+        Ok(s) => Ok(s),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(err) => Err(err).with_context(|| format!("reading {}", display(path))),
     }
 }
 
@@ -727,5 +804,128 @@ mod tests {
             Some(CANON),
             "the surviving group is the canonical broad one"
         );
+    }
+
+    #[test]
+    fn operating_model_note_starts_with_marker() {
+        // The idempotency check matches OPERATING_MODEL_MARKER against the note's
+        // header — guard that the two don't silently drift apart.
+        assert!(OPERATING_MODEL_NOTE.starts_with(OPERATING_MODEL_MARKER));
+    }
+
+    #[test]
+    fn operating_model_directives_default_local() {
+        let p = tmp();
+        add_operating_model_directives(&p, false, &mut Vec::new()).unwrap();
+        let local = std::fs::read_to_string(p.join("CLAUDE.local.md")).unwrap();
+        assert!(local.contains(OPERATING_MODEL_MARKER));
+        assert!(local.contains("Codex-implements loop"));
+        assert!(
+            !p.join("CLAUDE.md").exists(),
+            "default mode must not create the committed CLAUDE.md"
+        );
+    }
+
+    #[test]
+    fn operating_model_directives_shared_committed() {
+        let p = tmp();
+        add_operating_model_directives(&p, true, &mut Vec::new()).unwrap();
+        let committed = std::fs::read_to_string(p.join("CLAUDE.md")).unwrap();
+        assert!(committed.contains(OPERATING_MODEL_MARKER));
+        assert!(
+            !p.join("CLAUDE.local.md").exists(),
+            "shared mode must not write the untracked CLAUDE.local.md"
+        );
+    }
+
+    #[test]
+    fn operating_model_directives_rejects_unreadable_committed_file() {
+        let p = tmp();
+        let original: [u8; 5] = [0xFF, 0xFE, 0x00, b'h', b'i'];
+        std::fs::write(p.join("CLAUDE.md"), original).unwrap();
+
+        assert!(add_operating_model_directives(&p, true, &mut Vec::new()).is_err());
+        let bytes = std::fs::read(p.join("CLAUDE.md")).unwrap();
+        assert_eq!(
+            bytes,
+            original.to_vec(),
+            "unreadable file must not be overwritten"
+        );
+    }
+
+    #[test]
+    fn operating_model_directives_backs_up_existing_committed_file() {
+        let p = tmp();
+        let original = "# Team rules\n";
+        std::fs::write(p.join("CLAUDE.md"), original).unwrap();
+        add_operating_model_directives(&p, true, &mut Vec::new()).unwrap();
+        let backup = std::fs::read_dir(&p)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .find(|e| {
+                let name = e.file_name();
+                let name = name.to_string_lossy();
+                name.starts_with("CLAUDE.md.aibridge-") && name.ends_with(".bak")
+            })
+            .expect("an existing committed CLAUDE.md must be backed up before append");
+        // The backup must be a faithful copy of the PRE-append file...
+        assert_eq!(
+            std::fs::read_to_string(backup.path()).unwrap(),
+            original,
+            "backup must capture the original pre-append content"
+        );
+        // ...and the live file must keep the original content plus our block.
+        let live = std::fs::read_to_string(p.join("CLAUDE.md")).unwrap();
+        assert!(live.starts_with(original) && live.contains(OPERATING_MODEL_MARKER));
+    }
+
+    #[test]
+    fn operating_model_directives_idempotent() {
+        let p = tmp();
+        add_operating_model_directives(&p, false, &mut Vec::new()).unwrap();
+        let first = std::fs::read_to_string(p.join("CLAUDE.local.md")).unwrap();
+        add_operating_model_directives(&p, false, &mut Vec::new()).unwrap();
+        let second = std::fs::read_to_string(p.join("CLAUDE.local.md")).unwrap();
+        assert_eq!(first, second, "re-running must not change the file");
+        assert_eq!(
+            second.matches(OPERATING_MODEL_MARKER).count(),
+            1,
+            "the block must appear exactly once"
+        );
+    }
+
+    #[test]
+    fn operating_model_directives_append_preserves_existing() {
+        let p = tmp();
+        std::fs::write(p.join("CLAUDE.md"), "# Team rules\nUse tabs.").unwrap();
+        add_operating_model_directives(&p, true, &mut Vec::new()).unwrap();
+        let committed = std::fs::read_to_string(p.join("CLAUDE.md")).unwrap();
+        assert!(
+            committed.contains("# Team rules") && committed.contains("Use tabs."),
+            "existing team content must be preserved"
+        );
+        assert!(committed.contains(OPERATING_MODEL_MARKER));
+        assert!(
+            committed.contains("Use tabs.\n\n## AI Bridge"),
+            "a blank line must separate prior content from our block"
+        );
+    }
+
+    #[test]
+    fn gate_awareness_note_stays_local_even_in_shared_mode() {
+        let p = tmp();
+        add_gate_line(&p, &mut Vec::new()).unwrap();
+        add_operating_model_directives(&p, true, &mut Vec::new()).unwrap();
+        let local = std::fs::read_to_string(p.join("CLAUDE.local.md")).unwrap();
+        assert!(
+            local.contains("AI Bridge is installed locally"),
+            "the per-machine install note is untracked"
+        );
+        let committed = std::fs::read_to_string(p.join("CLAUDE.md")).unwrap();
+        assert!(
+            !committed.contains("AI Bridge is installed locally"),
+            "the install note must never be committed"
+        );
+        assert!(committed.contains(OPERATING_MODEL_MARKER));
     }
 }

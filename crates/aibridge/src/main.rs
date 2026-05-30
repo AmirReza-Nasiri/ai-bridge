@@ -36,6 +36,12 @@ enum Commands {
         /// must approve the plan. A quick per-session bypass is `AIBRIDGE_PLAN_GATE=0`.
         #[arg(long = "no-plan-gate")]
         no_plan_gate: bool,
+        /// Write the standing operating-model conventions to the COMMITTED
+        /// `CLAUDE.md` (team-shared) instead of the untracked `CLAUDE.local.md`
+        /// (the default). The per-machine "installed locally" note always stays
+        /// untracked.
+        #[arg(long)]
+        shared: bool,
     },
     /// Translate `ai-bridge.profile.toml` into native per-CLI config.
     Profile {
@@ -318,7 +324,11 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::McpServer => aibridge_core::mcp::serve(),
-        Commands::Init { rtk, no_plan_gate } => init(rtk, !no_plan_gate),
+        Commands::Init {
+            rtk,
+            no_plan_gate,
+            shared,
+        } => init(rtk, !no_plan_gate, shared),
         Commands::Profile { action } => match action {
             ProfileAction::Apply { dry_run, fix } => {
                 not_yet(&format!("profile apply (dry_run={dry_run}, fix={fix})"))
@@ -821,9 +831,9 @@ fn not_yet(what: &str) -> Result<()> {
     Ok(())
 }
 
-fn init(rtk: bool, plan_gate: bool) -> Result<()> {
+fn init(rtk: bool, plan_gate: bool, shared: bool) -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let report = aibridge_core::install::init(&cwd, rtk, plan_gate)?;
+    let report = aibridge_core::install::init(&cwd, rtk, plan_gate, shared)?;
     println!("AI Bridge: wired into {}", cwd.display());
     for action in &report.actions {
         println!("  • {action}");
@@ -843,6 +853,12 @@ fn init(rtk: bool, plan_gate: bool) -> Result<()> {
     } else {
         println!(
             "Then work normally — the automatic Stop peer-review gate is active (plan gate off)."
+        );
+    }
+    if shared {
+        println!(
+            "Operating-model conventions live in the COMMITTED CLAUDE.md (--shared) — \
+             review and commit it to share them with your team."
         );
     }
     Ok(())

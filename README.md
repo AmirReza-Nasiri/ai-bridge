@@ -24,7 +24,8 @@
 | **`aibridge status` / `--watch`** — live progress of an in-progress review (elapsed, codex events, token count) so a long review isn't a black box | ✅ working |
 | **`aibridge update`** — self-update from GitHub Releases (`gh` download + sha256 verify + replace; `--check` to just report) | ✅ working |
 | **rtk output-compression** — opt-in via `aibridge init --rtk` (safe-mode allowlist) | ✅ working |
-| `--shared` team install · `uninit` · TUI · `--from-source` update | 🔭 planned |
+| **`aibridge init --shared`** — version the standing operating-model conventions to the committed `CLAUDE.md` (opt-in; the per-machine gate note stays untracked) | ✅ working |
+| full `--shared` team install (committed `.mcp.json` + hooks) · `uninit` · TUI · `--from-source` update | 🔭 planned |
 
 ---
 
@@ -63,11 +64,15 @@ cd <your-project>
 aibridge init
 ```
 
-`init` is **local and untracked** — it registers the `aibridge` MCP server in
-Claude's local scope, installs the `Stop` review hook in
+`init` is **local and untracked** by default — it registers the `aibridge` MCP
+server in Claude's local scope, installs the `Stop` review hook in
 `.claude/settings.local.json`, drops a note in `CLAUDE.local.md`, and records
-ownership in `.ai-bridge/install-state.json`. It never edits committed config and
-backs up anything it touches.
+ownership in `.ai-bridge/install-state.json`. By default it never edits committed
+config, and it backs up any existing JSON config (and, under `--shared`, the
+committed `CLAUDE.md`) before modifying it. `aibridge init --shared` additionally
+appends the standing operating-model conventions to the committed `CLAUDE.md`
+(opt-in, for teams that want to version them — the per-machine gate note stays
+untracked).
 
 **3. Restart Claude Code, then verify — one command:**
 
