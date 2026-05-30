@@ -91,15 +91,16 @@ pub fn is_read_only(command: &str) -> bool {
     let Some(&first) = tokens.first() else {
         return false; // empty / whitespace-only
     };
-    // GLOBAL denials:
+    // GLOBAL denials (apply to EVERY command, incl. git operands):
     // - `--help` opens a man page / configured `web.browser` / pager → arbitrary exec.
     //   (`-h` only prints usage and is a legit human-readable flag for `ls`/`du`/…, kept.)
     // - a bare `-` operand reads stdin and would BLOCK the hook.
-    // - an ABSOLUTE path operand escapes the repo (system-file reads like `cat /etc/passwd`,
-    //   `ls C:/Users`, `find /`).
+    // - an ABSOLUTE path operand escapes the repo (`cat /etc/passwd`, `ls C:/Users`, `find /`).
+    // - any `..` token escapes the cwd (`git status ../secret`, `git diff --stat -- ../x`, a
+    //   `main..dev` rev-range); rejecting it confines every operand under the cwd (fail-closed).
     if tokens.contains(&"--help")
         || tokens.contains(&"-")
-        || tokens.iter().any(|t| is_absolute_path(t))
+        || tokens.iter().any(|t| is_absolute_path(t) || t.contains(".."))
     {
         return false;
     }
@@ -115,10 +116,8 @@ pub fn is_read_only(command: &str) -> bool {
     match first {
         "ls" | "dir" | "pwd" | "cat" | "head" | "tail" | "wc" => file_reader_ok(first, &tokens),
         "git" => git_read_only(&tokens),
-        "find" => {
-            !tokens.iter().any(|t| FIND_MUTATING_ACTIONS.contains(t))
-                && !tokens.iter().any(|t| t.contains(".."))
-        }
+        // `..` already rejected globally; only the mutating/exec actions remain to bar.
+        "find" => !tokens.iter().any(|t| FIND_MUTATING_ACTIONS.contains(t)),
         _ => false,
     }
 }
@@ -131,14 +130,12 @@ fn is_absolute_path(tok: &str) -> bool {
         || (b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':')
 }
 
-/// File-reading inspection (`ls`/`dir`/`pwd`/`cat`/`head`/`tail`/`wc`) is confined to the cwd
-/// subtree (no `..` escape; absolute paths already rejected globally) and must not BLOCK: a
+/// File-reading inspection (`ls`/`dir`/`pwd`/`cat`/`head`/`tail`/`wc`) — absolute and `..`
+/// escapes already rejected globally — must not BLOCK: a
 /// `tail -f`/`-F`/`--follow` streams forever, and `cat`/`head`/`tail`/`wc` with no FILE
 /// operand read stdin and hang the pre-approval hook.
 fn file_reader_ok(first: &str, tokens: &[&str]) -> bool {
-    if tokens.iter().any(|t| t.contains("..")) {
-        return false;
-    }
+    // (`..` escapes are already rejected globally.)
     if first == "tail" && tokens.iter().any(|t| tail_follows(t)) {
         return false;
     }
@@ -308,6 +305,11 @@ mod tests {
             "find .. -type f",
             "git diff --stat -- /etc/x",
             "cat \\\\server\\share",
+            // `..` escapes for GIT operands too (status/ls-files/diff path + rev-range).
+            "git status ../secret",
+            "git ls-files ../secret",
+            "git diff --stat -- ../secret",
+            "git log main..dev",
         ] {
             assert!(!is_read_only(c), "{c} (absolute/escape path) must be denied");
         }
