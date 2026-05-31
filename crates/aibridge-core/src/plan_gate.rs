@@ -21,7 +21,10 @@
 //! Claude Code restart `init` asks for). Merely shipping the binary gates no one.
 
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 /// Write tools denied until the plan is approved. `Bash` is handled separately
 /// (default-deny too) so its approved path can still flow through rtk.
@@ -171,6 +174,7 @@ fn read_state(cwd: &str) -> Option<Value> {
 /// sees a half-written/truncated file (the hooks and the warm server share this
 /// file with no other lock).
 fn write_state(cwd: &str, v: &Value) -> std::io::Result<()> {
+    forced_write_failure()?; // test-only deterministic write-failure seam (no-op in release)
     let d = dir(cwd);
     std::fs::create_dir_all(&d)?;
     let body = serde_json::to_string_pretty(v).unwrap_or_else(|_| "{}".to_string());
@@ -192,6 +196,9 @@ fn pending_path(cwd: &str) -> PathBuf {
 /// Record THIS review's submission (epoch + plan hash) atomically in the separate
 /// `pending` file. One write, no authority-state touch.
 fn write_pending(cwd: &str, epoch: &str, plan_hash: u64) -> bool {
+    if forced_write_failure().is_err() {
+        return false; // test-only deterministic write-failure seam (no-op in release)
+    }
     let d = dir(cwd);
     if std::fs::create_dir_all(&d).is_err() {
         return false;
@@ -215,6 +222,180 @@ fn read_pending(cwd: &str) -> Option<(String, u64)> {
 /// Drop the in-flight review marker (new epoch / clean slate). Best-effort.
 fn clear_pending(cwd: &str) {
     let _ = std::fs::remove_file(pending_path(cwd));
+}
+
+// ───────────── state authority serialization (v0.32 workflow-gate Unit A) ─────────────
+// `state.json` is read-modify-written from THREE separate processes (the UserPromptSubmit /
+// PreToolUse / Stop hooks) AND from MULTIPLE THREADS of the warm MCP server (begin_review /
+// record / record_resume / revoke). `write_state`'s atomic temp+rename prevents torn READS but
+// NOT lost UPDATES. Every RMW therefore runs under `with_state_lock`: an in-proc Mutex (serializes
+// the warm server's threads) plus a cross-process advisory file lock on `state.lock` (serializes
+// the hook processes; the OS releases it on process exit, so a crash never leaves a stale lock).
+// Both lock-acquire failure and write failure FAIL CLOSED via the `force_block` poison sentinel.
+
+// Test-only deterministic write-failure injection: when a test arms this thread-local,
+// `write_state`/`write_pending` return an error so the fail-closed write-failure paths are
+// testable. Thread-local → no cross-test race (cargo runs each test on its own thread).
+#[cfg(test)]
+thread_local! {
+    static FORCE_WRITE_FAIL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `Ok(())` in release; in test builds, `Err` while the `FORCE_WRITE_FAIL` seam is armed.
+#[cfg(test)]
+fn forced_write_failure() -> std::io::Result<()> {
+    if FORCE_WRITE_FAIL.with(|c| c.get()) {
+        return Err(std::io::Error::other("forced write failure (test seam)"));
+    }
+    Ok(())
+}
+#[cfg(not(test))]
+#[inline(always)]
+fn forced_write_failure() -> std::io::Result<()> {
+    Ok(())
+}
+
+// Bounded budget for acquiring the cross-process `state.lock`. A hook must never hang Claude, so
+// acquisition is a bounded try-lock spin; exceeding the budget FAILS CLOSED. Prod is always 2s;
+// only tests change it (per-thread) to exercise the timeout paths quickly.
+thread_local! {
+    static STATE_LOCK_BUDGET: std::cell::Cell<Duration> =
+        const { std::cell::Cell::new(Duration::from_secs(2)) };
+}
+
+#[cfg(test)]
+fn set_state_lock_budget_for_test(d: Duration) {
+    STATE_LOCK_BUDGET.with(|c| c.set(d));
+}
+
+/// The poison sentinel: a presence-only file meaning "a lock-acquire or write FAILED, so the
+/// integrity of `state.json` could not be guaranteed". While present (and not bypassed), the
+/// central approval predicate [`effectively_approved`] reads FALSE — so PreToolUse, the in-process
+/// `run` tool, and `review_checkpoint` all fail closed. Cleared only by a successful fresh-epoch
+/// `start_epoch` (a known PENDING baseline), never by an approval — so it self-heals on the next
+/// user turn without ever lifting on uncertain state.
+fn force_block_path(cwd: &str) -> PathBuf {
+    dir(cwd).join("force_block")
+}
+fn force_block_active(cwd: &str) -> bool {
+    force_block_path(cwd).exists()
+}
+/// Best-effort: poison the gate (creates the parent dir if needed).
+fn set_force_block(cwd: &str) {
+    let _ = std::fs::create_dir_all(dir(cwd));
+    let _ = std::fs::write(force_block_path(cwd), b"1\n");
+}
+/// Best-effort: lift the poison (only ever after a fresh PENDING epoch is persisted under lock).
+fn clear_force_block(cwd: &str) {
+    let _ = std::fs::remove_file(force_block_path(cwd));
+}
+
+/// Zero-sized proof-of-lock token. A `&StateGuard` is handed to the `*_locked` mutators so the
+/// compiler forbids calling them without holding the state lock (Codex option A — explicit
+/// `_locked` variants over a thread-local reentrant guard).
+pub(crate) struct StateGuard {
+    _private: (),
+}
+
+/// Per-lock-path in-process mutex: two THREADS of the warm server serialize their RMW even before
+/// the cross-process file lock (whose intra-process thread semantics are subtle/platform-specific).
+/// Keyed by path so different repos in one process don't contend.
+fn in_proc_mutex(lock_path: &Path) -> Arc<Mutex<()>> {
+    static REG: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+    let reg = REG.get_or_init(|| Mutex::new(HashMap::new()));
+    // Registry poison guards only the map → recover and continue.
+    let mut map = reg.lock().unwrap_or_else(|e| e.into_inner());
+    map.entry(lock_path.to_path_buf())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
+/// The `ErrorKind` fs4 returns for a contended try-lock (platform-abstracted). Compared against
+/// the SAME helper fs4 uses internally, so the match holds regardless of the concrete OS error.
+fn lock_contended_error_kind() -> std::io::ErrorKind {
+    fs4::lock_contended_error().kind()
+}
+
+/// Bounded try-lock spin. `true` once the exclusive lock is held; `false` on budget exhaustion or a
+/// non-contention lock error (both FAIL CLOSED at the caller).
+fn acquire_file_lock(file: &std::fs::File, budget: Duration) -> bool {
+    let start = Instant::now();
+    let contended = lock_contended_error_kind();
+    loop {
+        match fs4::fs_std::FileExt::try_lock_exclusive(file) {
+            Ok(()) => return true,
+            Err(e) if e.kind() == contended => {
+                if start.elapsed() >= budget {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(_) => return false, // a real lock error → fail closed
+        }
+    }
+}
+
+/// Run `f` holding BOTH the in-proc mutex and the cross-process advisory lock on `state.lock`.
+/// `None` if the lock could not be acquired within the budget (caller FAILS CLOSED). Releases both
+/// on scope exit (fs4 unlocks on `File` drop too). `state.lock` is created once and never deleted —
+/// only its OS lock is cycled (UFCS `fs4::fs_std::FileExt::*` avoids ambiguity with std 1.89's inherent
+/// `File::lock`/`unlock`, keeping acquire+release on the SAME backend across the 1.82 MSRV).
+fn with_state_lock<T>(cwd: &str, f: impl FnOnce(&StateGuard) -> T) -> Option<T> {
+    let budget = STATE_LOCK_BUDGET.with(|c| c.get());
+    let d = dir(cwd);
+    if std::fs::create_dir_all(&d).is_err() {
+        return None; // can't create the state dir → fail closed
+    }
+    let lock_path = d.join("state.lock");
+    let m = in_proc_mutex(&lock_path);
+    // The mutex guards only ORDERING; the protected resource is the atomic-on-disk file, so a panic
+    // mid-section can never tear it. Recover from poison rather than wedge the warm server.
+    let _in_proc = m.lock().unwrap_or_else(|e| e.into_inner());
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false) // a lock sentinel — never truncate its (irrelevant) contents
+        .open(&lock_path)
+    {
+        Ok(f) => f,
+        Err(_) => return None, // fail closed
+    };
+    if !acquire_file_lock(&file, budget) {
+        return None;
+    }
+    let out = f(&StateGuard { _private: () });
+    let _ = fs4::fs_std::FileExt::unlock(&file); // also released on drop
+    Some(out)
+}
+
+/// Single non-blocking attempt — for the hot `denied_writes` diagnostic counter, which must never
+/// delay the deny path. Skips on ANY contention (the counter is best-effort).
+fn with_state_lock_try<T>(cwd: &str, f: impl FnOnce(&StateGuard) -> T) -> Option<T> {
+    let d = dir(cwd);
+    if std::fs::create_dir_all(&d).is_err() {
+        return None;
+    }
+    let lock_path = d.join("state.lock");
+    let m = in_proc_mutex(&lock_path);
+    let _in_proc = match m.try_lock() {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return None,
+    };
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false) // a lock sentinel — never truncate its (irrelevant) contents
+        .open(&lock_path)
+        .ok()?;
+    if fs4::fs_std::FileExt::try_lock_exclusive(&file).is_err() {
+        return None;
+    }
+    let out = f(&StateGuard { _private: () });
+    let _ = fs4::fs_std::FileExt::unlock(&file);
+    Some(out)
 }
 
 /// Insert/overwrite a top-level field in a JSON object value (no-op if `v` is not
@@ -408,8 +589,30 @@ pub fn start_epoch(cwd: &str, session: &str, prompt: &str) {
 /// path is unit-testable without real-HOME config IO. The public wrapper supplies the on-disk
 /// value; behavior is otherwise identical.
 fn start_epoch_inner(cwd: &str, session: &str, prompt: &str, reset_on_user_turn: bool) {
+    if with_state_lock(cwd, |g| start_epoch_locked(cwd, session, prompt, reset_on_user_turn, g))
+        .is_none()
+    {
+        // Lock-acquire failure for a NEW-EPOCH transition → poison + best-effort remove state so a
+        // stale approval cannot unlock this new task (the central predicate then denies).
+        set_force_block(cwd);
+        let _ = std::fs::remove_file(state_path(cwd));
+    }
+}
+
+/// The epoch transition under the held state lock (split out so the lock-acquire-failure
+/// fail-closed path stays a thin wrapper in [`start_epoch_inner`]).
+fn start_epoch_locked(
+    cwd: &str,
+    session: &str,
+    prompt: &str,
+    reset_on_user_turn: bool,
+    g: &StateGuard,
+) {
     let class = classify_turn(prompt);
-    if p1_state_invalidation_supported()
+    // A POISONED gate must re-establish a fresh PENDING baseline — NEVER preserve a possibly stale
+    // approval, or `force_block` could be trapped forever behind a trivial continuation turn.
+    if !force_block_active(cwd)
+        && p1_state_invalidation_supported()
         && preserve_epoch_decision(
             reset_on_user_turn,
             is_approved(cwd),
@@ -418,13 +621,12 @@ fn start_epoch_inner(cwd: &str, session: &str, prompt: &str, reset_on_user_turn:
         )
     {
         // Preserve the approval; record the pending user-turn for PreToolUse to reconcile.
-        // A failed marker write must FAIL CLOSED. `revoke` preserves `approved_plan` for the
-        // Stop gate, but it ignores its OWN write failure — so if it did not persist (the state
-        // still reads as approved), DELETE the state outright so a stale approval cannot remain
-        // effective for the new turn (mirrors the fresh-epoch write-failure path below). The
-        // next prompt then re-approves from scratch.
-        if !set_pending_user_turn(cwd, class) {
-            revoke(cwd, "pending_user_turn_write_failed");
+        // A failed marker write must FAIL CLOSED. `revoke_locked` preserves `approved_plan` for the
+        // Stop gate, but if it could not persist (the state still reads as approved), DELETE the
+        // state outright so a stale approval cannot remain effective for the new turn (mirrors the
+        // fresh-epoch write-failure path below). The next prompt then re-approves from scratch.
+        if !set_pending_user_turn_locked(cwd, g, class) {
+            revoke_locked(cwd, g, "pending_user_turn_write_failed");
             if is_approved(cwd) {
                 let _ = std::fs::remove_file(state_path(cwd));
             }
@@ -451,18 +653,30 @@ fn start_epoch_inner(cwd: &str, session: &str, prompt: &str, reset_on_user_turn:
     // A new task starts with no in-flight review (drop any prior epoch's marker).
     clear_pending(cwd);
     if write_state(cwd, &state).is_err() {
-        // Fail closed: if we can't write the fresh PENDING epoch, delete any prior
-        // (possibly APPROVED) state so the gate denies until a plan is re-approved,
-        // rather than letting a stale approval unlock this new task.
+        // Fail closed: if we can't write the fresh PENDING epoch, poison + delete any prior
+        // (possibly APPROVED) state so the gate denies until a plan is re-approved, rather than
+        // letting a stale approval unlock this new task.
+        set_force_block(cwd);
         let _ = std::fs::remove_file(state_path(cwd));
+    } else {
+        // Fresh known-PENDING baseline persisted under lock → safe to lift any poison.
+        clear_force_block(cwd);
     }
+}
+
+/// Test-only locking wrapper so unit tests can seed a pending-user-turn marker the same way the
+/// production caller ([`start_epoch_inner`], already under the state lock) does it via the
+/// `_locked` form. Not compiled in release (the only prod path is the nested `_locked` call).
+#[cfg(test)]
+fn set_pending_user_turn(cwd: &str, class: TurnClass) -> bool {
+    with_state_lock(cwd, |g| set_pending_user_turn_locked(cwd, g, class)).unwrap_or(false)
 }
 
 /// Record a pending user-turn marker on the current (preserved) approved epoch. Returns
 /// `false` if state can't be read/written (caller fails closed). Stored INSIDE `state.json`
 /// (not the separate review `pending` file) as a nullable object so it travels with the
 /// authority state and a corrupt/missing value reads as "present" → fail closed.
-fn set_pending_user_turn(cwd: &str, class: TurnClass) -> bool {
+fn set_pending_user_turn_locked(cwd: &str, _g: &StateGuard, class: TurnClass) -> bool {
     let Some(mut s) = read_state(cwd) else {
         return false;
     };
@@ -510,8 +724,9 @@ fn has_pending_user_turn(cwd: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Drop the pending user-turn marker (best-effort; the marker was consumed by reconcile).
-fn clear_pending_user_turn(cwd: &str) {
+/// Drop the pending user-turn marker (best-effort; the marker was consumed by reconcile). Always
+/// called under the state lock (begin_review / reconcile paths), so it takes the proof token.
+fn clear_pending_user_turn_locked(cwd: &str, _g: &StateGuard) {
     if let Some(mut s) = read_state(cwd) {
         if let Some(o) = s.as_object_mut() {
             o.remove("pending_user_turn");
@@ -527,23 +742,36 @@ fn clear_pending_user_turn(cwd: &str) {
 /// Idempotent: clears the marker either way so it cannot loop. A no-op when the flag is on
 /// (no marker is ever written) — so default behavior is byte-identical.
 pub fn reconcile_pending_user_turn(cwd: &str) -> Option<String> {
-    let class = match read_state(cwd).and_then(|s| s.get("pending_user_turn").cloned()) {
-        None | Some(Value::Null) => return None, // nothing pending
-        Some(v) => v
-            .get("classification")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-    };
-    // Trivial continuation → preserve approval (just consume the marker).
-    if class.as_deref() == Some(TurnClass::TrivialContinue.as_marker()) {
-        clear_pending_user_turn(cwd);
+    // Lock-free pre-check: keep the hot PreToolUse path lock-free in the common case (no marker —
+    // a marker only ever exists in resetOnUserTurn=false preserve mode).
+    if !has_pending_user_turn(cwd) {
         return None;
     }
-    // Anything else (unknown delta, explicit_reset that slipped through, or a malformed/
-    // missing classification) → re-gate. Fail closed.
-    revoke(cwd, "user_scope_delta");
-    clear_pending_user_turn(cwd);
-    Some(deny_json(BlockReason::UserScopeDelta))
+    match with_state_lock(cwd, |g| {
+        // Re-read UNDER the lock (the marker may have been consumed/changed since the pre-check).
+        let class = match read_state(cwd).and_then(|s| s.get("pending_user_turn").cloned()) {
+            None | Some(Value::Null) => return None, // already consumed → allow
+            Some(v) => v
+                .get("classification")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        };
+        // Trivial continuation → preserve approval (just consume the marker).
+        if class.as_deref() == Some(TurnClass::TrivialContinue.as_marker()) {
+            clear_pending_user_turn_locked(cwd, g);
+            return None;
+        }
+        // Anything else (unknown delta, explicit_reset that slipped through, or a malformed/
+        // missing classification) → re-gate. Fail closed.
+        revoke_locked(cwd, g, "user_scope_delta");
+        clear_pending_user_turn_locked(cwd, g);
+        Some(deny_json(BlockReason::UserScopeDelta))
+    }) {
+        Some(decision) => decision,
+        // Lock-acquire failure WITH a marker present: it could be a scope delta we cannot resolve,
+        // so do not let the write through — fail closed: DENY (the marker stays for the next turn).
+        None => Some(deny_json(BlockReason::UserScopeDelta)),
+    }
 }
 
 /// v0.32: maintain the pending-user-turn marker for an admitted READ-ONLY discovery command.
@@ -553,16 +781,24 @@ pub fn reconcile_pending_user_turn(cwd: &str) -> Option<String> {
 /// [`effectively_approved`] false and make `review_checkpoint` refuse). A scope-delta / malformed
 /// marker is LEFT untouched so the revoke defers to the first WRITE. No-op when nothing is pending.
 fn reconcile_pending_user_turn_read_only(cwd: &str) {
-    let class = read_state(cwd)
-        .and_then(|s| s.get("pending_user_turn").cloned())
-        .and_then(|v| {
-            v.get("classification")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        });
-    if class.as_deref() == Some(TurnClass::TrivialContinue.as_marker()) {
-        clear_pending_user_turn(cwd);
+    // Lock-free pre-check (hot path stays lock-free with no marker).
+    if !has_pending_user_turn(cwd) {
+        return;
     }
+    // A read-only command writes NOTHING, so on lock-acquire failure we simply do nothing: leaving
+    // the marker keeps `effectively_approved` false until a WRITE reconciles it (fail-closed).
+    let _ = with_state_lock(cwd, |g| {
+        let class = read_state(cwd)
+            .and_then(|s| s.get("pending_user_turn").cloned())
+            .and_then(|v| {
+                v.get("classification")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            });
+        if class.as_deref() == Some(TurnClass::TrivialContinue.as_marker()) {
+            clear_pending_user_turn_locked(cwd, g);
+        }
+    });
 }
 
 /// The current epoch id (or a synthesized "manual" one if no prompt started a
@@ -646,6 +882,14 @@ fn bypassed() -> bool {
 /// names a plan whose hash differs from the approved one, the prior approval is
 /// treated as superseded until the new plan is approved.
 fn effectively_approved(cwd: &str) -> bool {
+    // v0.32 Unit A: a POISONED gate (a lock-acquire or write failure left `state.json` integrity
+    // uncertain) reads as NOT approved on EVERY surface — PreToolUse + the in-process `run` tool
+    // (via `blocks_writes`) AND `review_checkpoint` (via `is_effectively_approved`). `is_force_blocked`
+    // mirrors enforcement scope (enabled + not bypassed), so a stale sentinel under a disabled gate
+    // is inert and AIBRIDGE_PLAN_GATE=0 stays a uniform escape hatch. Lifted only by a fresh epoch.
+    if is_force_blocked(cwd) {
+        return false;
+    }
     if !is_approved(cwd) {
         return false;
     }
@@ -818,17 +1062,25 @@ fn enforce_tool_scoped_with(
     // reconcile, so a read-only command never eats a one-time deny or consumes the marker.)
     // Count repeated denied writes so the operator can see a wrong-loop (Claude
     // retrying the edit instead of calling plan_gate).
-    if let Some(mut s) = read_state(cwd) {
-        let n = s.get("denied_writes").and_then(Value::as_u64).unwrap_or(0) + 1;
-        if let Some(o) = s.as_object_mut() {
-            o.insert("denied_writes".into(), json!(n));
+    // Best-effort diagnostic counter under a NON-blocking lock attempt — it must never delay the
+    // deny path, and skipping on contention is harmless (a lost count only mis-reports a wrong-loop;
+    // locking still prevents a stale read+write from clobbering a concurrent approval).
+    let _ = with_state_lock_try(cwd, |_g| {
+        if let Some(mut s) = read_state(cwd) {
+            let n = s.get("denied_writes").and_then(Value::as_u64).unwrap_or(0) + 1;
+            if let Some(o) = s.as_object_mut() {
+                o.insert("denied_writes".into(), json!(n));
+            }
+            let _ = write_state(cwd, &s);
         }
-        let _ = write_state(cwd, &s);
-    }
-    // Pre-approval block. When the read-only carve-out is ENABLED, a Bash command it could not
-    // prove read-only denies with the dedicated parser reason code; everything else is the
-    // default no-active-approval block.
-    let reason = if tool_name == "Bash" && read_only_execution_supported() && orientation_on {
+    });
+    // Pre-approval block. A POISONED gate (force_block) reports its own reason so the rare degraded
+    // state is diagnosable; otherwise, when the read-only carve-out is ENABLED, a Bash command it
+    // could not prove read-only denies with the dedicated parser reason code; everything else is
+    // the default no-active-approval block.
+    let reason = if is_force_blocked(cwd) {
+        BlockReason::GateLockUnavailable
+    } else if tool_name == "Bash" && read_only_execution_supported() && orientation_on {
         BlockReason::ReadOnlyParserDenial
     } else {
         BlockReason::NoActiveApproval
@@ -991,6 +1243,10 @@ pub enum BlockReason {
     /// A path-bearing write targets a file outside the reviewer-approved ALLOWED-GLOBS scope
     /// (or a path that cannot be confined to the repo root). Wired by v0.32 Unit 4.
     OutOfScopePath,
+    /// The gate is POISONED: a state-lock acquire or write FAILED, so `state.json` integrity could
+    /// not be guaranteed and the `force_block` sentinel is in force. Self-heals on the next user
+    /// turn (a fresh epoch). Wired by v0.32 Unit A.
+    GateLockUnavailable,
 }
 
 impl BlockReason {
@@ -1004,6 +1260,7 @@ impl BlockReason {
             BlockReason::WorkingTreeDelta => "working_tree_delta",
             BlockReason::ReadOnlyParserDenial => "read_only_parser_denial",
             BlockReason::OutOfScopePath => "out_of_scope_path",
+            BlockReason::GateLockUnavailable => "gate_lock_unavailable",
         }
     }
 
@@ -1047,8 +1304,114 @@ impl BlockReason {
                  with `mcp__aibridge__plan_gate`, adding this path to the `ALLOWED-GLOBS:` line, \
                  to expand the approved scope."
             }
+            BlockReason::GateLockUnavailable => {
+                "the plan gate could not safely read/update its state (a lock or write failed), so \
+                 it is holding writes closed for safety. Do NOT retry the write. Send a new message \
+                 (which starts a fresh task epoch and clears this), or relaunch Claude Code with \
+                 AIBRIDGE_PLAN_GATE=0 to bypass the gate for this session."
+            }
         }
     }
+}
+
+/// Whether the gate is POISONED (a state lock-acquire or write failed → `force_block`) AND actively
+/// enforcing for this repo. Mirrors enforcement scope exactly — `is_enabled && !bypassed` — so a
+/// STALE sentinel left after the gate is disabled/uninstalled (the `enabled` marker removed) is
+/// inert, and `AIBRIDGE_PLAN_GATE=0` bypasses it. The MCP tools use this to give the RIGHT recovery
+/// (a fresh epoch clears it; retrying `plan_gate` cannot, since `record`/`record_resume` refuse to
+/// approve while poisoned). The single source of truth for "poisoned" across the gate.
+pub fn is_force_blocked(cwd: &str) -> bool {
+    is_enabled(cwd) && !bypassed() && force_block_active(cwd)
+}
+
+/// General poison-recovery prose shared by the MCP tools (`run`, `plan_gate` needs-info, and
+/// `review_checkpoint`) when [`is_force_blocked`]. Calling `plan_gate` again will NOT lift it.
+pub(crate) fn force_blocked_message() -> &'static str {
+    "the plan gate is holding writes closed after a state lock/write failure — calling plan_gate \
+     again will NOT lift this. Send a new message (a fresh task epoch clears it), or relaunch \
+     Claude Code with AIBRIDGE_PLAN_GATE=0 to bypass the gate for this session"
+}
+
+/// The `run` tool's pre-execution refusal message, poison-aware. `None` → `run` may proceed
+/// (subject to the high-risk-delta check). `Some` → refuse with this message.
+pub(crate) fn run_tool_blocked_message(cwd: &str) -> Option<String> {
+    if is_force_blocked(cwd) {
+        Some(format!("AI Bridge: `run` blocked — {}.", force_blocked_message()))
+    } else if blocks_writes(cwd) {
+        Some(
+            "AI Bridge: `run` is blocked by the plan gate — this task has no approved plan yet. \
+             Call `plan_gate` with your plan and retry after <AI-BRIDGE-APPROVE/>."
+                .to_string(),
+        )
+    } else {
+        None
+    }
+}
+
+/// The `plan_gate` tool's `NeedsInfo` presentation for the NON-poison case (a poisoned gate is
+/// handled upstream by [`poisoned_outcome_message`], so this never needs to be poison-aware).
+pub(crate) fn needs_info_message(findings: &str) -> String {
+    format!(
+        "AI Bridge: Codex needs more information to judge the plan (or is blocked). Provide what it \
+         asks or check with the user, then call `plan_gate` again:\n\n{findings}"
+    )
+}
+
+/// The `plan_gate` tool's EARLY refusal: when the gate is ALREADY poisoned, approval is impossible
+/// until a fresh epoch clears it, so the MCP handler must short-circuit BEFORE any review work
+/// (begin_review's pending marker + the minutes-long Codex round). `Some(message)` → return it now;
+/// `None` → proceed with the normal review.
+pub(crate) fn plan_gate_early_refusal(cwd: &str) -> Option<String> {
+    if is_force_blocked(cwd) {
+        Some(poisoned_outcome_message(&Outcome::NeedsInfo(String::new())))
+    } else {
+        None
+    }
+}
+
+/// The SINGLE poison-aware presentation for ANY `plan_gate` outcome (Revise / Stuck / NeedsInfo)
+/// when [`is_force_blocked`]. No outcome may tell the agent to "revise and call plan_gate again" —
+/// retrying cannot approve until a fresh epoch clears the poison (`record`/`record_resume` refuse).
+/// Reviewer findings (if any) are kept as context for the re-review after a fresh task starts.
+pub(crate) fn poisoned_outcome_message(outcome: &Outcome) -> String {
+    let findings = match outcome {
+        Outcome::Revise(f) | Outcome::Stuck(f) | Outcome::NeedsInfo(f) => f.trim(),
+        Outcome::Approved => "", // unreachable under poison (record refuses), handled defensively
+    };
+    let recovery = force_blocked_message();
+    if findings.is_empty() {
+        format!("AI Bridge: {recovery}.")
+    } else {
+        format!(
+            "AI Bridge: {recovery}.\n\nReviewer notes (address these after starting a fresh \
+             task):\n\n{findings}"
+        )
+    }
+}
+
+/// The `review_checkpoint` no-approval refusal message, poison-aware.
+pub(crate) fn checkpoint_refused_message(cwd: &str) -> String {
+    if is_force_blocked(cwd) {
+        format!(
+            "AI Bridge: `review_checkpoint` refused — {}.\nFrontier unchanged.",
+            force_blocked_message()
+        )
+    } else {
+        "AI Bridge: `review_checkpoint` refused: no currently approved plan_gate scope; call \
+         plan_gate for this PR/task first.\nFrontier unchanged."
+            .to_string()
+    }
+}
+
+/// Recovery prose when `begin_review` could not persist the in-flight review marker and POISONED
+/// the gate (a state lock-acquire failure). Retrying `plan_gate` will NOT help — `record` refuses
+/// to approve while poisoned — so the recovery mirrors [`BlockReason::GateLockUnavailable`]: a fresh
+/// task epoch (a new user message) clears the poison, or bypass with `AIBRIDGE_PLAN_GATE=0`.
+pub(crate) fn marker_write_failed_message() -> &'static str {
+    "AI Bridge: could not persist the in-flight review marker (a state lock/write failed), so the \
+     plan gate is holding writes closed for safety. Retrying plan_gate will NOT lift this. Send a \
+     new message (a fresh task epoch clears it), or relaunch Claude Code with AIBRIDGE_PLAN_GATE=0 \
+     to bypass the gate for this session."
 }
 
 /// The `PLAN_GATE_REQUIRED:` deny prose for a given reason (code + recovery hint).
@@ -1734,6 +2097,17 @@ pub fn review_policy_present(cwd: &str) -> bool {
 /// Revoke the current epoch's approval (re-arm the gate). `reason` is recorded for
 /// `doctor`/diagnostics. Best-effort: a missing state file means nothing to revoke.
 pub fn revoke(cwd: &str, reason: &str) {
+    if with_state_lock(cwd, |g| revoke_locked(cwd, g, reason)).is_none() {
+        // Lock-acquire failure on a de-authorization: a stale approval must NOT survive. Poison +
+        // best-effort remove state so the central predicate denies until a fresh epoch.
+        set_force_block(cwd);
+        let _ = std::fs::remove_file(state_path(cwd));
+    }
+}
+
+/// Revoke under the held state lock. Write-FAILURE is fail-closed too: if the revoked state can't
+/// be persisted, a stale approval could remain effective → poison + best-effort remove state.
+fn revoke_locked(cwd: &str, _g: &StateGuard, reason: &str) {
     if let Some(mut s) = read_state(cwd) {
         set_field(&mut s, "approved", json!(false));
         if let Some(o) = s.as_object_mut() {
@@ -1742,7 +2116,10 @@ pub fn revoke(cwd: &str, reason: &str) {
         set_field(&mut s, "status", json!("pending"));
         set_field(&mut s, "revoked_reason", json!(reason));
         set_field(&mut s, "review_policy_hash", Value::Null);
-        let _ = write_state(cwd, &s);
+        if write_state(cwd, &s).is_err() {
+            set_force_block(cwd);
+            let _ = std::fs::remove_file(state_path(cwd));
+        }
     }
 }
 
@@ -1782,36 +2159,50 @@ pub fn begin_review(cwd: &str, plan: &str) -> ReviewStart {
     if !is_enabled(cwd) {
         return ReviewStart::Ready(ConsumedTurn::None);
     }
-    let pending_written = write_pending(cwd, &current_epoch(cwd), hash_str(plan));
-    // v0.31 P1: submitting a plan for review IS the agent's response to the current user
-    // turn, so consume any pending user-turn marker here ("at review start") and REPORT what
-    // it was. A marker that re-appears AFTER this (a new prompt during the minutes-long review)
-    // is detected by `record`, which refuses to approve an unreviewed turn; and a NON-trivial
-    // marker consumed here tells the caller to SKIP the receipt fast-path (it runs no review).
-    // No-op in default reset mode (no marker is ever written).
-    let consumed = match read_state(cwd)
-        .and_then(|s| s.get("pending_user_turn").filter(|v| !v.is_null()).cloned())
-    {
-        None => ConsumedTurn::None,
-        Some(v) => {
-            if v.get("classification").and_then(Value::as_str)
-                == Some(TurnClass::TrivialContinue.as_marker())
-            {
-                ConsumedTurn::Trivial
-            } else {
-                ConsumedTurn::NonTrivial // unknown_delta / malformed → fail closed
+    // The whole critical section runs under ONE lock so the in-flight `(epoch, plan_hash)` marker
+    // and the `pending_user_turn` snapshot are consistent and cannot race a concurrent start_epoch.
+    match with_state_lock(cwd, |g| {
+        let pending_written = write_pending(cwd, &current_epoch(cwd), hash_str(plan));
+        // v0.31 P1: submitting a plan for review IS the agent's response to the current user
+        // turn, so consume any pending user-turn marker here ("at review start") and REPORT what
+        // it was. A marker that re-appears AFTER this (a new prompt during the minutes-long review)
+        // is detected by `record`, which refuses to approve an unreviewed turn; and a NON-trivial
+        // marker consumed here tells the caller to SKIP the receipt fast-path (it runs no review).
+        // No-op in default reset mode (no marker is ever written).
+        let consumed = match read_state(cwd)
+            .and_then(|s| s.get("pending_user_turn").filter(|v| !v.is_null()).cloned())
+        {
+            None => ConsumedTurn::None,
+            Some(v) => {
+                if v.get("classification").and_then(Value::as_str)
+                    == Some(TurnClass::TrivialContinue.as_marker())
+                {
+                    ConsumedTurn::Trivial
+                } else {
+                    ConsumedTurn::NonTrivial // unknown_delta / malformed → fail closed
+                }
             }
+        };
+        // Fail closed: only consume the user-turn marker after the in-flight review marker is
+        // confirmed on disk; otherwise revoke and leave the turn pending so the next gated tool
+        // re-gates (a lost review marker must not also silently drop the user turn).
+        if !pending_written {
+            revoke_locked(cwd, g, "begin_review_pending_write_failed");
+            return ReviewStart::MarkerWriteFailed;
         }
-    };
-    // Fail closed: only consume the user-turn marker after the in-flight review marker is
-    // confirmed on disk; otherwise revoke and leave the turn pending so the next gated tool
-    // re-gates (a lost review marker must not also silently drop the user turn).
-    if !pending_written {
-        revoke(cwd, "begin_review_pending_write_failed");
-        return ReviewStart::MarkerWriteFailed;
+        clear_pending_user_turn_locked(cwd, g);
+        ReviewStart::Ready(consumed)
+    }) {
+        Some(outcome) => outcome,
+        // Lock-acquire failure: the in-flight review marker cannot be recorded → fail closed.
+        // Poison AND best-effort remove state (mirroring the other stale-approval paths) so a stale
+        // approval can't stay effective with no valid `pending` marker even if the sentinel write fails.
+        None => {
+            set_force_block(cwd);
+            let _ = std::fs::remove_file(state_path(cwd));
+            ReviewStart::MarkerWriteFailed
+        }
     }
-    clear_pending_user_turn(cwd);
-    ReviewStart::Ready(consumed)
 }
 
 /// A post-approval risk delta the approved plan did not cover (v0.31 P3). Either a
@@ -1968,6 +2359,53 @@ pub fn record(
     verdict: &crate::gate::Verdict,
     findings: &str,
 ) -> Outcome {
+    match with_state_lock(cwd, |g| record_locked(cwd, g, expected_epoch, plan, verdict, findings)) {
+        Some(o) => o,
+        None => record_lock_failed(cwd, verdict, findings),
+    }
+}
+
+/// Lock-acquire failure for `record`, branched BY VERDICT (Codex): an `Approve` simply cannot be
+/// recorded (NeedsInfo, no poison — the prior PENDING/same-epoch state is already fail-closed), but
+/// EVERY non-approve verdict must NOT leave a prior approval effective, so poison + best-effort
+/// remove state, then return a non-approve outcome.
+fn record_lock_failed(cwd: &str, verdict: &crate::gate::Verdict, findings: &str) -> Outcome {
+    match verdict {
+        crate::gate::Verdict::Approve => Outcome::NeedsInfo(
+            "AI Bridge: could not acquire the plan-gate lock to record approval — retry, or restart \
+             Claude and re-send the task."
+                .to_string(),
+        ),
+        crate::gate::Verdict::RequestChanges => {
+            set_force_block(cwd);
+            let _ = std::fs::remove_file(state_path(cwd));
+            Outcome::Revise(findings.to_string())
+        }
+        crate::gate::Verdict::Blocked | crate::gate::Verdict::Unparseable => {
+            set_force_block(cwd);
+            let _ = std::fs::remove_file(state_path(cwd));
+            Outcome::NeedsInfo(findings.to_string())
+        }
+    }
+}
+
+fn record_locked(
+    cwd: &str,
+    _g: &StateGuard,
+    expected_epoch: &str,
+    plan: &str,
+    verdict: &crate::gate::Verdict,
+    findings: &str,
+) -> Outcome {
+    // A POISONED gate (force_block) must not MINT an approval the central predicate would render
+    // ineffective — that would emit a misleading <AI-BRIDGE-APPROVE/> ("writes unlocked") while
+    // every write is still denied. Refuse until a fresh epoch (start_epoch) re-establishes a known
+    // baseline and clears the poison. `is_force_blocked` honors enable+bypass scope (a disabled
+    // gate's manual `record` is unaffected by a stale sentinel). Empty findings → the MCP layer's
+    // `poisoned_outcome_message` short-circuit supplies the single shared recovery prose.
+    if is_force_blocked(cwd) {
+        return Outcome::NeedsInfo(String::new());
+    }
     // Fail-safe: when the gate is enabled, NEVER approve from missing/unparseable
     // state (a corrupted/half-written file must not become an approved epoch). Only
     // synthesize a state when the gate is OFF (manual `plan_gate` use, harmless).
@@ -2087,7 +2525,15 @@ pub fn record(
             set_field(&mut s, "status", json!("approved"));
             set_field(&mut s, "revoked_reason", Value::Null);
             set_field(&mut s, "same_findings", json!(0));
-            let _ = write_state(cwd, &s);
+            if write_state(cwd, &s).is_err() {
+                // The approval did NOT persist → do not claim it. The prior PENDING/same-epoch
+                // state remains effective-or-not exactly as before this call (fail-closed); no
+                // poison needed (we never widened authorization).
+                return Outcome::NeedsInfo(
+                    "AI Bridge: approval could not be persisted (state write failed) — retry."
+                        .to_string(),
+                );
+            }
             Outcome::Approved
         }
         crate::gate::Verdict::RequestChanges => {
@@ -2111,7 +2557,12 @@ pub fn record(
             };
             set_field(&mut s, "last_findings_hash", json!(fh));
             set_field(&mut s, "same_findings", json!(same));
-            let _ = write_state(cwd, &s);
+            if write_state(cwd, &s).is_err() {
+                // A non-APPROVE revocation whose write FAILED must not leave a prior approval
+                // effective (e.g. re-reviewing an already-approved plan) → poison + remove state.
+                set_force_block(cwd);
+                let _ = std::fs::remove_file(state_path(cwd));
+            }
             if same >= NO_PROGRESS_THRESHOLD as u64 {
                 Outcome::Stuck(findings.to_string())
             } else {
@@ -2127,7 +2578,11 @@ pub fn record(
             set_field(&mut s, "status", json!("needs_info"));
             set_field(&mut s, "revoked_reason", json!("blocked"));
             set_field(&mut s, "review_policy_hash", Value::Null);
-            let _ = write_state(cwd, &s);
+            if write_state(cwd, &s).is_err() {
+                // A non-decision whose write FAILED must not leave writes open → poison + remove.
+                set_force_block(cwd);
+                let _ = std::fs::remove_file(state_path(cwd));
+            }
             Outcome::NeedsInfo(findings.to_string())
         }
     }
@@ -2148,6 +2603,28 @@ pub fn record_resume(
     grants: &[RiskGrant],
     allowed_globs: &[String],
 ) -> bool {
+    // Lock-acquire failure → return false so the caller runs a full review (fail-closed). The
+    // approve write inside already propagates its own failure via `is_ok()`.
+    with_state_lock(cwd, |g| {
+        record_resume_locked(cwd, g, expected_epoch, plan, grants, allowed_globs)
+    })
+    .unwrap_or(false)
+}
+
+fn record_resume_locked(
+    cwd: &str,
+    _g: &StateGuard,
+    expected_epoch: &str,
+    plan: &str,
+    grants: &[RiskGrant],
+    allowed_globs: &[String],
+) -> bool {
+    // A poisoned gate must not fast-path-approve either (see `record_locked`): the resume would be
+    // rendered ineffective by `effectively_approved` yet still report success. Fail closed → the
+    // caller runs a full review, and the poison clears on the next fresh epoch.
+    if is_force_blocked(cwd) {
+        return false;
+    }
     // Fail-safe: when enabled, never approve from missing/unparseable state.
     let mut s = match read_state(cwd) {
         Some(s) => s,
@@ -4605,6 +5082,494 @@ mod tests {
         assert!(
             !review_policy_present(&cwd),
             "an all-comment scaffold must be inert (not present)"
+        );
+    }
+
+    // ─────────── v0.32 workflow-gate Unit A: state RMW lock + force_block poison ───────────
+
+    /// Hold the cross-process `state.lock` via a RAW handle (NOT through `with_state_lock`, so the
+    /// in-proc mutex stays free) → a mutator's bounded try-lock times out and FAILS CLOSED. Works
+    /// in-process: a second handle's `try_lock_exclusive` is WouldBlock while this one holds it.
+    fn hold_state_lock(cwd: &str) -> std::fs::File {
+        let d = dir(cwd);
+        std::fs::create_dir_all(&d).unwrap();
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(d.join("state.lock"))
+            .unwrap();
+        fs4::fs_std::FileExt::lock_exclusive(&f).unwrap();
+        f
+    }
+
+    #[test]
+    fn state_lock_serializes_concurrent_writers() {
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        let counter = dir(&cwd).join("counter");
+        std::fs::write(&counter, "0").unwrap();
+        const N: u64 = 150;
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let cwd = cwd.clone();
+                let counter = counter.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..N {
+                        let done = with_state_lock(&cwd, |_g| {
+                            let v: u64 = std::fs::read_to_string(&counter)
+                                .unwrap()
+                                .trim()
+                                .parse()
+                                .unwrap();
+                            std::thread::yield_now(); // widen the lost-update window
+                            std::fs::write(&counter, (v + 1).to_string()).unwrap();
+                        });
+                        assert!(done.is_some(), "uncontended lock must acquire");
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let final_v: u64 = std::fs::read_to_string(&counter)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(final_v, 2 * N, "the in-proc lock prevents lost updates");
+    }
+
+    #[test]
+    fn lock_timeout_poisons_start_epoch() {
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "task");
+        approve(&cwd, "PLAN");
+        assert!(is_effectively_approved(&cwd));
+        let _held = hold_state_lock(&cwd);
+        set_state_lock_budget_for_test(Duration::from_millis(30));
+        start_epoch(&cwd, "sess", "next task");
+        assert!(force_block_active(&cwd), "lock-timeout start_epoch poisons");
+        assert!(!is_effectively_approved(&cwd), "stale approval neutralized");
+        assert!(blocks_writes(&cwd));
+    }
+
+    #[test]
+    fn lock_timeout_poisons_revoke() {
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "task");
+        approve(&cwd, "PLAN");
+        let _held = hold_state_lock(&cwd);
+        set_state_lock_budget_for_test(Duration::from_millis(30));
+        revoke(&cwd, "test");
+        assert!(force_block_active(&cwd));
+        assert!(!is_effectively_approved(&cwd));
+    }
+
+    #[test]
+    fn lock_timeout_begin_review_marker_write_failed() {
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "task");
+        approve(&cwd, "PLAN");
+        let _held = hold_state_lock(&cwd);
+        set_state_lock_budget_for_test(Duration::from_millis(30));
+        assert_eq!(begin_review(&cwd, "PLAN v2"), ReviewStart::MarkerWriteFailed);
+        assert!(force_block_active(&cwd), "begin_review lock-timeout poisons");
+        assert!(!is_effectively_approved(&cwd));
+        assert!(
+            read_state(&cwd).is_none(),
+            "stale approved state removed even if the sentinel cannot be relied on"
+        );
+    }
+
+    #[test]
+    fn lock_timeout_record_branches_by_verdict() {
+        // Approve under a lock-timeout → NeedsInfo, NO poison (prior pending state is fail-closed).
+        let a = tmp();
+        enable(&a).unwrap();
+        start_epoch(&a, "sess", "task");
+        let ea = current_epoch(&a);
+        let ha = hold_state_lock(&a);
+        set_state_lock_budget_for_test(Duration::from_millis(30));
+        assert!(matches!(
+            record(&a, &ea, "PLAN", &crate::gate::Verdict::Approve, ""),
+            Outcome::NeedsInfo(_)
+        ));
+        assert!(!force_block_active(&a), "Approve lock-timeout must NOT poison");
+        drop(ha);
+
+        // RequestChanges under a lock-timeout → poison + a non-approve outcome (a prior approval,
+        // e.g. re-reviewing the same plan, must NOT survive the failed revocation).
+        let b = tmp();
+        enable(&b).unwrap();
+        start_epoch(&b, "sess", "task");
+        approve(&b, "PLAN");
+        let eb = current_epoch(&b);
+        let _hb = hold_state_lock(&b);
+        assert!(matches!(
+            record(
+                &b,
+                &eb,
+                "PLAN",
+                &crate::gate::Verdict::RequestChanges,
+                "FINDINGS: x"
+            ),
+            Outcome::Revise(_)
+        ));
+        assert!(force_block_active(&b), "RequestChanges lock-timeout poisons");
+        assert!(!is_effectively_approved(&b), "prior approval neutralized");
+    }
+
+    #[test]
+    fn lock_timeout_record_resume_returns_false() {
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "task");
+        let epoch = current_epoch(&cwd);
+        let _held = hold_state_lock(&cwd);
+        set_state_lock_budget_for_test(Duration::from_millis(30));
+        assert!(
+            !record_resume(&cwd, &epoch, "PLAN", &[], &[]),
+            "lock-timeout resume → false (caller runs a full review)"
+        );
+    }
+
+    #[test]
+    fn lock_timeout_reconcile_denies_when_marker_present() {
+        let cwd = tmp();
+        approve_with_scope_state(&cwd, json!(["src/a.rs"]), true);
+        assert!(set_pending_user_turn(&cwd, TurnClass::UnknownDelta));
+        let _held = hold_state_lock(&cwd);
+        set_state_lock_budget_for_test(Duration::from_millis(30));
+        assert!(
+            reconcile_pending_user_turn(&cwd).is_some(),
+            "a marker present + lock-timeout must DENY (fail-closed), not silently consume"
+        );
+    }
+
+    #[test]
+    fn write_failure_poisons_revoke() {
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "task");
+        approve(&cwd, "PLAN");
+        assert!(is_effectively_approved(&cwd));
+        FORCE_WRITE_FAIL.with(|c| c.set(true));
+        revoke(&cwd, "test");
+        FORCE_WRITE_FAIL.with(|c| c.set(false));
+        assert!(force_block_active(&cwd), "revoke write-failure poisons");
+        assert!(!is_effectively_approved(&cwd), "stale approval neutralized");
+    }
+
+    #[test]
+    fn write_failure_record_paths() {
+        // RequestChanges whose write FAILS → poison + still a Revise outcome.
+        let a = tmp();
+        enable(&a).unwrap();
+        start_epoch(&a, "sess", "task");
+        approve(&a, "PLAN");
+        let ea = current_epoch(&a);
+        FORCE_WRITE_FAIL.with(|c| c.set(true));
+        let out = record(
+            &a,
+            &ea,
+            "PLAN",
+            &crate::gate::Verdict::RequestChanges,
+            "FINDINGS: x",
+        );
+        FORCE_WRITE_FAIL.with(|c| c.set(false));
+        assert!(matches!(out, Outcome::Revise(_)));
+        assert!(force_block_active(&a), "non-approve write-failure poisons");
+        assert!(!is_effectively_approved(&a));
+
+        // Approve whose write FAILS → NeedsInfo (must NOT claim approval); no poison needed.
+        let b = tmp();
+        enable(&b).unwrap();
+        start_epoch(&b, "sess", "task");
+        let eb = current_epoch(&b);
+        FORCE_WRITE_FAIL.with(|c| c.set(true));
+        let out = record(&b, &eb, "PLAN", &crate::gate::Verdict::Approve, "");
+        FORCE_WRITE_FAIL.with(|c| c.set(false));
+        assert!(
+            matches!(out, Outcome::NeedsInfo(_)),
+            "Approve write-fail → not Approved"
+        );
+        assert!(!is_approved(&b), "the unpersisted approval did not take effect");
+    }
+
+    #[test]
+    fn write_failure_start_epoch_fresh_poisons() {
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "task");
+        approve(&cwd, "PLAN");
+        FORCE_WRITE_FAIL.with(|c| c.set(true));
+        start_epoch_inner(&cwd, "sess", "a different task", true); // forced fresh-epoch
+        FORCE_WRITE_FAIL.with(|c| c.set(false));
+        assert!(force_block_active(&cwd), "fresh-epoch write-failure poisons");
+        assert!(!is_effectively_approved(&cwd));
+    }
+
+    #[test]
+    fn force_block_denies_writes_on_all_surfaces() {
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "task");
+        approve(&cwd, "PLAN");
+        assert!(!blocks_writes(&cwd) && is_effectively_approved(&cwd));
+        set_force_block(&cwd);
+        // The CENTRAL predicate fails closed on BOTH surfaces.
+        assert!(
+            blocks_writes(&cwd),
+            "PreToolUse + mcp run surface blocked under poison"
+        );
+        assert!(
+            !is_effectively_approved(&cwd),
+            "review_checkpoint surface blocked under poison"
+        );
+        let deny = enforce(&cwd, "Write").expect("a write is denied under force_block");
+        assert!(
+            deny.contains("gate_lock_unavailable"),
+            "the deny carries the diagnostic reason"
+        );
+    }
+
+    #[test]
+    fn record_refuses_approval_under_force_block() {
+        // A poisoned gate must never mint `Outcome::Approved` (the MCP layer emits
+        // <AI-BRIDGE-APPROVE/> ONLY on Approved) — that would tell Claude "writes unlocked" while
+        // every write is still denied by the central predicate.
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "task");
+        let epoch = current_epoch(&cwd);
+        set_force_block(&cwd);
+        assert!(
+            matches!(
+                record(&cwd, &epoch, "PLAN", &crate::gate::Verdict::Approve, ""),
+                Outcome::NeedsInfo(_)
+            ),
+            "record must refuse to approve under force_block"
+        );
+        assert!(!is_effectively_approved(&cwd));
+        // The receipt fast-path must refuse too (else a resume re-mints the ineffective approval).
+        assert!(
+            !record_resume(&cwd, &epoch, "PLAN", &[], &[]),
+            "record_resume must refuse under force_block"
+        );
+    }
+
+    #[test]
+    fn force_block_cleared_by_fresh_epoch_not_by_approve() {
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "task");
+        set_force_block(&cwd);
+        // record approve must NOT lift the poison (only a fresh PENDING baseline may).
+        let epoch = current_epoch(&cwd);
+        let _ = record(&cwd, &epoch, "PLAN", &crate::gate::Verdict::Approve, "");
+        assert!(
+            force_block_active(&cwd),
+            "record approve must not lift the poison"
+        );
+        assert!(!is_effectively_approved(&cwd));
+        // A fresh-epoch start_epoch lifts it.
+        start_epoch_inner(&cwd, "sess", "a new task", true);
+        assert!(!force_block_active(&cwd), "fresh epoch lifts the poison");
+    }
+
+    #[test]
+    fn force_block_forces_fresh_epoch_under_preserve_mode() {
+        // resetOnUserTurn=false + approved + enforced scope + trivial "ok" would normally PRESERVE
+        // the approval; an active force_block must override that and re-arm a fresh epoch (finding
+        // #2 — else the poison is trapped forever behind trivial continuations).
+        let cwd = tmp();
+        approve_with_scope_state(&cwd, json!(["src/a.rs"]), true);
+        let epoch_before = current_epoch(&cwd);
+        set_force_block(&cwd);
+        start_epoch_inner(&cwd, "sess", "ok", false);
+        assert_ne!(
+            current_epoch(&cwd),
+            epoch_before,
+            "poison forces a fresh epoch (no preserve)"
+        );
+        assert!(!is_approved(&cwd), "stale approval not carried into the fresh epoch");
+        assert!(!force_block_active(&cwd), "the fresh epoch lifted the poison");
+        assert!(!has_pending_user_turn(&cwd), "no preserve marker was recorded");
+    }
+
+    #[test]
+    fn denied_writes_counter_skips_under_contention() {
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "task"); // pending → blocks writes
+        let _held = hold_state_lock(&cwd);
+        // The deny path must still return a deny and not hang, even though the (non-blocking)
+        // counter lock attempt loses the race for `state.lock`.
+        assert!(
+            enforce(&cwd, "Write").is_some(),
+            "still denies pre-approval; counter contention is harmless"
+        );
+    }
+
+    #[test]
+    fn state_lock_recovers_from_poison() {
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        let c2 = cwd.clone();
+        let h = std::thread::spawn(move || {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                with_state_lock(&c2, |_g| panic!("intentional panic while holding the lock"));
+            }));
+        });
+        h.join().unwrap();
+        // The in-proc mutex for this path is now poisoned; a later acquire must RECOVER it rather
+        // than wedge the warm server.
+        assert_eq!(
+            with_state_lock(&cwd, |_g| 42),
+            Some(42),
+            "a poisoned in-proc mutex recovers"
+        );
+    }
+
+    #[test]
+    fn gate_lock_unavailable_reason_code_and_hint() {
+        assert_eq!(
+            BlockReason::GateLockUnavailable.code(),
+            "gate_lock_unavailable"
+        );
+        assert!(BlockReason::GateLockUnavailable
+            .recovery_hint()
+            .contains("AIBRIDGE_PLAN_GATE=0"));
+    }
+
+    #[test]
+    fn marker_write_failed_message_points_to_fresh_epoch_not_retry() {
+        // The MCP `MarkerWriteFailed` response must NOT tell the agent to retry plan_gate (record
+        // refuses to approve while poisoned) — it must point at a fresh epoch / bypass.
+        let m = marker_write_failed_message();
+        assert!(
+            !m.to_lowercase().contains("retry plan_gate"),
+            "retrying plan_gate cannot lift the poison"
+        );
+        assert!(
+            m.contains("new message") && m.contains("AIBRIDGE_PLAN_GATE=0"),
+            "recovery must point at a fresh epoch or the bypass"
+        );
+    }
+
+    #[test]
+    fn stale_force_block_is_inert_when_gate_disabled() {
+        // A `force_block` sentinel left over from a prior install must NOT affect behavior once the
+        // gate is disabled (the `enabled` marker removed) — `is_force_blocked` mirrors enforcement
+        // scope, so the gate-off contract is preserved.
+        let cwd = tmp();
+        std::fs::create_dir_all(dir(&cwd)).unwrap();
+        set_force_block(&cwd);
+        assert!(!is_enabled(&cwd), "gate is NOT enabled");
+        assert!(
+            !is_force_blocked(&cwd),
+            "a disabled gate's stale sentinel is inert"
+        );
+        assert!(!blocks_writes(&cwd), "a disabled gate never blocks writes");
+        assert!(
+            run_tool_blocked_message(&cwd).is_none(),
+            "`run` is not blocked by a stale sentinel under a disabled gate"
+        );
+        // Manual `record` (gate off) must NOT hit the poison refusal — it synthesizes harmless state.
+        assert!(
+            matches!(
+                record(
+                    &cwd,
+                    &current_epoch(&cwd),
+                    "PLAN",
+                    &crate::gate::Verdict::Approve,
+                    ""
+                ),
+                Outcome::Approved
+            ),
+            "disabled-gate manual approve proceeds despite a stale sentinel"
+        );
+    }
+
+    #[test]
+    fn mcp_recovery_messages_are_poison_aware() {
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "task");
+        approve(&cwd, "PLAN");
+        // Approved + not poisoned: `run` allowed; the normal NeedsInfo wrapper is unchanged.
+        assert!(!is_force_blocked(&cwd));
+        assert!(
+            run_tool_blocked_message(&cwd).is_none(),
+            "approved → run proceeds"
+        );
+        let ni_normal = needs_info_message("FINDINGS");
+        assert!(
+            ni_normal.contains("call `plan_gate` again") && ni_normal.contains("FINDINGS"),
+            "non-poison NeedsInfo keeps the plan_gate-retry wrapper"
+        );
+
+        // Poison the gate → every recovery path points at a fresh epoch / bypass, NOT plan_gate.
+        set_force_block(&cwd);
+        assert!(is_force_blocked(&cwd));
+        let run_msg = run_tool_blocked_message(&cwd).expect("run blocked under poison");
+        assert!(
+            run_msg.contains("new message") && run_msg.contains("AIBRIDGE_PLAN_GATE=0"),
+            "run poison recovery → fresh epoch / bypass"
+        );
+        let ckpt = checkpoint_refused_message(&cwd);
+        assert!(
+            ckpt.contains("AIBRIDGE_PLAN_GATE=0") && ckpt.contains("Frontier unchanged"),
+            "checkpoint poison recovery → fresh epoch / bypass"
+        );
+    }
+
+    #[test]
+    fn poisoned_outcome_message_never_says_retry_plan_gate() {
+        // EVERY plan_gate outcome under poison routes through one shared recovery — including the
+        // non-approve verdicts (Revise/Stuck) that the write/lock-failure paths can produce.
+        for o in [
+            Outcome::Revise("reviewer says X".to_string()),
+            Outcome::Stuck("reviewer says X".to_string()),
+        ] {
+            let m = poisoned_outcome_message(&o);
+            assert!(
+                m.contains("AIBRIDGE_PLAN_GATE=0") && m.contains("reviewer says X"),
+                "non-approve poison message gives recovery + keeps reviewer notes"
+            );
+            assert!(
+                !m.contains("call `plan_gate` again"),
+                "must NOT send the agent into a plan_gate retry loop"
+            );
+        }
+        // Empty findings (record's poison refusal) → just the recovery, no dangling notes section.
+        let m = poisoned_outcome_message(&Outcome::NeedsInfo(String::new()));
+        assert!(m.contains("AIBRIDGE_PLAN_GATE=0") && !m.contains("Reviewer notes"));
+    }
+
+    #[test]
+    fn plan_gate_short_circuits_when_poisoned() {
+        // The plan_gate handler must refuse a poisoned gate BEFORE begin_review / the Codex round —
+        // the decision is a pure function of cwd, so it's verifiable without driving the handler.
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "task");
+        approve(&cwd, "PLAN");
+        assert!(
+            plan_gate_early_refusal(&cwd).is_none(),
+            "not poisoned → proceed to review"
+        );
+        set_force_block(&cwd);
+        let msg = plan_gate_early_refusal(&cwd).expect("poisoned gate refuses early");
+        assert!(
+            msg.contains("AIBRIDGE_PLAN_GATE=0") && !msg.contains("call `plan_gate` again"),
+            "early refusal carries the fresh-epoch / bypass recovery"
         );
     }
 }

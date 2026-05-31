@@ -18,3 +18,4 @@ zip = { version = "2", default-features = false, features = ["deflate"] } # extr
 tar = "0.4" # extract rtk's macOS .tar.gz release asset (v0.20.0)
 flate2 = "1" # gzip layer for rtk's macOS .tar.gz (v0.20.0)
 globset = "0.4" # v0.32 scoped-approval: anchored, separator-literal glob matching of approved file scopes
+fs4 = { version = "0.12", features = ["sync"] } # v0.32 workflow-gate Unit A: cross-process advisory file lock on plan-gate state.json (auto-released on process exit)

@@ -372,12 +372,11 @@ impl Server {
                     .unwrap_or_else(|_| ".".to_string());
                 if command.is_empty() {
                     "AI Bridge: `run` requires a non-empty 'command' argument.".to_string()
-                } else if crate::plan_gate::blocks_writes(&cwd) {
-                    // In-tool defense: `run` executes arbitrary shell, so it must
-                    // honor the plan gate even if the PreToolUse matcher missed it.
-                    "AI Bridge: `run` is blocked by the plan gate — this task has no approved \
-                     plan yet. Call `plan_gate` with your plan and retry after <AI-BRIDGE-APPROVE/>."
-                        .to_string()
+                } else if let Some(msg) = crate::plan_gate::run_tool_blocked_message(&cwd) {
+                    // In-tool defense: `run` executes arbitrary shell, so it must honor the plan
+                    // gate even if the PreToolUse matcher missed it. Poison-aware (a force-blocked
+                    // gate points at a fresh epoch, not another plan_gate retry).
+                    msg
                 } else if let Some(delta) =
                     crate::plan_gate::run_risk_delta(&cwd, "mcp__aibridge__run", command)
                 {
@@ -605,6 +604,12 @@ impl Server {
         let cwd = std::env::current_dir()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| ".".to_string());
+        // Already poisoned (a prior lock/write failure) → approval is impossible until a fresh epoch
+        // clears it. Short-circuit BEFORE begin_review's pending marker AND the minutes-long Codex
+        // round — retrying plan_gate here is pure waste.
+        if let Some(msg) = crate::plan_gate::plan_gate_early_refusal(&cwd) {
+            return msg;
+        }
         // Capture the epoch BEFORE the (minutes-long) Codex call so `record` can
         // refuse to approve if a new task started meanwhile (TOCTOU guard).
         let epoch = crate::plan_gate::current_epoch(&cwd);
@@ -616,9 +621,9 @@ impl Server {
             // The in-flight review marker could not be persisted — the stale/superseded-plan
             // guard in `record` relies on it, so FAIL CLOSED: do not resume or review.
             crate::plan_gate::ReviewStart::MarkerWriteFailed => {
-                return "AI Bridge: could not persist the in-flight review marker (filesystem \
-                     error); approval is held. Retry plan_gate."
-                    .to_string();
+                // The gate is poisoned (lock/write failure); `record` now refuses to approve while
+                // poisoned, so "retry plan_gate" would loop. Point at the real recovery instead.
+                return crate::plan_gate::marker_write_failed_message().to_string();
             }
         };
         // RELOAD-RESUME fast-path: if a saved receipt shows this EXACT plan was
@@ -739,6 +744,12 @@ impl Server {
                 }),
             );
         }
+        // Poison short-circuit: under a force-blocked gate NO outcome may tell the agent to "revise
+        // and call plan_gate again" — retrying cannot approve until a fresh epoch clears the poison.
+        // This also skips the receipt write (an Approved can't occur here, but be defensive).
+        if crate::plan_gate::is_force_blocked(&cwd) {
+            return crate::plan_gate::poisoned_outcome_message(&outcome);
+        }
         match outcome {
             crate::plan_gate::Outcome::Approved => {
                 // Save a receipt from the SAME risk GRANTS the reviewer just authorized
@@ -766,10 +777,7 @@ impl Server {
                 "AI Bridge: the plan still has the same unresolved concerns after revision. \
                  STOP and ask the user how to proceed — do not keep retrying.\n\n{f}"
             ),
-            crate::plan_gate::Outcome::NeedsInfo(f) => format!(
-                "AI Bridge: Codex needs more information to judge the plan (or is blocked). \
-                 Provide what it asks or check with the user, then call `plan_gate` again:\n\n{f}"
-            ),
+            crate::plan_gate::Outcome::NeedsInfo(f) => crate::plan_gate::needs_info_message(&f),
         }
     }
 
@@ -1426,9 +1434,8 @@ fn checkpoint_prepare(cwd: &str, reason: &str) -> CheckpointPrep {
     // to invalidate in-memory.
     if !crate::plan_gate::is_effectively_approved(cwd) {
         return CheckpointPrep::Refuse {
-            message: "AI Bridge: `review_checkpoint` refused: no currently approved \
-                 plan_gate scope; call plan_gate for this PR/task first.\nFrontier unchanged."
-                .to_string(),
+            // Poison-aware: a force-blocked gate points at a fresh epoch, not another plan_gate call.
+            message: crate::plan_gate::checkpoint_refused_message(cwd),
             session: None,
         };
     }
