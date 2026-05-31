@@ -5,6 +5,9 @@
 //! structured `run` tool on top. Raw Bash stays FREE (the owner-accepted Option-3
 //! residual), so this layer does NOT "close" the residual — it is the OPT-IN trusted
 //! execution path.
+//!
+//! INERT until a later unit wires the structured `run`, so the API is unused by design.
+#![allow(dead_code)]
 
 use aibridge_platform::{DefaultPlatform, Platform};
 use std::path::{Path, PathBuf};

@@ -11,9 +11,10 @@ pub mod codex_models;
 pub mod doctor;
 pub mod gate;
 pub mod git;
-// item 3 (hardened-exec, option B): INERT primitive layer, no caller yet (pub so its
-// unused-by-design API isn't dead_code; a later unit wires the structured `run` on it).
-pub mod hardened_exec;
+// item 3 (hardened-exec, option B): INERT primitive layer, no caller yet. PRIVATE so the
+// unfinished primitives aren't a public API; a later unit wires the structured `run` on
+// them. `#![allow(dead_code)]` inside the module covers the unused-by-design items.
+mod hardened_exec;
 pub mod health;
 pub mod install;
 pub mod managed_skills;
