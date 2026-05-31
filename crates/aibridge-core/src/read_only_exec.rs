@@ -133,13 +133,45 @@ pub fn is_read_only(command: &str) -> bool {
     }
 }
 
+/// The ONLY long flags allowed for the read-only `gh` carve-out — a FAIL-CLOSED
+/// metadata / filter / output-shaping allowlist. Everything not listed (`--web`,
+/// `--watch`, `--help`, `--log`, `--log-failed`, `--template`, or any unknown/future
+/// flag) is denied, so a content-dumping / exec / blocking flag can never slip through.
+const GH_SAFE_FLAGS: &[&str] = &[
+    "--json",
+    "--jq",
+    "--state",
+    "--limit",
+    "--author",
+    "--assignee",
+    "--label",
+    "--milestone",
+    "--base",
+    "--head",
+    "--repo",
+    "--app",
+    "--branch",
+    "--workflow",
+    "--user",
+    "--commit",
+    "--event",
+    "--created",
+    "--search",
+    "--draft",
+    "--archived",
+    "--required",
+    "--exit-status",
+    "--job",
+];
+
 /// Read-only `gh` (GitHub CLI) subcommands — a TIGHT allowlist of metadata QUERIES so
 /// `gh pr checks`/`status`/`list` (and run status) work pre-approval. Fail-closed:
 /// - LONG-FORM flags only. gh (Cobra/pflag) clusters boolean shorthands (`-wh` = `-w -h`)
 ///   AND allows attached values (`-Lwhatever`), both lexically ambiguous, so EVERY
 ///   single-dash short flag is denied (use `--state`/`--limit`/`--json`).
-/// - The long `--web` (opens a browser = exec), `--watch` (BLOCKS the hook, like `tail -f`),
-///   and `--help` (pager) are denied by base form (so `--web=true` etc. can't slip past).
+/// - Long flags: a fail-closed metadata/filter ALLOWLIST (`GH_SAFE_FLAGS`). `--web` (browser
+///   exec), `--watch` (BLOCKS the hook like `tail -f`), `--help` (pager), `--log`/`--log-failed`
+///   (dump run LOGS = content, not metadata), `--template`, and any unknown flag are denied.
 /// - Only an exact read-only noun+verb passes; every mutating/admin/exec subcommand is denied.
 ///
 /// `--json`/human metadata output is allowed: gh reads REMOTE GitHub metadata via the API, so
@@ -149,7 +181,10 @@ pub fn is_read_only(command: &str) -> bool {
 fn gh_read_only(tokens: &[&str]) -> bool {
     for &t in &tokens[1..] {
         if t.starts_with("--") {
-            if matches!(t.split('=').next().unwrap_or(t), "--web" | "--watch" | "--help") {
+            // Fail-closed: only the metadata/filter allowlist passes, so content-dumping /
+            // exec / blocking flags (--web, --watch, --help, --log, --log-failed, --template,
+            // …) and any unknown flag are denied — by base form (`--flag=value` too).
+            if !GH_SAFE_FLAGS.contains(&t.split('=').next().unwrap_or(t)) {
                 return false;
             }
         } else if t.starts_with('-') && t.len() > 1 {
@@ -322,6 +357,9 @@ mod tests {
             "gh ext install x",            // installs/execs
             "gh run watch 1",              // blocking subcommand
             "gh run view",                 // bare → interactive run picker (hangs)
+            "gh run view 123 --log",       // dumps run LOGS (content, not metadata)
+            "gh run view 123 --log-failed", // dumps failed-step logs
+            "gh pr view 21 --comments",    // unknown flag → fail-closed allowlist denies it
             "gh",                          // bare
             "gh --version",                // not a noun+verb query
             "gh pr view 21 --web",         // browser exec
