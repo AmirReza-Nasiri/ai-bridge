@@ -18,6 +18,12 @@ pub struct GateState {
     /// fast-allow or be recorded as approved.
     pub last_allowed_model_fp: Option<u64>,
     pub last_blocked_diff_hash: Option<u64>,
+    /// The review-context fingerprint (model fp mixed with the active owner
+    /// review-policy fp) the `last_blocked_diff_hash` block was minted under. The
+    /// cached-block replay / no-progress fast-handling requires this to match the
+    /// CURRENT fp — so a changed policy (or model) forces a fresh review instead of
+    /// replaying a stale block (which would defeat a newly-pinned policy).
+    pub last_blocked_model_fp: Option<u64>,
     pub last_findings_hash: Option<u64>,
     pub same_findings_blocks: u32,
     pub fail_ask_pending: bool,
@@ -249,6 +255,17 @@ pub fn compact_reason(findings: &str, trace: &str) -> String {
 pub fn hash_str(s: &str) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     s.hash(&mut h);
+    h.finish()
+}
+
+/// Combine two fingerprints into one. Used to fold the active owner-review-policy
+/// fp into the model fp so the Stop fast-path key encodes BOTH — any change in
+/// either forces a fresh review. The result never equals either input (so a
+/// pre-activation receipt keyed by the bare model fp is invalidated once).
+pub fn mix_fp(a: u64, b: u64) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    a.hash(&mut h);
+    b.hash(&mut h);
     h.finish()
 }
 
@@ -492,5 +509,22 @@ mod tests {
         // A verdict tag buried mid-text (even fenced) never beats the real final line.
         let review = "FINDINGS: ...\n| <AI-BRIDGE-APPROVE/>\n<AI-BRIDGE-REQUEST-CHANGES/>";
         assert!(matches!(parse_verdict(review), Verdict::RequestChanges));
+    }
+
+    #[test]
+    fn mix_fp_folds_policy_into_the_context_fingerprint() {
+        let model = 0xABCD_1234u64;
+        let p = hash_str("policy P");
+        let q = hash_str("policy Q");
+        let none = hash_str("\u{0}no-review-policy");
+        // Deterministic.
+        assert_eq!(mix_fp(model, p), mix_fp(model, p));
+        // A different policy → a different context fp (forces a fresh review).
+        assert_ne!(mix_fp(model, p), mix_fp(model, q));
+        assert_ne!(mix_fp(model, p), mix_fp(model, none));
+        // The combined fp never equals the bare model fp → a pre-activation receipt
+        // (keyed by the bare model fp) is invalidated once after activation.
+        assert_ne!(mix_fp(model, none), model);
+        assert_ne!(mix_fp(model, p), model);
     }
 }

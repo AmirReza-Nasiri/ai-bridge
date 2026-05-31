@@ -1605,6 +1605,26 @@ pub enum ReviewPolicy {
     Active(String),
 }
 
+impl ReviewPolicy {
+    /// The policy text to inject into the review prompt — Some only for `Active`
+    /// (Absent/Ignored inject nothing). Adapter to `gate::prompt_with_scope`.
+    pub fn active_text(&self) -> Option<&str> {
+        match self {
+            ReviewPolicy::Active(s) => Some(s.as_str()),
+            ReviewPolicy::Absent | ReviewPolicy::Ignored(_) => None,
+        }
+    }
+
+    /// A fingerprint of the policy CONTENT that will be injected (or a fixed sentinel
+    /// when none). Folded into the Stop fast-path key (`gate::mix_fp`) so any change in
+    /// the active policy forces a fresh review and invalidates a prior allow / cached
+    /// block. Absent and Ignored share the sentinel — both inject nothing, so they
+    /// yield the same prompt and must yield the same fp.
+    pub fn fp(&self) -> u64 {
+        crate::gate::hash_str(self.active_text().unwrap_or("\u{0}no-review-policy"))
+    }
+}
+
 /// Canonical form of raw policy content: the SAME string that is BOTH hashed and
 /// injected (so a pin can never mismatch the injected text). Trims; whitespace-only → None.
 fn normalize_policy(raw: &str) -> Option<String> {
@@ -1672,6 +1692,18 @@ pub fn active_review_policy(cwd: &str) -> ReviewPolicy {
         Some(_) => ReviewPolicy::Ignored("policy changed since approval"),
         None => ReviewPolicy::Ignored("policy not pinned at approval"),
     }
+}
+
+/// True when an in-bounds owner review-policy file is present on disk (regardless of
+/// whether it is currently pinned/effective). The plan-gate receipt fast-path is
+/// SKIPPED in this case so a full `record()` approval runs and PINS the policy —
+/// otherwise the no-review resume (which Nulls the pin) would leave the policy
+/// inactive and the owner could never activate it by re-approving an identical plan.
+pub fn review_policy_present(cwd: &str) -> bool {
+    matches!(
+        read_review_policy_raw(cwd).as_deref().and_then(normalize_policy),
+        Some(c) if c.chars().count() <= REVIEW_POLICY_MAX_CHARS
+    )
 }
 
 /// Revoke the current epoch's approval (re-arm the gate). `reason` is recorded for
@@ -4482,5 +4514,37 @@ mod tests {
             "FINDINGS: x",
         );
         assert_eq!(read_state(&cwd).unwrap()["review_policy_hash"], Value::Null);
+    }
+
+    #[test]
+    fn review_policy_active_text_and_fp() {
+        assert_eq!(ReviewPolicy::Active("P".into()).active_text(), Some("P"));
+        assert_eq!(ReviewPolicy::Absent.active_text(), None);
+        assert_eq!(ReviewPolicy::Ignored("x").active_text(), None);
+        let p = ReviewPolicy::Active("P".into()).fp();
+        let q = ReviewPolicy::Active("Q".into()).fp();
+        assert_ne!(p, q, "different policy content → different fp");
+        assert_ne!(p, ReviewPolicy::Absent.fp(), "policy vs none → different fp");
+        assert_eq!(
+            ReviewPolicy::Absent.fp(),
+            ReviewPolicy::Ignored("any").fp(),
+            "Absent and Ignored both inject nothing → same fp"
+        );
+    }
+
+    #[test]
+    fn review_policy_present_detects_in_bounds_file() {
+        let cwd = tmp();
+        std::fs::create_dir_all(std::path::Path::new(&cwd).join(".ai-bridge")).unwrap();
+        assert!(!review_policy_present(&cwd), "no file → not present");
+        write_policy(&cwd, "   \n  ");
+        assert!(!review_policy_present(&cwd), "whitespace-only → not present");
+        write_policy(&cwd, "accepted: links may 404");
+        assert!(review_policy_present(&cwd), "in-bounds policy → present");
+        write_policy(&cwd, &"x".repeat(REVIEW_POLICY_MAX_CHARS + 1));
+        assert!(
+            !review_policy_present(&cwd),
+            "oversized → not present (fail-closed)"
+        );
     }
 }

@@ -633,7 +633,11 @@ impl Server {
         // `begin_review` consumed it, and the receipt fast-path runs NO fresh review, so
         // resuming would unlock writes for a turn that was never reviewed. Force a full
         // review in that case (a trivial continuation or no marker still fast-paths).
-        if !matches!(consumed_turn, crate::plan_gate::ConsumedTurn::NonTrivial) {
+        // Also SKIP the resume when an in-bounds owner review-policy is present: the
+        // resume runs no review and Nulls the policy pin, so the owner could never
+        // activate a policy by re-approving an identical plan. A present policy forces
+        // the full record() path below, which PINS it.
+        if may_use_receipt_fastpath(consumed_turn, crate::plan_gate::review_policy_present(&cwd)) {
             if let Some(resume) =
                 crate::plan_receipt::matching_classes(&cwd, plan, &self.plan_effort)
             {
@@ -850,7 +854,14 @@ impl Server {
         // under a different model can never fast-allow. A configured-but-not-restarted
         // model change is surfaced as a NON-blocking advisory (logs only — review_stop
         // MUST return valid hook JSON, so we never alter the returned decision string).
-        let active_fp = self.pinned_model.fp;
+        // Fold the active owner review-policy into the fast-path fingerprint so any
+        // change to it forces a fresh review (and invalidates a prior allow / cached
+        // block keyed by the old context). Ignored states are logged for diagnostics.
+        let policy = crate::plan_gate::active_review_policy(cwd);
+        if let crate::plan_gate::ReviewPolicy::Ignored(reason) = &policy {
+            log_gate(cwd, &format!("owner review-policy ignored: {reason}"));
+        }
+        let active_fp = gate::mix_fp(self.pinned_model.fp, policy.fp());
         let pending_restart = self.review_model_pending_restart();
         let mut state = self.gates.remove(&key).unwrap_or_default();
         // Hydrate the "already approved this exact diff" fast-path from disk so an MCP
@@ -874,6 +885,7 @@ impl Server {
             approved_plan.as_deref(),
             active_fp,
             reconstructed_base,
+            policy.active_text(),
         );
         // Map the outcome to the frontier status so the NEXT task start won't advance
         // the base over unresolved debt. CRUCIAL: an allow is only a genuine APPROVE
@@ -999,14 +1011,17 @@ impl Server {
         // ticks for checkpoint reviews).
         self.tick_gate_reset();
         let approved_plan = crate::plan_gate::approved_plan(&cwd);
+        let policy = crate::plan_gate::active_review_policy(&cwd);
+        if let crate::plan_gate::ReviewPolicy::Ignored(reason) = &policy {
+            log_gate(&cwd, &format!("owner review-policy ignored: {reason}"));
+        }
         // v0.32: when the review base is reconstructed (orphaned/diverged → net base↔HEAD diff
         // spanning earlier separately-gated tasks), soften the latest-plan breadth check.
         let prompt = gate::prompt_with_scope(
             &ctx.bundle.text,
             approved_plan.as_deref(),
             ctx.committed_warning.is_some(),
-            // Unit 2 wires the owner review-policy here; inert (None) until then.
-            None,
+            policy.active_text(),
         );
         let review = match self.ask_topic(TopicKey::Gate, &prompt, &cwd) {
             Ok(r) if !r.trim().is_empty() => r,
@@ -1105,6 +1120,7 @@ impl Server {
         self.ask_topic(TopicKey::Gate, prompt, cwd)
     }
 
+    #[allow(clippy::too_many_arguments)] // cohesive review context threaded from review_stop_inner
     fn gate_decide(
         &mut self,
         st: &mut gate::GateState,
@@ -1113,8 +1129,13 @@ impl Server {
         approved_plan: Option<&str>,
         active_fp: u64,
         reconstructed_base: bool,
+        review_policy: Option<&str>,
     ) -> String {
         let dh = bundle.hash;
+        // The cached-block replay / no-progress fast-handling is valid only when the
+        // SAME diff was blocked under the SAME review context (model + policy fp) — a
+        // changed policy/model must re-review, not replay a stale block.
+        let same_blocked = same_blocked_context(st, dh, active_fp);
 
         // v0.29 (O1b): the in-memory fast-path allows ONLY when this diff was approved
         // AND under the ACTIVE review model (else a stale allow minted under a different
@@ -1125,18 +1146,19 @@ impl Server {
         }
         if st.fail_ask_pending {
             st.fail_ask_pending = false;
-            if st.last_blocked_diff_hash == Some(dh) {
+            if same_blocked {
                 return allow(); // the ask was surfaced last turn; let Claude stop now
             }
-            // diff changed — fall through and review normally
+            // diff or review-context (policy/model) changed — fall through and review
         }
-        // Same blocked diff stopping again with nothing changed → no progress.
-        if st.last_blocked_diff_hash == Some(dh) {
+        // Same blocked diff under the same context, nothing changed → no progress.
+        if same_blocked {
             st.same_findings_blocks += 1;
             if st.same_findings_blocks >= gate::NO_PROGRESS_THRESHOLD {
                 return self.fail_ask(
                     st,
                     dh,
+                    active_fp,
                     "the diff hasn't changed but peer review still has unresolved findings",
                 );
             }
@@ -1148,8 +1170,8 @@ impl Server {
         // The pre-approved plan (read once by the caller) lets the reviewer flag changes
         // that fall outside the approved scope or high-risk actions the plan never named
         // — the soft-telemetry half of plan-gate v2 (we don't hard-fence files).
-        // Unit 2 wires the owner review-policy 4th arg here; inert (None) until then.
-        let prompt = gate::prompt_with_scope(&bundle.text, approved_plan, reconstructed_base, None);
+        let prompt =
+            gate::prompt_with_scope(&bundle.text, approved_plan, reconstructed_base, review_policy);
         // Periodic anti-anchoring reset of the reserved review thread (shared bound
         // with manual review_diff; warm-cache speed is kept for the runs between).
         self.tick_gate_reset();
@@ -1179,6 +1201,7 @@ impl Server {
                 return self.fail_ask(
                     st,
                     dh,
+                    active_fp,
                     &format!("peer review couldn't run after 1 retry: {e}"),
                 );
             }
@@ -1191,6 +1214,7 @@ impl Server {
                 // v0.29 (O1b): bind the in-memory allow to the model that JUST reviewed.
                 st.last_allowed_model_fp = Some(active_fp);
                 st.last_blocked_diff_hash = None;
+                st.last_blocked_model_fp = None;
                 st.cached_block_reason = None;
                 st.same_findings_blocks = 0;
                 allow()
@@ -1207,6 +1231,7 @@ impl Server {
                         return self.fail_ask(
                             st,
                             dh,
+                            active_fp,
                             "the same findings persist even though the code changed",
                         );
                     }
@@ -1215,6 +1240,7 @@ impl Server {
                 }
                 let reason = gate::compact_reason(&findings, &trace);
                 st.last_blocked_diff_hash = Some(dh);
+                st.last_blocked_model_fp = Some(active_fp);
                 st.last_findings_hash = Some(fh);
                 st.cached_block_reason = Some(reason.clone());
                 block(&reason)
@@ -1222,14 +1248,16 @@ impl Server {
             gate::Verdict::Blocked | gate::Verdict::Unparseable => self.fail_ask(
                 st,
                 dh,
+                active_fp,
                 "peer review could not complete (blocked or unparseable verdict)",
             ),
         }
     }
 
-    fn fail_ask(&mut self, st: &mut gate::GateState, dh: u64, why: &str) -> String {
+    fn fail_ask(&mut self, st: &mut gate::GateState, dh: u64, active_fp: u64, why: &str) -> String {
         st.fail_ask_pending = true;
         st.last_blocked_diff_hash = Some(dh);
+        st.last_blocked_model_fp = Some(active_fp);
         block(&format!(
             "AI Bridge: {why}. I won't finalize on my own — ask the user how to proceed \
              (continue without review / wait and retry / fix it first). The next stop will be \
@@ -1320,6 +1348,26 @@ fn collect_filenames_from_diff(diff_text: &str) -> Vec<String> {
 /// model-fp gate is testable without spawning Codex.
 fn fast_path_allows(st: &gate::GateState, dh: u64, active_fp: u64) -> bool {
     st.last_allowed_diff_hash == Some(dh) && st.last_allowed_model_fp == Some(active_fp)
+}
+
+/// True when the SAME diff was blocked under the SAME review context (model + owner-
+/// policy fp). The cached-block replay / no-progress fast-handling requires this — a
+/// changed policy (or model) must trigger a fresh review, not replay a stale block
+/// (which would prevent a newly-pinned policy from ever suppressing its finding).
+fn same_blocked_context(st: &gate::GateState, dh: u64, active_fp: u64) -> bool {
+    st.last_blocked_diff_hash == Some(dh) && st.last_blocked_model_fp == Some(active_fp)
+}
+
+/// Whether the plan-gate may take the saved-receipt fast-path (resume an identical
+/// plan WITHOUT a fresh review). Both must hold: the turn pending at review start was
+/// not a non-trivial delta (v0.31 P1), AND no in-bounds owner review-policy is present
+/// — a present policy forces the full `record()` path so the policy gets PINNED
+/// (`record_resume` would Null the pin, leaving the policy permanently inactive).
+fn may_use_receipt_fastpath(
+    consumed_turn: crate::plan_gate::ConsumedTurn,
+    policy_present: bool,
+) -> bool {
+    !matches!(consumed_turn, crate::plan_gate::ConsumedTurn::NonTrivial) && !policy_present
 }
 
 /// v0.23.0: Pure-fn verdict mapper for the checkpoint review. Separated so the
@@ -1729,6 +1777,12 @@ fn format_checkpoint_request_changes(
     if let Some(t) = trace {
         out.push_str(&format!("trace: {t}\n"));
     }
+    out.push_str(
+        "If a finding above is a deliberate owner-accepted product/sequencing decision, record a \
+         NARROW entry in .ai-bridge/review-policy.md (scope + does-not-cover + reason) and \
+         re-approve the plan to pin it — that file CANNOT waive correctness/safety/security/build/\
+         data-loss, and is sent to the review model (no secrets).\n",
+    );
     out
 }
 
@@ -2596,6 +2650,83 @@ mod tests {
             !fast_path_allows(&st, 0xAA, 0xF1),
             "missing model fp (pre-O1b / unreviewed) → no fast-allow"
         );
+    }
+
+    // ───── item 2.5 unit 2: owner review-policy folded into the fast-path ─────
+    #[test]
+    fn fast_path_invalidated_by_a_policy_change() {
+        use crate::plan_gate::ReviewPolicy;
+        let model = 0xF1u64;
+        let fp_a = gate::mix_fp(model, ReviewPolicy::Active("policy A".into()).fp());
+        let fp_b = gate::mix_fp(model, ReviewPolicy::Active("policy B".into()).fp());
+        let st = gate::GateState {
+            last_allowed_diff_hash: Some(0xAA),
+            last_allowed_model_fp: Some(fp_a),
+            ..Default::default()
+        };
+        assert!(
+            fast_path_allows(&st, 0xAA, fp_a),
+            "same diff + same policy context → fast-allow"
+        );
+        assert!(
+            !fast_path_allows(&st, 0xAA, fp_b),
+            "policy changed → context fp differs → no fast-allow (forces fresh review)"
+        );
+    }
+
+    #[test]
+    fn same_blocked_context_requires_diff_and_fp() {
+        let mut st = gate::GateState {
+            last_blocked_diff_hash: Some(0xAA),
+            last_blocked_model_fp: Some(0xF1),
+            ..Default::default()
+        };
+        assert!(
+            same_blocked_context(&st, 0xAA, 0xF1),
+            "same diff + same context → cached-block replay eligible"
+        );
+        assert!(
+            !same_blocked_context(&st, 0xBB, 0xF1),
+            "diff changed → fresh review"
+        );
+        assert!(
+            !same_blocked_context(&st, 0xAA, 0xF2),
+            "context fp changed (policy/model) → fresh review, NOT a stale cached-block replay"
+        );
+        st.last_blocked_model_fp = None;
+        assert!(
+            !same_blocked_context(&st, 0xAA, 0xF1),
+            "no blocked context fp recorded → fresh review"
+        );
+    }
+
+    #[test]
+    fn may_use_receipt_fastpath_table() {
+        use crate::plan_gate::ConsumedTurn as CT;
+        // No policy → existing behavior: only a NON-trivial pending turn blocks the resume.
+        assert!(may_use_receipt_fastpath(CT::None, false));
+        assert!(may_use_receipt_fastpath(CT::Trivial, false));
+        assert!(!may_use_receipt_fastpath(CT::NonTrivial, false));
+        // A present in-bounds policy ALWAYS blocks the resume → full record() pins it.
+        assert!(!may_use_receipt_fastpath(CT::None, true));
+        assert!(!may_use_receipt_fastpath(CT::Trivial, true));
+        assert!(!may_use_receipt_fastpath(CT::NonTrivial, true));
+    }
+
+    #[test]
+    fn format_checkpoint_request_changes_includes_policy_hint() {
+        let out = format_checkpoint_request_changes(
+            "reason",
+            "sess",
+            None,
+            "FINDINGS: x",
+            None,
+            None,
+            false,
+        );
+        assert!(out.contains(".ai-bridge/review-policy.md"), "hint names the file");
+        assert!(out.contains("CANNOT waive"), "hint states the safety limit");
+        assert!(out.contains("no secrets"), "hint warns about secrets");
     }
 
     #[test]

@@ -160,6 +160,28 @@ No skill to install, no slash command to memorize: Claude knows these from the
 connected MCP server's tool descriptions plus one line in `CLAUDE.local.md` — a
 tiny fixed cost, far below the startup overhead the warm engine removes.
 
+### Owner review policy (opt-in)
+
+If the Stop/checkpoint reviewer keeps re-flagging a finding you've *deliberately
+accepted* as a product/sequencing decision (e.g. real links to routes that
+intentionally 404 until a later slice lands), record a **narrow** entry in
+`.ai-bridge/review-policy.md` (untracked, per-machine). It's fed to the reviewer
+as accepted context, so it stops re-blocking on that specific item:
+
+```md
+## Accepted non-blockers
+### live-on-arrival-nav
+Accepted: the shared header renders real links to /products, /about before those
+routes land. Scope: that header's nav only. Does not cover: broken existing
+routes, crashes, auth regressions, malformed hrefs.
+Reason: live-on-arrival sequencing, owner-approved 2026-05.
+```
+
+It is **pinned at plan approval** (an edit made after approval is ignored until you
+re-approve), and it **cannot** waive correctness, safety, security, build/test, or
+data-loss findings — only the specific product/sequencing items you list. The file
+is sent to the review model, so keep **no secrets** in it.
+
 ---
 
 ## Commands
