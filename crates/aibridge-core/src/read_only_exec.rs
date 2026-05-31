@@ -203,17 +203,56 @@ fn gh_read_only(tokens: &[&str]) -> bool {
     }
 }
 
+/// The subset of `GH_SAFE_FLAGS` that consume the NEXT token as their value (when not
+/// written `--flag=value`). The remainder (`--draft`/`--archived`/`--required`/
+/// `--exit-status`) are booleans. Used to skip a flag's value so it is never mistaken
+/// for a positional run id.
+const GH_VALUE_FLAGS: &[&str] = &[
+    "--json",
+    "--jq",
+    "--state",
+    "--limit",
+    "--author",
+    "--assignee",
+    "--label",
+    "--milestone",
+    "--base",
+    "--head",
+    "--repo",
+    "--app",
+    "--branch",
+    "--workflow",
+    "--user",
+    "--commit",
+    "--event",
+    "--created",
+    "--search",
+    "--job",
+];
+
 /// `gh run view` needs a NON-interactive selector or it drops into a run PICKER that
-/// hangs the hook. A flag VALUE (e.g. `--json state`, `--repo owner/repo`) is NOT a run
-/// id, so we require either an explicit `--job` selector or a NUMERIC positional token
-/// (gh run/job ids are numeric database ids — flag values like field lists or `owner/repo`
-/// never are).
+/// hangs the hook. Parse the args, SKIPPING each value-taking flag's value, so a flag
+/// VALUE (e.g. `--json status`, `--jq 1`, `--repo owner/repo`) is never mistaken for a
+/// run id — then require an explicit `--job` selector or a TRUE positional run id.
 fn gh_run_view_has_selector(args: &[&str]) -> bool {
-    args.iter().any(|&a| {
-        a == "--job"
-            || a.starts_with("--job=")
-            || (!a.starts_with('-') && !a.is_empty() && a.bytes().all(|b| b.is_ascii_digit()))
-    })
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i];
+        if a == "--job" || a.starts_with("--job=") {
+            return true; // explicit, non-interactive job selector
+        }
+        if a.starts_with("--") {
+            // A value-taking flag WITHOUT `=` consumes the next token → skip it; a
+            // `--flag=value` form or a boolean flag consumes no separate token.
+            i += if GH_VALUE_FLAGS.contains(&a) { 2 } else { 1 };
+            continue;
+        }
+        if !a.is_empty() && !a.starts_with('-') {
+            return true; // a true positional token = the run id
+        }
+        i += 1;
+    }
+    false
 }
 
 /// True iff `tok` is an absolute path: a leading `/` or `\`, or a `X:` drive prefix.
@@ -354,6 +393,7 @@ mod tests {
             "gh run view 123",
             "gh run view 123 --job 456",
             "gh run view --job 456",       // explicit non-interactive job selector, no positional
+            "gh run view --json status 123", // value flag THEN a real positional run-id
             "gh pr checks 21 --json state",
             "gh pr view 21 --json body",
             "gh pr list --json files",
@@ -373,6 +413,8 @@ mod tests {
             "gh run view",                 // bare → interactive run picker (hangs)
             "gh run view --json jobs",     // flag VALUE only, no run-id → still interactive
             "gh run view --repo owner/repo", // flag value only, no run-id → still interactive
+            "gh run view --json status --jq 1", // numeric `--jq` VALUE is not a run-id
+            "gh run view --jq 1",          // numeric flag value, no run-id
             "gh run view 123 --log",       // dumps run LOGS (content, not metadata)
             "gh run view 123 --log-failed", // dumps failed-step logs
             "gh pr view 21 --comments",    // unknown flag → fail-closed allowlist denies it
