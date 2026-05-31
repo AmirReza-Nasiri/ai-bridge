@@ -196,11 +196,24 @@ fn gh_read_only(tokens: &[&str]) -> bool {
         (Some("pr"), Some("checks" | "status" | "list" | "view")) | (Some("run"), Some("list")) => {
             true
         }
-        // `gh run view` with NO run-id is an INTERACTIVE run picker that would HANG the
-        // pre-approval hook — require a concrete positional operand (a run/job id value).
-        (Some("run"), Some("view")) => tokens[3..].iter().any(|t| !t.starts_with('-')),
+        // `gh run view` with NO selector is an INTERACTIVE run picker that would HANG the
+        // pre-approval hook — require an explicit `--job` or a numeric run-id positional.
+        (Some("run"), Some("view")) => gh_run_view_has_selector(&tokens[3..]),
         _ => false,
     }
+}
+
+/// `gh run view` needs a NON-interactive selector or it drops into a run PICKER that
+/// hangs the hook. A flag VALUE (e.g. `--json state`, `--repo owner/repo`) is NOT a run
+/// id, so we require either an explicit `--job` selector or a NUMERIC positional token
+/// (gh run/job ids are numeric database ids — flag values like field lists or `owner/repo`
+/// never are).
+fn gh_run_view_has_selector(args: &[&str]) -> bool {
+    args.iter().any(|&a| {
+        a == "--job"
+            || a.starts_with("--job=")
+            || (!a.starts_with('-') && !a.is_empty() && a.bytes().all(|b| b.is_ascii_digit()))
+    })
 }
 
 /// True iff `tok` is an absolute path: a leading `/` or `\`, or a `X:` drive prefix.
@@ -340,6 +353,7 @@ mod tests {
             "gh run list",
             "gh run view 123",
             "gh run view 123 --job 456",
+            "gh run view --job 456",       // explicit non-interactive job selector, no positional
             "gh pr checks 21 --json state",
             "gh pr view 21 --json body",
             "gh pr list --json files",
@@ -357,6 +371,8 @@ mod tests {
             "gh ext install x",            // installs/execs
             "gh run watch 1",              // blocking subcommand
             "gh run view",                 // bare → interactive run picker (hangs)
+            "gh run view --json jobs",     // flag VALUE only, no run-id → still interactive
+            "gh run view --repo owner/repo", // flag value only, no run-id → still interactive
             "gh run view 123 --log",       // dumps run LOGS (content, not metadata)
             "gh run view 123 --log-failed", // dumps failed-step logs
             "gh pr view 21 --comments",    // unknown flag → fail-closed allowlist denies it
