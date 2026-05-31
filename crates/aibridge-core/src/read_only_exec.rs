@@ -156,11 +156,16 @@ fn gh_read_only(tokens: &[&str]) -> bool {
             return false; // any single-dash short flag → deny (LONG-FORM ONLY)
         }
     }
-    matches!(
-        (tokens.get(1).copied(), tokens.get(2).copied()),
-        (Some("pr"), Some("checks" | "status" | "list" | "view"))
-            | (Some("run"), Some("list" | "view"))
-    )
+    match (tokens.get(1).copied(), tokens.get(2).copied()) {
+        // `pr` queries default to the current branch / list when given no number → non-interactive.
+        (Some("pr"), Some("checks" | "status" | "list" | "view")) | (Some("run"), Some("list")) => {
+            true
+        }
+        // `gh run view` with NO run-id is an INTERACTIVE run picker that would HANG the
+        // pre-approval hook — require a concrete positional operand (a run/job id value).
+        (Some("run"), Some("view")) => tokens[3..].iter().any(|t| !t.starts_with('-')),
+        _ => false,
+    }
 }
 
 /// True iff `tok` is an absolute path: a leading `/` or `\`, or a `X:` drive prefix.
@@ -299,6 +304,7 @@ mod tests {
             "gh pr view 21",
             "gh run list",
             "gh run view 123",
+            "gh run view 123 --job 456",
             "gh pr checks 21 --json state",
             "gh pr view 21 --json body",
             "gh pr list --json files",
@@ -315,6 +321,7 @@ mod tests {
             "gh alias set co pr-checkout", // mutating
             "gh ext install x",            // installs/execs
             "gh run watch 1",              // blocking subcommand
+            "gh run view",                 // bare → interactive run picker (hangs)
             "gh",                          // bare
             "gh --version",                // not a noun+verb query
             "gh pr view 21 --web",         // browser exec
