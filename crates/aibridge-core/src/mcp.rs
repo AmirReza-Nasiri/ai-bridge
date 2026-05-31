@@ -1005,6 +1005,8 @@ impl Server {
             &ctx.bundle.text,
             approved_plan.as_deref(),
             ctx.committed_warning.is_some(),
+            // Unit 2 wires the owner review-policy here; inert (None) until then.
+            None,
         );
         let review = match self.ask_topic(TopicKey::Gate, &prompt, &cwd) {
             Ok(r) if !r.trim().is_empty() => r,
@@ -1146,7 +1148,8 @@ impl Server {
         // The pre-approved plan (read once by the caller) lets the reviewer flag changes
         // that fall outside the approved scope or high-risk actions the plan never named
         // — the soft-telemetry half of plan-gate v2 (we don't hard-fence files).
-        let prompt = gate::prompt_with_scope(&bundle.text, approved_plan, reconstructed_base);
+        // Unit 2 wires the owner review-policy 4th arg here; inert (None) until then.
+        let prompt = gate::prompt_with_scope(&bundle.text, approved_plan, reconstructed_base, None);
         // Periodic anti-anchoring reset of the reserved review thread (shared bound
         // with manual review_diff; warm-cache speed is kept for the runs between).
         self.tick_gate_reset();
