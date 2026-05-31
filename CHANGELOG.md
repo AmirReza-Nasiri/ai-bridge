@@ -6,6 +6,51 @@ versioning is semver.
 
 ## [Unreleased]
 
+## [0.34.0] - 2026-05-31
+
+Hardening + workflow groundwork bundled since 0.33.0: the plan gate's authority state is now
+concurrency-safe and fails *closed* on any lock/write error, `init` can write shared operating-model
+conventions, the binding reviewer can honor a narrow owner-accepted review policy, read-only `gh`
+queries join the discovery carve-out, and the inert foundations for hardened execution and an
+operation lease are in place. Backward-compatible: every new behavior is opt-in or internal — with
+the defaults the gate behaves as in 0.33 plus the always-on state-lock hardening, and
+`AIBRIDGE_PLAN_GATE=0` remains the escape hatch.
+
+### Added
+- **State read-modify-write lock (always on).** A dual lock — a process-global in-process mutex plus
+  a cross-process `fs4` advisory lock on `state.lock` (auto-released on process exit) — serializes
+  every approval-state transition, eliminating the lost-update race between the multi-threaded
+  `plan_gate` MCP server and the separate UserPromptSubmit / PreToolUse / Stop hook processes.
+  Acquisition is bounded and fail-closed, so a hook never hangs.
+- **`force_block` poison sentinel.** If a state lock cannot be acquired or a state write fails, the
+  gate fails *closed*: a sentinel folded into the central approval predicate denies writes on every
+  surface (PreToolUse, the in-process `run` tool, and `review_checkpoint`), and `record` /
+  `record_resume` refuse to mint an approval until a fresh task epoch clears it. Recovery messaging
+  points at sending a new message or `AIBRIDGE_PLAN_GATE=0`, never a futile `plan_gate` retry. Scoped
+  to an enabled, non-bypassed gate, so a stale sentinel under a disabled gate is inert.
+- **`aibridge init --shared`.** `init` appends standing operating-model directives (the
+  Codex-implements loop, orchestration conventions, caching discipline) to `CLAUDE.local.md` by
+  default, or to the committed `CLAUDE.md` with `--shared`.
+- **Owner review-policy (`.ai-bridge/review-policy.md`, opt-in).** The binding Stop/checkpoint
+  reviewer honors a pinned, narrow file of owner-accepted product/sequencing decisions — injected as
+  untrusted data that may only *decline* a finding whose sole basis is an accepted item, never a
+  correctness / safety / security / build / data-loss finding. Pinned by SHA-256 at approval; `init`
+  auto-scaffolds an inert all-comment template.
+- **Read-only `gh` discovery carve-out (`planGate.readOnlyOrientation`).** A fail-closed allowlist of
+  `gh pr {checks,status,list,view}` and `gh run {list,view}` (long-form flags only; content-dump
+  flags such as `--log` denied; `gh run view` requires a real run-id) may run pre-approval, so
+  checking PR/CI status no longer forces a plan round.
+- **Operation-lease foundation (`planGate.operationLease`, default `false`, inert).** The config
+  flag, the `operation.json` lease plus a durable review-pending sentinel, and a fail-closed
+  lease-validity predicate (bound to the live epoch, approval hash, an exact file scope, a monotonic
+  approval generation, and a hard TTL). Unwired in this release — the hook integration follows.
+
+### Internal
+- Monotonic `approved_generation` recorded on every approval (overflow-/corrupt-safe) so a future
+  operation lease cannot survive a revoke followed by re-approval of the same plan.
+- Inert hardened-execution primitives (trusted-executable resolver, environment sanitizer, no-shell
+  argv command construction) — groundwork for a future structured `run` executor; no caller yet.
+
 ## [0.33.0] - 2026-05-30
 
 **Scoped approval** — the plan gate can now confine *where* an approved task writes and let
