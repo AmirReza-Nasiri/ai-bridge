@@ -37,6 +37,12 @@ const OPERATING_MODEL_MARKER: &str = "## AI Bridge — operating model";
 /// preamble scopes the whole block to "when the MCP tools are available".
 const OPERATING_MODEL_NOTE: &str = "## AI Bridge — operating model\n\nThese conventions apply when working in a project with AI Bridge installed. The `mcp__aibridge__*` tools below exist only when the AI Bridge MCP server is connected — when it isn't, treat this section as advisory.\n\n**Codex-implements loop.** When a `plan_gate` or `review_diff` finding is localized and precisely specified, call `mcp__aibridge__implement` so Codex drafts the patch, then verify + apply + test it yourself — don't re-derive the fix by hand. This cuts review round-trips.\n\n**Orchestration / shape-routing.** Route work by shape: broad, parallelizable, read-only work (audits, wide refactors, N-site migrations, research) → fan out across subagents or a workflow; deep, sequential, interdependent work (e.g. a safety-core state machine) → keep it in a single coherent context. Don't fan out a sequential dependency chain. Verify proportional to risk — dual-brain (a Claude review AND an independent Codex `review_diff`) on safety-core changes.\n\n**Caching discipline.** Keep the Codex `topic` stable across a task: a stable topic + stable prompt + transcript replay is Codex's only cache lever (AI Bridge has no Anthropic API client of its own). Claude's own prompt cache is owned by the harness (~5-min TTL) — keep model/effort/tools stable within a task and prefer append-only context.";
 
+/// An INERT owner-review-policy template `init` drops at `.ai-bridge/review-policy.md`
+/// so the owner never has to CREATE the file by hand. The whole thing is one HTML
+/// comment, so `plan_gate::normalize_policy` reads it as empty (Absent) — the policy
+/// stays inactive until a REAL entry is added outside the comment.
+const REVIEW_POLICY_SCAFFOLD: &str = "<!--\nAI Bridge — owner review policy (auto-created by `aibridge init`; opt-in).\n\nRecord NARROW, owner-accepted product/sequencing decisions here so the Stop/checkpoint\nreviewer stops re-flagging them (e.g. real links to routes that intentionally 404 until a\nlater slice lands). This file is sent to the review model — keep NO secrets in it.\n\nSafety: it is pinned at plan approval (an edit made AFTER approval is ignored until you\nre-approve), and it CANNOT waive correctness / safety / security / build / test / data-loss\nfindings — only the specific product/sequencing items you list.\n\nThis template is INERT until a real entry is added OUTSIDE this comment. You usually don't\nedit it by hand — just tell your AI Bridge agent \"this finding is an accepted product/\nsequencing decision\" and it will record a narrow entry for you, like:\n\n  ## Accepted non-blockers\n  ### live-on-arrival-nav\n  Accepted: the shared header links to /products, /about before those routes land.\n  Scope: that header's nav only.\n  Does not cover: broken existing routes, crashes, auth regressions, malformed hrefs.\n  Reason: live-on-arrival sequencing, owner-approved.\n-->\n";
+
 /// What `init` did, for a human-readable report.
 pub struct InitReport {
     pub actions: Vec<String>,
@@ -81,6 +87,7 @@ pub fn init(project: &Path, rtk: bool, plan_gate: bool, shared: bool) -> Result<
     add_gate_line(project, &mut actions)?;
     add_operating_model_directives(project, shared, &mut actions)?;
     write_install_state(project, &exe_str, &mut actions)?;
+    add_review_policy_scaffold(project, &mut actions)?;
     git_exclude(project, ".ai-bridge/", &mut actions);
 
     // Record global install provenance (which binary to replace on `update`).
@@ -583,6 +590,27 @@ fn add_operating_model_directives(
     Ok(())
 }
 
+/// Auto-create the INERT owner-review-policy template so the owner never has to
+/// create `.ai-bridge/review-policy.md` by hand. The whole template is one HTML
+/// comment → the gate reads it as Absent (inactive) until a REAL entry is added.
+/// Idempotent: NEVER overwrites an existing file (a real, edited policy must survive
+/// re-init). `.ai-bridge/` is already git-excluded by `init`.
+fn add_review_policy_scaffold(project: &Path, actions: &mut Vec<String>) -> Result<()> {
+    let dir = project.join(".ai-bridge");
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", display(&dir)))?;
+    let path = dir.join("review-policy.md");
+    if path.exists() {
+        return Ok(()); // preserve an existing (possibly real, edited) policy
+    }
+    std::fs::write(&path, REVIEW_POLICY_SCAFFOLD)
+        .with_context(|| format!("writing {}", display(&path)))?;
+    actions.push(format!(
+        "scaffolded an inert review-policy template at {} (opt-in; inert until you add an entry)",
+        display(&path)
+    ));
+    Ok(())
+}
+
 /// Best-effort: add `entry` to the repo's `.git/info/exclude` so a local-only
 /// file stays untracked without editing the committed `.gitignore`.
 ///
@@ -927,5 +955,32 @@ mod tests {
             "the install note must never be committed"
         );
         assert!(committed.contains(OPERATING_MODEL_MARKER));
+    }
+
+    #[test]
+    fn review_policy_scaffold_is_created_and_inert() {
+        let p = tmp();
+        add_review_policy_scaffold(&p, &mut Vec::new()).unwrap();
+        let path = p.join(".ai-bridge").join("review-policy.md");
+        assert!(path.exists(), "scaffold file is created");
+        assert!(
+            !crate::plan_gate::review_policy_present(&p.to_string_lossy()),
+            "an all-comment scaffold must be inert (not present)"
+        );
+    }
+
+    #[test]
+    fn review_policy_scaffold_never_overwrites_a_real_policy() {
+        let p = tmp();
+        std::fs::create_dir_all(p.join(".ai-bridge")).unwrap();
+        let path = p.join(".ai-bridge").join("review-policy.md");
+        let real = "## Accepted\nlinks may 404 until later";
+        std::fs::write(&path, real).unwrap();
+        add_review_policy_scaffold(&p, &mut Vec::new()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            real,
+            "an existing real policy must be preserved on re-init"
+        );
     }
 }

@@ -1625,10 +1625,35 @@ impl ReviewPolicy {
     }
 }
 
+/// Strip well-formed `<!-- ... -->` HTML comments (incl. multi-line). An UNBALANCED
+/// `<!--` (no closing) is left intact — conservative: keeping content can only make a
+/// policy read as PRESENT/active, never hide a real entry, so stripping is monotonic
+/// toward safety. Lets `init` ship an all-comment, INERT review-policy template.
+fn strip_html_comments(s: &str) -> String {
+    let mut out = String::new();
+    let mut rest = s;
+    while let Some(start) = rest.find("<!--") {
+        out.push_str(&rest[..start]);
+        match rest[start..].find("-->") {
+            Some(end) => rest = &rest[start + end + 3..],
+            None => {
+                // No closing marker → keep the remainder verbatim (don't strip).
+                out.push_str(&rest[start..]);
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Canonical form of raw policy content: the SAME string that is BOTH hashed and
-/// injected (so a pin can never mismatch the injected text). Trims; whitespace-only → None.
+/// injected (so a pin can never mismatch the injected text). HTML comments are
+/// stripped first (so an all-comment scaffold is inert), then trimmed; empty → None.
 fn normalize_policy(raw: &str) -> Option<String> {
-    let t = raw.trim();
+    let stripped = strip_html_comments(raw);
+    let t = stripped.trim();
     if t.is_empty() {
         None
     } else {
@@ -4545,6 +4570,41 @@ mod tests {
         assert!(
             !review_policy_present(&cwd),
             "oversized → not present (fail-closed)"
+        );
+    }
+
+    #[test]
+    fn strip_html_comments_drops_balanced_keeps_unbalanced() {
+        assert_eq!(strip_html_comments("a<!--x-->b"), "ab");
+        assert_eq!(strip_html_comments("a<!--\nmulti\nline-->b"), "ab");
+        assert_eq!(strip_html_comments("<!--only-->"), "");
+        // An unbalanced opener is kept verbatim (conservative → reads as present).
+        assert_eq!(strip_html_comments("keep<!--no close"), "keep<!--no close");
+        assert_eq!(strip_html_comments("no comments"), "no comments");
+    }
+
+    #[test]
+    fn normalize_policy_treats_all_comment_scaffold_as_inert() {
+        // The init scaffold (the whole file is one HTML comment) → None (Absent/inert).
+        assert_eq!(normalize_policy("<!-- template, no entries yet -->\n"), None);
+        // A real entry outside comments → Some(stripped entry); inline comments removed.
+        let raw = "<!-- docs -->\n## Accepted\nlinks may 404 <!-- note --> until later";
+        let got = normalize_policy(raw).unwrap();
+        assert!(got.contains("## Accepted") && got.contains("links may 404"));
+        assert!(
+            !got.contains("docs") && !got.contains("note"),
+            "comment text is stripped from the canonical"
+        );
+    }
+
+    #[test]
+    fn review_policy_present_false_for_all_comment_scaffold() {
+        let cwd = tmp();
+        std::fs::create_dir_all(std::path::Path::new(&cwd).join(".ai-bridge")).unwrap();
+        write_policy(&cwd, "<!--\nAI Bridge review policy template — no entries yet.\n-->\n");
+        assert!(
+            !review_policy_present(&cwd),
+            "an all-comment scaffold must be inert (not present)"
         );
     }
 }
