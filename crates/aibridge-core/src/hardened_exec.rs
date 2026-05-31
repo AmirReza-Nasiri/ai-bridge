@@ -11,6 +11,7 @@
 
 use aibridge_platform::{DefaultPlatform, Platform};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 /// Execution-trust mode for a structured run (set by the caller per Codex's design).
 /// Only `ReadOnly`/`WriteScoped` will run through the hardened path; `UnsafeUnmanaged`
@@ -160,6 +161,56 @@ pub fn sanitize_env(input: &[(String, String)]) -> Vec<(String, String)> {
         out.push((k.to_string(), v.to_string()));
     }
     out
+}
+
+/// Build a NO-SHELL hardened `std::process::Command` from a resolved trusted `exe`, an
+/// `argv` array, a `cwd`, and the caller's `current_env`. `argv` is passed DIRECTLY (never
+/// a shell string), so `*`/`|`/`;`/`"` are LITERAL arguments, not shell metacharacters —
+/// that is the whole point: it sidesteps the lexical carve-out's metacharacter problem.
+/// The child inherits ONLY the [`sanitize_env`] set (`env_clear` + the sanitized vars) and
+/// gets a NULL stdin (so it can never hang on a prompt). PURE construction — does NOT spawn.
+/// cwd CONFINEMENT (under the repo root), the spawn + timeout + process-tree kill, and
+/// stdout/stderr capture are LATER units; this only constructs the command.
+fn hardened_command(
+    exe: &Path,
+    argv: &[String],
+    cwd: &Path,
+    current_env: &[(String, String)],
+) -> Command {
+    let mut cmd = Command::new(exe);
+    cmd.args(argv);
+    cmd.env_clear();
+    for (k, v) in sanitize_env(current_env) {
+        cmd.env(k, v);
+    }
+    cmd.current_dir(cwd);
+    cmd.stdin(Stdio::null());
+    #[cfg(windows)]
+    {
+        // Match the project's no-console launch policy (platform `command_for` sets this on
+        // every spawned process; a fresh `Command::new` would otherwise lose it).
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
+/// Resolve a BARE tool name to a trusted binary (unit 1) and build the no-shell hardened
+/// command (see [`hardened_command`]). INERT — no caller yet; a later unit wires the
+/// structured `run` + spawn. NOTE: exe resolution uses the REAL process `PATH` (via
+/// `find_executable`), so this is NOT a pure function — resolving against a CONTROLLED
+/// `PATH` + full provenance confinement is a later unit. `current_env` controls only the
+/// CHILD's sanitized environment, NOT the resolution (a mismatch the later confinement
+/// unit closes).
+pub fn resolve_and_build_command(
+    tool: &str,
+    argv: &[String],
+    cwd: &Path,
+    current_env: &[(String, String)],
+) -> Result<Command, TrustedExeReject> {
+    let exe = resolve_trusted_exe(tool)?;
+    Ok(hardened_command(&exe, argv, cwd, current_env))
 }
 
 #[cfg(test)]
@@ -368,5 +419,88 @@ mod tests {
     fn run_mode_variants_are_distinct() {
         assert_ne!(RunMode::ReadOnly, RunMode::WriteScoped);
         assert_ne!(RunMode::WriteScoped, RunMode::UnsafeUnmanaged);
+    }
+
+    #[test]
+    fn hardened_command_passes_argv_literally_and_sanitizes_env() {
+        let exe = tmp_dir().join("tool.exe");
+        std::fs::write(&exe, b"MZ").unwrap();
+        #[cfg(unix)]
+        chmod(&exe, 0o755);
+        let cwd = tmp_dir();
+        let argv: Vec<String> = ["a", "*.tsx", "--flag", "x|y"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let env = vec![
+            ("PATH".into(), "/usr/bin".into()),
+            ("HOME".into(), "/home/me".into()),
+            ("GIT_PAGER".into(), "evil".into()),
+            ("NODE_OPTIONS".into(), "--require /evil".into()),
+        ];
+        let cmd = hardened_command(&exe, &argv, &cwd, &env);
+        assert_eq!(cmd.get_program(), exe.as_os_str());
+        // argv reaches Command verbatim — `*` and `|` are LITERAL args, not shell metachars.
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, vec!["a", "*.tsx", "--flag", "x|y"]);
+        assert_eq!(cmd.get_current_dir(), Some(cwd.as_path()));
+        // env: only the sanitized set (env_clear + the kept/forced vars).
+        let envs: std::collections::HashMap<String, Option<String>> = cmd
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|x| x.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert!(
+            envs.contains_key("PATH") && envs.contains_key("HOME"),
+            "benign vars kept"
+        );
+        assert!(!envs.contains_key("GIT_PAGER"), "pager dropped");
+        assert!(!envs.contains_key("NODE_OPTIONS"), "injection knob dropped");
+        assert_eq!(envs.get("GIT_CONFIG_NOSYSTEM"), Some(&Some("1".to_string())));
+        assert!(
+            envs.contains_key("GIT_CONFIG_GLOBAL") && envs.contains_key("GIT_TERMINAL_PROMPT"),
+            "forced safe git controls present"
+        );
+    }
+
+    #[test]
+    fn resolve_and_build_command_rejects_non_bare_tool() {
+        let cwd = tmp_dir();
+        assert_eq!(
+            resolve_and_build_command("dir/git", &[], &cwd, &[]).map(|_| ()),
+            Err(TrustedExeReject::NameNotBare)
+        );
+    }
+
+    #[test]
+    fn resolve_and_build_command_builds_for_a_resolvable_tool() {
+        let cwd = tmp_dir();
+        // cargo + git are on PATH wherever this test suite runs (cargo invokes the suite;
+        // CI checks out with git), so at least one resolves — else FAIL loudly rather than
+        // silently no-op (so the success path is actually exercised).
+        for tool in ["cargo", "rustc", "git"] {
+            if let Ok(cmd) = resolve_and_build_command(tool, &["--version".to_string()], &cwd, &[])
+            {
+                assert!(
+                    Path::new(cmd.get_program()).is_absolute(),
+                    "resolved to an absolute trusted exe"
+                );
+                let args: Vec<String> = cmd
+                    .get_args()
+                    .map(|a| a.to_string_lossy().into_owned())
+                    .collect();
+                assert_eq!(args, vec!["--version"]);
+                assert_eq!(cmd.get_current_dir(), Some(cwd.as_path()));
+                return;
+            }
+        }
+        panic!("expected at least one of cargo/rustc/git to resolve as a trusted executable");
     }
 }
