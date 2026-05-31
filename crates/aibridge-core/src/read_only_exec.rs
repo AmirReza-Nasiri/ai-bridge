@@ -28,6 +28,11 @@
 //!   to author source;
 //! - a relative path operand could be a symlink pointing outside the repo (would need a
 //!   pre-existing in-repo symlink, itself a prior gate-blocked write).
+//! - read-only `gh` METADATA queries (`gh pr checks/status/list/view`, `gh run list/view`)
+//!   also run pre-approval (long-form flags only; `--web`/`--watch`/`--help` denied; no
+//!   mutating/`api` subcommand). `gh` reads remote GitHub data via the authenticated API — no
+//!   LOCAL textconv/diff helper execs — so the residual is the same class (pager / `gh alias` /
+//!   extension / shadowed `gh`); it grants no write capability.
 
 /// `git log`/`diff`/`show` flags that only affect read-only summary/selection. CONTENT-diff
 /// flags (`-p`/`--patch`/`--word-diff`) are deliberately EXCLUDED — rendering file content can
@@ -123,8 +128,39 @@ pub fn is_read_only(command: &str) -> bool {
         "git" => git_read_only(&tokens),
         // `..` already rejected globally; only the mutating/exec actions remain to bar.
         "find" => !tokens.iter().any(|t| FIND_MUTATING_ACTIONS.contains(t)),
+        "gh" => gh_read_only(&tokens),
         _ => false,
     }
+}
+
+/// Read-only `gh` (GitHub CLI) subcommands — a TIGHT allowlist of metadata QUERIES so
+/// `gh pr checks`/`status`/`list` (and run status) work pre-approval. Fail-closed:
+/// - LONG-FORM flags only. gh (Cobra/pflag) clusters boolean shorthands (`-wh` = `-w -h`)
+///   AND allows attached values (`-Lwhatever`), both lexically ambiguous, so EVERY
+///   single-dash short flag is denied (use `--state`/`--limit`/`--json`).
+/// - The long `--web` (opens a browser = exec), `--watch` (BLOCKS the hook, like `tail -f`),
+///   and `--help` (pager) are denied by base form (so `--web=true` etc. can't slip past).
+/// - Only an exact read-only noun+verb passes; every mutating/admin/exec subcommand is denied.
+///
+/// `--json`/human metadata output is allowed: gh reads REMOTE GitHub metadata via the API, so
+/// there is no LOCAL textconv/ext-diff/filter helper to exec (git's content concern); `gh pr diff`
+/// is simply not in the allowlist. Residual (pager/`gh alias`/extension/shadowed `gh`) = the SAME
+/// owner-accepted class documented above; no write capability; the Stop gate reviews the final diff.
+fn gh_read_only(tokens: &[&str]) -> bool {
+    for &t in &tokens[1..] {
+        if t.starts_with("--") {
+            if matches!(t.split('=').next().unwrap_or(t), "--web" | "--watch" | "--help") {
+                return false;
+            }
+        } else if t.starts_with('-') && t.len() > 1 {
+            return false; // any single-dash short flag → deny (LONG-FORM ONLY)
+        }
+    }
+    matches!(
+        (tokens.get(1).copied(), tokens.get(2).copied()),
+        (Some("pr"), Some("checks" | "status" | "list" | "view"))
+            | (Some("run"), Some("list" | "view"))
+    )
 }
 
 /// True iff `tok` is an absolute path: a leading `/` or `\`, or a `X:` drive prefix.
@@ -251,6 +287,49 @@ mod tests {
             "find . -name foo.rs",
         ] {
             assert!(is_read_only(c), "{c} should be read-only");
+        }
+    }
+
+    #[test]
+    fn gh_read_only_allows_queries_denies_writes_blocking_and_short_flags() {
+        for c in [
+            "gh pr checks 21",
+            "gh pr status",
+            "gh pr list",
+            "gh pr view 21",
+            "gh run list",
+            "gh run view 123",
+            "gh pr checks 21 --json state",
+            "gh pr view 21 --json body",
+            "gh pr list --json files",
+            "gh pr list --state open --limit 20",
+        ] {
+            assert!(is_read_only(c), "{c} (read-only gh query) should be allowed");
+        }
+        for c in [
+            "gh pr diff",                  // content/diff — not a discovery command
+            "gh pr merge 21 --squash",     // mutating
+            "gh pr create --title x",      // mutating
+            "gh api repos/o/r",            // arbitrary API (can POST)
+            "gh secret set X",             // mutating/secret
+            "gh alias set co pr-checkout", // mutating
+            "gh ext install x",            // installs/execs
+            "gh run watch 1",              // blocking subcommand
+            "gh",                          // bare
+            "gh --version",                // not a noun+verb query
+            "gh pr view 21 --web",         // browser exec
+            "gh pr view 21 --web=true",    // attached-value bypass
+            "gh run view 123 --web=true",
+            "gh pr checks 21 --watch",     // BLOCKS the hook (like tail -f)
+            "gh pr checks 21 --watch=true",
+            "gh pr view 21 --help=true",   // help/pager (attached)
+            "gh pr view 21 -h",            // short help
+            "gh pr view 21 -w",            // short web
+            "gh pr view 21 -wh",           // pflag boolean shorthand cluster
+            "gh pr view 21 -hw",
+            "gh pr list -s open",          // short flag → long-form only
+        ] {
+            assert!(!is_read_only(c), "{c} must be denied");
         }
     }
 
