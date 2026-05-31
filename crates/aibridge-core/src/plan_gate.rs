@@ -398,12 +398,197 @@ fn with_state_lock_try<T>(cwd: &str, f: impl FnOnce(&StateGuard) -> T) -> Option
     Some(out)
 }
 
+/// v0.32 Unit B (operation LEASE) — INERT foundation (sub-units 1-3): the on-disk lease file, the
+/// DURABLE deferred-review sentinel, and the read-only fail-closed VALIDITY predicate. NOTHING wires
+/// these yet (sub-units 4-9 add operation_begin/end + the UserPromptSubmit/Stop/PreToolUse
+/// integration), so `#![allow(dead_code)]` until then and behavior is byte-identical. The validity
+/// predicate is Unit B's fail-closed heart: a too-lenient lease would suppress the gate's re-arm
+/// across a scope-changing user turn, so it binds the lease to the LIVE approved + scope-fenced
+/// epoch and fully bounds time. (Tests live in `plan_gate::tests`, which has the state-setup helpers.)
+mod operation_lease {
+    #![allow(dead_code)]
+    use super::*;
+    use serde_json::Value;
+    use std::path::PathBuf;
+
+    /// Hard cap on a lease's lifetime — a forged over-long `expires_at` must be rejected (Codex).
+    pub(super) const MAX_TTL_MS: u64 = 60 * 60 * 1000; // 60 minutes
+
+    pub(super) fn operation_path(cwd: &str) -> PathBuf {
+        dir(cwd).join("operation.json")
+    }
+
+    /// Read the lease file (None if absent/unparseable → fail-closed at the caller).
+    pub(super) fn read_operation(cwd: &str) -> Option<Value> {
+        serde_json::from_str(&std::fs::read_to_string(operation_path(cwd)).ok()?).ok()
+    }
+
+    /// Write the lease atomically (temp+rename). The CALLER must hold `with_state_lock` (the lease is
+    /// part of the gate-authority RMW set); this helper only performs the atomic file write.
+    pub(super) fn write_operation(cwd: &str, v: &Value) -> std::io::Result<()> {
+        let d = dir(cwd);
+        std::fs::create_dir_all(&d)?;
+        let body = serde_json::to_string_pretty(v).unwrap_or_else(|_| "{}".to_string());
+        let tmp = d.join(format!("operation.json.tmp.{}", std::process::id()));
+        std::fs::write(&tmp, body)?;
+        std::fs::rename(&tmp, operation_path(cwd))
+    }
+
+    /// Best-effort: clear the lease (lease end / invalidation).
+    pub(super) fn clear_operation(cwd: &str) {
+        let _ = std::fs::remove_file(operation_path(cwd));
+    }
+
+    pub(super) fn operation_review_pending_path(cwd: &str) -> PathBuf {
+        dir(cwd).join("operation_review_pending")
+    }
+
+    /// The DURABLE deferred-review obligation sentinel: set when a valid-lease Stop is SUPPRESSED,
+    /// cleared ONLY after a successful deferred review. It outlives lease expiry/clear (unlike a flag
+    /// inside operation.json), so "must review OR block" stays enforceable after the lease is gone.
+    pub(super) fn operation_review_pending_active(cwd: &str) -> bool {
+        // FAIL-CLOSED: a metadata/access ERROR ("cannot determine") must NOT read as "no obligation"
+        // — treat it as ACTIVE so the future PreToolUse/Stop caller blocks rather than loses the
+        // deferred-review obligation.
+        operation_review_pending_path(cwd)
+            .try_exists()
+            .unwrap_or(true)
+    }
+    /// Persist the obligation. Returns `Err` if it cannot be written — the future caller MUST fail
+    /// closed (block) when this fails, since a suppressed Stop whose obligation was not recorded would
+    /// otherwise be lost. Honors the `forced_write_failure` test seam for a deterministic failure test.
+    pub(super) fn set_operation_review_pending(cwd: &str) -> std::io::Result<()> {
+        forced_write_failure()?;
+        std::fs::create_dir_all(dir(cwd))?;
+        std::fs::write(operation_review_pending_path(cwd), b"1\n")
+    }
+    pub(super) fn clear_operation_review_pending(cwd: &str) {
+        let _ = std::fs::remove_file(operation_review_pending_path(cwd));
+    }
+
+    /// Current wall-clock ms since the UNIX epoch (0 if the clock predates the epoch → fail-safe: 0
+    /// reads as before any real `created_at`, making the lease invalid).
+    pub(super) fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    /// The FAIL-CLOSED lease validity predicate (read-only; no lock — atomic reads like
+    /// `effectively_approved`). Returns true ONLY when EVERY condition holds; any missing field,
+    /// type mismatch, time-bound violation, or live-state mismatch → false.
+    pub(super) fn operation_lease_valid(cwd: &str) -> bool {
+        operation_lease_valid_with(cwd, crate::review_mcp::operation_lease_enabled())
+    }
+
+    /// [`operation_lease_valid`] with the `operationLease` config flag INJECTED, so the predicate is
+    /// unit-testable without the operator's real on-disk config (mirrors `start_epoch_inner` /
+    /// `enforce_tool_scoped_with`). The public wrapper supplies the live value.
+    pub(super) fn operation_lease_valid_with(cwd: &str, enabled: bool) -> bool {
+        // 1. opt-in feature flag.
+        if !enabled {
+            return false;
+        }
+        // 2. poison ALWAYS wins over a lease.
+        if is_force_blocked(cwd) {
+            return false;
+        }
+        // 3. the LIVE approval must still be effective (not revoked/blocked/pending) AND scope-fenced.
+        if !is_effectively_approved(cwd) || !scope_is_enforced(cwd) {
+            return false;
+        }
+        let (Some(op), Some(state)) = (read_operation(cwd), read_state(cwd)) else {
+            return false;
+        };
+        // 4. all required fields present + correctly typed.
+        let (
+            Some(lease_epoch),
+            Some(lease_appr_epoch),
+            Some(lease_plan_hash),
+            Some(lease_generation),
+            Some(created_at),
+            Some(expires_at),
+            Some(_operation_id),
+        ) = (
+            op.get("epoch").and_then(Value::as_str),
+            op.get("approved_epoch").and_then(Value::as_str),
+            op.get("approved_plan_hash").and_then(Value::as_u64),
+            op.get("approved_generation").and_then(Value::as_u64),
+            op.get("created_at").and_then(Value::as_u64),
+            op.get("expires_at").and_then(Value::as_u64),
+            op.get("operation_id").and_then(Value::as_str),
+        )
+        else {
+            return false;
+        };
+        let lease_globs = match op.get("approved_allowed_globs").and_then(Value::as_array) {
+            Some(a) if !a.is_empty() && a.iter().all(Value::is_string) => a,
+            _ => return false, // absent / empty / non-array / non-string element → invalid
+        };
+        // 5. TIME fully bounded: created_at <= now <= expires_at, expires_at >= created_at, and the
+        //    window <= MAX_TTL. The `created_at <= now` lower bound makes a BACKWARD wall-clock
+        //    (rollback below created_at) AND a far-FUTURE created_at both fail closed. HONEST residual:
+        //    within [created_at, expires_at] the wall clock is trusted; a forward jump only EXPIRES a
+        //    lease early (fail-safe).
+        let now = now_ms();
+        if !(created_at <= now && now <= expires_at && expires_at >= created_at) {
+            return false;
+        }
+        if expires_at.saturating_sub(created_at) > MAX_TTL_MS {
+            return false;
+        }
+        // 6. bind to the LIVE epoch + approval identity + approval GENERATION (revoke + re-approve,
+        //    new epoch, or changed plan → invalid). The monotonic generation is what makes a
+        //    revoke→same-plan-re-approve cycle fail closed (collision-proof, timing-independent).
+        if state.get("epoch").and_then(Value::as_str) != Some(lease_epoch)
+            || state.get("approved_epoch").and_then(Value::as_str) != Some(lease_appr_epoch)
+            || state.get("approved_plan_hash").and_then(Value::as_u64) != Some(lease_plan_hash)
+            || state.get("approved_generation").and_then(Value::as_u64) != Some(lease_generation)
+        {
+            return false;
+        }
+        // 7. EXACT live-scope binding: the lease's globs must equal the LIVE approved scope (not just
+        //    be a non-empty array of their own), so a forged lease can't fabricate a scope. Combined
+        //    with `scope_is_enforced` above, this fails closed unless the lease mirrors a real fence.
+        if state.get("approved_allowed_globs").and_then(Value::as_array) != Some(lease_globs) {
+            return false;
+        }
+        true
+    }
+}
+
 /// Insert/overwrite a top-level field in a JSON object value (no-op if `v` is not
 /// an object). Shared by `record`/`revoke` so they all mutate state the same way.
 fn set_field(v: &mut Value, k: &str, val: Value) {
     if let Some(o) = v.as_object_mut() {
         o.insert(k.into(), val);
     }
+}
+
+/// v0.32 Unit B: increment the MONOTONIC per-approval generation in `s` (absent → 0). The approval
+/// writers call this under the state lock, so an operation lease can bind to a SPECIFIC approval
+/// instance; a `revoke` + re-approve (via `record` OR `record_resume`) strictly increases it,
+/// invalidating any stale lease regardless of timing. Read by nothing except the lease validity.
+/// Returns `false` if the counter would OVERFLOW (a corrupt/hand-edited `u64::MAX`) — gate-authority
+/// state must fail closed, never panic (debug) or wrap to 0 (release); the caller refuses approval.
+#[must_use]
+fn bump_approved_generation(s: &mut Value) -> bool {
+    // Distinguish ABSENT/null (legacy/fresh → 0) from PRESENT-but-malformed (corrupt → fail closed).
+    // A non-u64 present value must NOT silently reset to 1 (that could collide with a stale lease's
+    // generation), and a u64::MAX must not wrap.
+    let current = match s.get("approved_generation") {
+        None | Some(Value::Null) => 0,
+        Some(v) => match v.as_u64() {
+            Some(n) => n,
+            None => return false, // present but not a u64 → corrupt → fail closed
+        },
+    };
+    let Some(gen) = current.checked_add(1) else {
+        return false; // overflow → fail closed
+    };
+    set_field(s, "approved_generation", json!(gen));
+    true
 }
 
 /// Cap the stored approved-plan text so `state.json` stays small (the Stop gate
@@ -2525,6 +2710,20 @@ fn record_locked(
             set_field(&mut s, "status", json!("approved"));
             set_field(&mut s, "revoked_reason", Value::Null);
             set_field(&mut s, "same_findings", json!(0));
+            // v0.32 Unit B: a MONOTONIC per-approval generation (under the state lock → atomic) so an
+            // operation lease can bind to THIS approval instance; a revoke + re-approve bumps it,
+            // invalidating a stale lease regardless of timing. Overflow (corrupt state) → fail closed.
+            if !bump_approved_generation(&mut s) {
+                // Corrupt/overflowed generation → fail closed AND neutralize any PRIOR (corrupt)
+                // approval so it can't stay effective: poison + best-effort remove state.
+                set_force_block(cwd);
+                let _ = std::fs::remove_file(state_path(cwd));
+                return Outcome::NeedsInfo(
+                    "AI Bridge: the plan-gate state is corrupt (approval-generation). Send a new \
+                     message to start a fresh task."
+                        .to_string(),
+                );
+            }
             if write_state(cwd, &s).is_err() {
                 // The approval did NOT persist → do not claim it. The prior PENDING/same-epoch
                 // state remains effective-or-not exactly as before this call (fail-closed); no
@@ -2689,6 +2888,15 @@ fn record_resume_locked(
     set_field(&mut s, "status", json!("approved"));
     set_field(&mut s, "revoked_reason", Value::Null);
     set_field(&mut s, "same_findings", json!(0));
+    // v0.32 Unit B: bump the monotonic per-approval generation HERE too — `record_resume` is a
+    // separate approval writer that does NOT touch `rounds`, so without this a revoke + receipt-resume
+    // re-approve could revive a stale lease. Overflow (corrupt state) → fail closed (no approval).
+    if !bump_approved_generation(&mut s) {
+        // Corrupt/overflowed generation → fail closed AND neutralize any prior corrupt approval.
+        set_force_block(cwd);
+        let _ = std::fs::remove_file(state_path(cwd));
+        return false;
+    }
     write_state(cwd, &s).is_ok()
 }
 
@@ -4262,6 +4470,7 @@ mod tests {
             "status": "approved",
             "rounds": 1,
             "same_findings": 0,
+            "approved_generation": 1, // v0.32 Unit B: a real approval carries a generation
         });
         write_state(cwd, &s).unwrap();
         assert!(!blocks_writes(cwd));
@@ -5570,6 +5779,321 @@ mod tests {
         assert!(
             msg.contains("AIBRIDGE_PLAN_GATE=0") && !msg.contains("call `plan_gate` again"),
             "early refusal carries the fresh-epoch / bypass recovery"
+        );
+    }
+
+    // ───────── v0.32 Unit B (operation LEASE): inert foundation — file helpers + validity ─────────
+
+    /// Build a lease Value that mirrors the LIVE approved+scoped state, with the given time window.
+    fn lease_value(cwd: &str, created_at: u64, expires_at: u64) -> Value {
+        let s = read_state(cwd).unwrap();
+        json!({
+            "epoch": s["epoch"],
+            "approved_epoch": s["approved_epoch"],
+            "approved_plan_hash": s["approved_plan_hash"],
+            "approved_allowed_globs": s["approved_allowed_globs"],
+            "approved_generation": s["approved_generation"],
+            "created_at": created_at,
+            "expires_at": expires_at,
+            "operation_id": "op-test",
+        })
+    }
+
+    /// A REAL scoped approval via `record` (sets `approved_allowed_globs` AND bumps
+    /// `approved_generation`), unlike the synthetic `approve_with_scope_state`. Caller does
+    /// enable + start_epoch first; uses the same epoch each call (so a re-approve stays in-epoch).
+    fn real_scoped_approve(cwd: &str) {
+        let epoch = current_epoch(cwd);
+        let plan = "do work\nALLOWED-GLOBS: src/a.rs";
+        begin_review(cwd, plan);
+        let findings = "ok\nSCOPE-APPROVED: src/a.rs";
+        assert!(matches!(
+            record(cwd, &epoch, plan, &crate::gate::Verdict::Approve, findings),
+            Outcome::Approved
+        ));
+    }
+
+    #[test]
+    fn operation_lease_helpers_round_trip() {
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        let v = json!({ "operation_id": "x", "created_at": 1u64 });
+        assert!(operation_lease::read_operation(&cwd).is_none(), "absent → None");
+        operation_lease::write_operation(&cwd, &v).unwrap();
+        assert_eq!(operation_lease::read_operation(&cwd).unwrap()["operation_id"], "x");
+        operation_lease::clear_operation(&cwd);
+        assert!(operation_lease::read_operation(&cwd).is_none(), "cleared → None");
+        // Durable sentinel.
+        assert!(!operation_lease::operation_review_pending_active(&cwd));
+        operation_lease::set_operation_review_pending(&cwd).unwrap();
+        assert!(operation_lease::operation_review_pending_active(&cwd));
+        operation_lease::clear_operation_review_pending(&cwd);
+        assert!(!operation_lease::operation_review_pending_active(&cwd));
+    }
+
+    #[test]
+    fn operation_lease_valid_happy_path_only() {
+        let cwd = tmp();
+        approve_with_scope_state(&cwd, json!(["src/a.rs"]), true);
+        let now = operation_lease::now_ms();
+        operation_lease::write_operation(&cwd, &lease_value(&cwd, now - 1000, now + 300_000)).unwrap();
+        assert!(
+            operation_lease::operation_lease_valid_with(&cwd, true),
+            "config on + fresh in-window lease bound to the live approved+scoped epoch → VALID"
+        );
+        // Feature flag OFF → invalid even with a perfect lease. (The public `operation_lease_valid`
+        // reader is config-backed and NOT asserted here — that would read the operator's real
+        // review-mcp.json and break hermeticity; the config default is covered by the pure-parser
+        // test `operation_lease_enabled_from_defaults_off`.)
+        assert!(!operation_lease::operation_lease_valid_with(&cwd, false));
+    }
+
+    #[test]
+    fn operation_lease_invalid_under_force_block() {
+        let cwd = tmp();
+        approve_with_scope_state(&cwd, json!(["src/a.rs"]), true);
+        let now = operation_lease::now_ms();
+        operation_lease::write_operation(&cwd, &lease_value(&cwd, now - 1000, now + 300_000)).unwrap();
+        set_force_block(&cwd);
+        assert!(
+            !operation_lease::operation_lease_valid_with(&cwd, true),
+            "poison ALWAYS wins over a lease"
+        );
+    }
+
+    #[test]
+    fn operation_lease_invalid_missing_or_malformed_fields() {
+        let cwd = tmp();
+        approve_with_scope_state(&cwd, json!(["src/a.rs"]), true);
+        let now = operation_lease::now_ms();
+        // Missing operation_id.
+        let mut v = lease_value(&cwd, now - 1000, now + 300_000);
+        v.as_object_mut().unwrap().remove("operation_id");
+        operation_lease::write_operation(&cwd, &v).unwrap();
+        assert!(!operation_lease::operation_lease_valid_with(&cwd, true), "missing field");
+        // Missing approved_generation.
+        let mut v = lease_value(&cwd, now - 1000, now + 300_000);
+        v.as_object_mut().unwrap().remove("approved_generation");
+        operation_lease::write_operation(&cwd, &v).unwrap();
+        assert!(!operation_lease::operation_lease_valid_with(&cwd, true), "missing generation");
+        // Empty globs.
+        let mut v = lease_value(&cwd, now - 1000, now + 300_000);
+        v["approved_allowed_globs"] = json!([]);
+        operation_lease::write_operation(&cwd, &v).unwrap();
+        assert!(!operation_lease::operation_lease_valid_with(&cwd, true), "empty globs");
+        // Non-array globs.
+        let mut v = lease_value(&cwd, now - 1000, now + 300_000);
+        v["approved_allowed_globs"] = json!("src/a.rs");
+        operation_lease::write_operation(&cwd, &v).unwrap();
+        assert!(!operation_lease::operation_lease_valid_with(&cwd, true), "non-array globs");
+    }
+
+    #[test]
+    fn operation_lease_invalid_time_bounds() {
+        let cwd = tmp();
+        approve_with_scope_state(&cwd, json!(["src/a.rs"]), true);
+        let now = operation_lease::now_ms();
+        // Expired (now > expires_at).
+        operation_lease::write_operation(&cwd, &lease_value(&cwd, now - 10_000, now - 5_000)).unwrap();
+        assert!(!operation_lease::operation_lease_valid_with(&cwd, true), "expired");
+        // Over-long TTL (window > MAX_TTL).
+        operation_lease::write_operation(
+            &cwd,
+            &lease_value(&cwd, now - 1000, now + operation_lease::MAX_TTL_MS + 5000),
+        )
+        .unwrap();
+        assert!(!operation_lease::operation_lease_valid_with(&cwd, true), "over-TTL");
+        // Future created_at == backward-clock rollback (now < created_at) → fail closed.
+        operation_lease::write_operation(&cwd, &lease_value(&cwd, now + 50_000, now + 350_000)).unwrap();
+        assert!(
+            !operation_lease::operation_lease_valid_with(&cwd, true),
+            "future created_at / clock rollback fails closed"
+        );
+        // expires_at < created_at.
+        operation_lease::write_operation(&cwd, &lease_value(&cwd, now - 1000, now - 2000)).unwrap();
+        assert!(!operation_lease::operation_lease_valid_with(&cwd, true), "expires<created");
+    }
+
+    #[test]
+    fn operation_lease_invalid_epoch_or_approval_mismatch() {
+        let cwd = tmp();
+        approve_with_scope_state(&cwd, json!(["src/a.rs"]), true);
+        let now = operation_lease::now_ms();
+        for field in [
+            "epoch",
+            "approved_epoch",
+            "approved_plan_hash",
+            "approved_generation",
+        ] {
+            let mut v = lease_value(&cwd, now - 1000, now + 300_000);
+            v[field] = if field == "approved_plan_hash" || field == "approved_generation" {
+                json!(999_999u64)
+            } else {
+                json!("stale-mismatch")
+            };
+            operation_lease::write_operation(&cwd, &v).unwrap();
+            assert!(
+                !operation_lease::operation_lease_valid_with(&cwd, true),
+                "{field} mismatch vs live state → invalid"
+            );
+        }
+    }
+
+    #[test]
+    fn approved_generation_is_monotonic_across_approvals() {
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "task");
+        real_scoped_approve(&cwd);
+        let g1 = read_state(&cwd).unwrap()["approved_generation"]
+            .as_u64()
+            .unwrap();
+        revoke(&cwd, "x");
+        real_scoped_approve(&cwd);
+        let g2 = read_state(&cwd).unwrap()["approved_generation"]
+            .as_u64()
+            .unwrap();
+        assert!(g2 > g1, "each approval strictly increases the generation");
+    }
+
+    #[test]
+    fn operation_lease_invalid_after_revoke_and_reapprove_via_record() {
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "task");
+        real_scoped_approve(&cwd); // generation 1, scope enforced
+        let now = operation_lease::now_ms();
+        operation_lease::write_operation(&cwd, &lease_value(&cwd, now - 1000, now + 300_000))
+            .unwrap();
+        assert!(
+            operation_lease::operation_lease_valid_with(&cwd, true),
+            "fresh lease bound to the live approval is valid"
+        );
+        revoke(&cwd, "scope changed");
+        real_scoped_approve(&cwd); // SAME epoch/plan/scope, generation 2
+        assert!(
+            !operation_lease::operation_lease_valid_with(&cwd, true),
+            "a revoke + same-plan re-approve (record) must NOT revive the stale lease"
+        );
+    }
+
+    #[test]
+    fn operation_lease_invalid_after_revoke_and_reapprove_via_record_resume() {
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        start_epoch(&cwd, "sess", "task");
+        real_scoped_approve(&cwd); // generation 1, scope enforced
+        let now = operation_lease::now_ms();
+        operation_lease::write_operation(&cwd, &lease_value(&cwd, now - 1000, now + 300_000))
+            .unwrap();
+        assert!(operation_lease::operation_lease_valid_with(&cwd, true));
+        revoke(&cwd, "scope changed");
+        // Re-approve via the RECEIPT fast-path — a SEPARATE writer that does not touch `rounds`, so
+        // only the monotonic generation guards it. Same epoch/plan/scope as the lease.
+        let epoch = current_epoch(&cwd);
+        assert!(record_resume(
+            &cwd,
+            &epoch,
+            "do work\nALLOWED-GLOBS: src/a.rs",
+            &[],
+            &["src/a.rs".to_string()],
+        ));
+        assert!(
+            !operation_lease::operation_lease_valid_with(&cwd, true),
+            "a revoke + same-plan re-approve (record_resume) must NOT revive the stale lease"
+        );
+    }
+
+    #[test]
+    fn approved_generation_corrupt_or_overflow_fails_closed_and_neutralizes_prior_approval() {
+        // A present-but-malformed generation (non-u64) AND an overflow (u64::MAX) must fail closed
+        // WITHOUT minting (or wrapping to) a new generation, AND must neutralize a PRIOR effective
+        // approval (not merely refuse the new one) so a corrupt approved state can't stay open.
+        for bad in [json!(u64::MAX), json!("1"), json!({})] {
+            for resume in [false, true] {
+                let cwd = tmp();
+                approve_with_scope_state(&cwd, json!(["src/a.rs"]), true); // approved + scoped, gen=1
+                let mut s = read_state(&cwd).unwrap();
+                set_field(&mut s, "approved_generation", bad.clone());
+                write_state(&cwd, &s).unwrap();
+                assert!(
+                    is_effectively_approved(&cwd),
+                    "precondition: corrupt-but-effective approval (bad={bad})"
+                );
+                let epoch = current_epoch(&cwd);
+                let plan = "do work\nALLOWED-GLOBS: src/a.rs";
+                begin_review(&cwd, plan);
+                if resume {
+                    assert!(!record_resume(&cwd, &epoch, plan, &[], &["src/a.rs".to_string()]));
+                } else {
+                    assert!(matches!(
+                        record(
+                            &cwd,
+                            &epoch,
+                            plan,
+                            &crate::gate::Verdict::Approve,
+                            "ok\nSCOPE-APPROVED: src/a.rs"
+                        ),
+                        Outcome::NeedsInfo(_)
+                    ));
+                }
+                assert!(
+                    !is_effectively_approved(&cwd),
+                    "a corrupt generation neutralizes the prior approval (bad={bad}, resume={resume})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn operation_review_pending_set_propagates_write_failure() {
+        let cwd = tmp();
+        enable(&cwd).unwrap();
+        FORCE_WRITE_FAIL.with(|c| c.set(true));
+        let r = operation_lease::set_operation_review_pending(&cwd);
+        FORCE_WRITE_FAIL.with(|c| c.set(false));
+        assert!(
+            r.is_err(),
+            "the durable obligation must surface a write failure (caller fails closed)"
+        );
+    }
+
+    #[test]
+    fn operation_lease_invalid_scope_not_enforced_or_glob_mismatch() {
+        // Live approval with NO enforced scope (declared-but-empty) but the lease fabricates globs.
+        let cwd = tmp();
+        approve_with_scope_state(&cwd, json!([]), true); // DenyAll → scope_is_enforced false
+        let now = operation_lease::now_ms();
+        let mut v = lease_value(&cwd, now - 1000, now + 300_000);
+        v["approved_allowed_globs"] = json!(["src/forged.rs"]); // fabricated non-empty scope
+        operation_lease::write_operation(&cwd, &v).unwrap();
+        assert!(
+            !operation_lease::operation_lease_valid_with(&cwd, true),
+            "no live enforced scope → invalid even with fabricated lease globs"
+        );
+        // Live scope enforced, but the lease globs DIFFER from the live approved scope.
+        let cwd2 = tmp();
+        approve_with_scope_state(&cwd2, json!(["src/a.rs"]), true);
+        let mut v = lease_value(&cwd2, now - 1000, now + 300_000);
+        v["approved_allowed_globs"] = json!(["src/other.rs"]);
+        operation_lease::write_operation(&cwd2, &v).unwrap();
+        assert!(
+            !operation_lease::operation_lease_valid_with(&cwd2, true),
+            "lease globs != live approved globs → invalid"
+        );
+    }
+
+    #[test]
+    fn operation_lease_invalid_when_revoked() {
+        let cwd = tmp();
+        approve_with_scope_state(&cwd, json!(["src/a.rs"]), true);
+        let now = operation_lease::now_ms();
+        operation_lease::write_operation(&cwd, &lease_value(&cwd, now - 1000, now + 300_000)).unwrap();
+        assert!(operation_lease::operation_lease_valid_with(&cwd, true));
+        revoke(&cwd, "test"); // approval no longer effective
+        assert!(
+            !operation_lease::operation_lease_valid_with(&cwd, true),
+            "a revoked approval invalidates the lease"
         );
     }
 }

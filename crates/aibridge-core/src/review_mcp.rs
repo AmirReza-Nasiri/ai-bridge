@@ -838,6 +838,22 @@ pub fn reset_on_user_turn() -> bool {
     reset_on_user_turn_from(&read_config())
 }
 
+/// Pure: the `planGate.operationLease` flag from a policy Value. DEFAULT FALSE — the v0.32 Unit B
+/// operation-lease (a scoped, time-bounded suppression of re-arm/Stop for a turn-spanning background
+/// workflow) is OPT-IN. An absent/non-bool/malformed value reads FALSE (fail-safe: the suppression
+/// never turns on by accident).
+fn operation_lease_enabled_from(cfg: &Value) -> bool {
+    cfg.get("planGate")
+        .and_then(|p| p.get("operationLease"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Whether the operation-lease feature is enabled (on-disk config). DEFAULT OFF.
+pub fn operation_lease_enabled() -> bool {
+    operation_lease_enabled_from(&read_config())
+}
+
 // ───────────────────────── v0.32 (Phase 1): shadow execution router ─────────────────────
 //
 // LOG-ONLY telemetry, default OFF. `router.shadow` gates whether plan_gate appends a
@@ -1585,6 +1601,28 @@ mod tests {
         ));
         assert!(!read_only_orientation_from(
             &json!({"planGate": {"readOnlyOrientation": 1}})
+        ));
+    }
+
+    #[test]
+    fn operation_lease_enabled_from_defaults_off() {
+        // Absent → OFF (opt-in; the suppression never turns on by accident).
+        assert!(!operation_lease_enabled_from(&json!({})));
+        assert!(!operation_lease_enabled_from(&json!({"planGate": {}})));
+        // Explicitly true → ON.
+        assert!(operation_lease_enabled_from(
+            &json!({"planGate": {"operationLease": true}})
+        ));
+        // Explicitly false → OFF.
+        assert!(!operation_lease_enabled_from(
+            &json!({"planGate": {"operationLease": false}})
+        ));
+        // Malformed / non-bool → OFF (fail-safe).
+        assert!(!operation_lease_enabled_from(
+            &json!({"planGate": {"operationLease": "true"}})
+        ));
+        assert!(!operation_lease_enabled_from(
+            &json!({"planGate": {"operationLease": 1}})
         ));
     }
 
