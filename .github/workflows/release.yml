@@ -21,7 +21,7 @@ jobs:
   preflight:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Tag must match the workspace version
         shell: bash
         run: |
@@ -49,7 +49,7 @@ jobs:
             target: aarch64-apple-darwin
             ext: ""
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0 # full history so build.rs can stamp the git SHA/date
       - uses: dtolnay/rust-toolchain@stable
