@@ -73,7 +73,7 @@ jobs:
             shasum -a 256 "$asset" > "$asset.sha256"
           fi
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target }}
           path: |
@@ -89,7 +89,7 @@ jobs:
     permissions:
       contents: write # create the release + upload assets (built-in GITHUB_TOKEN)
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
