@@ -557,7 +557,11 @@ fn add_operating_model_directives(
     shared: bool,
     actions: &mut Vec<String>,
 ) -> Result<()> {
-    let path = project.join(if shared { "CLAUDE.md" } else { "CLAUDE.local.md" });
+    let path = project.join(if shared {
+        "CLAUDE.md"
+    } else {
+        "CLAUDE.local.md"
+    });
     let existing = read_note_or_empty(&path)?;
     if !existing.contains(OPERATING_MODEL_MARKER) {
         let mut content = existing;

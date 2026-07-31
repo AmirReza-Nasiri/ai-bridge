@@ -1178,8 +1178,12 @@ impl Server {
         // The pre-approved plan (read once by the caller) lets the reviewer flag changes
         // that fall outside the approved scope or high-risk actions the plan never named
         // — the soft-telemetry half of plan-gate v2 (we don't hard-fence files).
-        let prompt =
-            gate::prompt_with_scope(&bundle.text, approved_plan, reconstructed_base, review_policy);
+        let prompt = gate::prompt_with_scope(
+            &bundle.text,
+            approved_plan,
+            reconstructed_base,
+            review_policy,
+        );
         // Periodic anti-anchoring reset of the reserved review thread (shared bound
         // with manual review_diff; warm-cache speed is kept for the runs between).
         self.tick_gate_reset();
@@ -2731,7 +2735,10 @@ mod tests {
             None,
             false,
         );
-        assert!(out.contains(".ai-bridge/review-policy.md"), "hint names the file");
+        assert!(
+            out.contains(".ai-bridge/review-policy.md"),
+            "hint names the file"
+        );
         assert!(out.contains("CANNOT waive"), "hint states the safety limit");
         assert!(out.contains("no secrets"), "hint warns about secrets");
     }

@@ -392,45 +392,48 @@ mod tests {
             "gh run list",
             "gh run view 123",
             "gh run view 123 --job 456",
-            "gh run view --job 456",       // explicit non-interactive job selector, no positional
+            "gh run view --job 456", // explicit non-interactive job selector, no positional
             "gh run view --json status 123", // value flag THEN a real positional run-id
             "gh pr checks 21 --json state",
             "gh pr view 21 --json body",
             "gh pr list --json files",
             "gh pr list --state open --limit 20",
         ] {
-            assert!(is_read_only(c), "{c} (read-only gh query) should be allowed");
+            assert!(
+                is_read_only(c),
+                "{c} (read-only gh query) should be allowed"
+            );
         }
         for c in [
-            "gh pr diff",                  // content/diff — not a discovery command
-            "gh pr merge 21 --squash",     // mutating
-            "gh pr create --title x",      // mutating
-            "gh api repos/o/r",            // arbitrary API (can POST)
-            "gh secret set X",             // mutating/secret
-            "gh alias set co pr-checkout", // mutating
-            "gh ext install x",            // installs/execs
-            "gh run watch 1",              // blocking subcommand
-            "gh run view",                 // bare → interactive run picker (hangs)
-            "gh run view --json jobs",     // flag VALUE only, no run-id → still interactive
-            "gh run view --repo owner/repo", // flag value only, no run-id → still interactive
+            "gh pr diff",                       // content/diff — not a discovery command
+            "gh pr merge 21 --squash",          // mutating
+            "gh pr create --title x",           // mutating
+            "gh api repos/o/r",                 // arbitrary API (can POST)
+            "gh secret set X",                  // mutating/secret
+            "gh alias set co pr-checkout",      // mutating
+            "gh ext install x",                 // installs/execs
+            "gh run watch 1",                   // blocking subcommand
+            "gh run view",                      // bare → interactive run picker (hangs)
+            "gh run view --json jobs",          // flag VALUE only, no run-id → still interactive
+            "gh run view --repo owner/repo",    // flag value only, no run-id → still interactive
             "gh run view --json status --jq 1", // numeric `--jq` VALUE is not a run-id
-            "gh run view --jq 1",          // numeric flag value, no run-id
-            "gh run view 123 --log",       // dumps run LOGS (content, not metadata)
-            "gh run view 123 --log-failed", // dumps failed-step logs
-            "gh pr view 21 --comments",    // unknown flag → fail-closed allowlist denies it
-            "gh",                          // bare
-            "gh --version",                // not a noun+verb query
-            "gh pr view 21 --web",         // browser exec
-            "gh pr view 21 --web=true",    // attached-value bypass
+            "gh run view --jq 1",               // numeric flag value, no run-id
+            "gh run view 123 --log",            // dumps run LOGS (content, not metadata)
+            "gh run view 123 --log-failed",     // dumps failed-step logs
+            "gh pr view 21 --comments",         // unknown flag → fail-closed allowlist denies it
+            "gh",                               // bare
+            "gh --version",                     // not a noun+verb query
+            "gh pr view 21 --web",              // browser exec
+            "gh pr view 21 --web=true",         // attached-value bypass
             "gh run view 123 --web=true",
-            "gh pr checks 21 --watch",     // BLOCKS the hook (like tail -f)
+            "gh pr checks 21 --watch", // BLOCKS the hook (like tail -f)
             "gh pr checks 21 --watch=true",
-            "gh pr view 21 --help=true",   // help/pager (attached)
-            "gh pr view 21 -h",            // short help
-            "gh pr view 21 -w",            // short web
-            "gh pr view 21 -wh",           // pflag boolean shorthand cluster
+            "gh pr view 21 --help=true", // help/pager (attached)
+            "gh pr view 21 -h",          // short help
+            "gh pr view 21 -w",          // short web
+            "gh pr view 21 -wh",         // pflag boolean shorthand cluster
             "gh pr view 21 -hw",
-            "gh pr list -s open",          // short flag → long-form only
+            "gh pr list -s open", // short flag → long-form only
         ] {
             assert!(!is_read_only(c), "{c} must be denied");
         }

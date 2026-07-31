@@ -465,13 +465,21 @@ mod tests {
         let base = prompt_with_scope("DIFF", None, false, None);
         assert_eq!(base, prompt("DIFF"));
         assert_eq!(base, prompt_with_scope("DIFF", None, false, Some("")));
-        assert_eq!(base, prompt_with_scope("DIFF", None, false, Some("   \n  \t ")));
+        assert_eq!(
+            base,
+            prompt_with_scope("DIFF", None, false, Some("   \n  \t "))
+        );
         assert!(!base.contains("OWNER REVIEW POLICY"));
     }
 
     #[test]
     fn active_policy_injects_before_task_changes_and_keeps_verdict_tags() {
-        let p = prompt_with_scope("DIFF", None, false, Some("links may 404 until later slices"));
+        let p = prompt_with_scope(
+            "DIFF",
+            None,
+            false,
+            Some("links may 404 until later slices"),
+        );
         assert!(p.contains("OWNER REVIEW POLICY"), "policy block present");
         let pol = p.find("OWNER REVIEW POLICY").unwrap();
         let diff = p.find("=== TASK CHANGES").unwrap();

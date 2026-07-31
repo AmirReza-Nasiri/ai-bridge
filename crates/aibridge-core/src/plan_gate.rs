@@ -551,7 +551,11 @@ mod operation_lease {
         // 7. EXACT live-scope binding: the lease's globs must equal the LIVE approved scope (not just
         //    be a non-empty array of their own), so a forged lease can't fabricate a scope. Combined
         //    with `scope_is_enforced` above, this fails closed unless the lease mirrors a real fence.
-        if state.get("approved_allowed_globs").and_then(Value::as_array) != Some(lease_globs) {
+        if state
+            .get("approved_allowed_globs")
+            .and_then(Value::as_array)
+            != Some(lease_globs)
+        {
             return false;
         }
         true
@@ -774,8 +778,10 @@ pub fn start_epoch(cwd: &str, session: &str, prompt: &str) {
 /// path is unit-testable without real-HOME config IO. The public wrapper supplies the on-disk
 /// value; behavior is otherwise identical.
 fn start_epoch_inner(cwd: &str, session: &str, prompt: &str, reset_on_user_turn: bool) {
-    if with_state_lock(cwd, |g| start_epoch_locked(cwd, session, prompt, reset_on_user_turn, g))
-        .is_none()
+    if with_state_lock(cwd, |g| {
+        start_epoch_locked(cwd, session, prompt, reset_on_user_turn, g)
+    })
+    .is_none()
     {
         // Lock-acquire failure for a NEW-EPOCH transition → poison + best-effort remove state so a
         // stale approval cannot unlock this new task (the central predicate then denies).
@@ -1521,7 +1527,10 @@ pub(crate) fn force_blocked_message() -> &'static str {
 /// (subject to the high-risk-delta check). `Some` → refuse with this message.
 pub(crate) fn run_tool_blocked_message(cwd: &str) -> Option<String> {
     if is_force_blocked(cwd) {
-        Some(format!("AI Bridge: `run` blocked — {}.", force_blocked_message()))
+        Some(format!(
+            "AI Bridge: `run` blocked — {}.",
+            force_blocked_message()
+        ))
     } else if blocks_writes(cwd) {
         Some(
             "AI Bridge: `run` is blocked by the plan gate — this task has no approved plan yet. \
@@ -2229,7 +2238,10 @@ fn read_review_policy_raw(cwd: &str) -> Option<String> {
 /// else Null (absent / whitespace-only / oversized → nothing pinned → fail-closed at
 /// review). Storing only the hash never leaks policy content into state.
 fn review_policy_pin(cwd: &str) -> Value {
-    match read_review_policy_raw(cwd).as_deref().and_then(normalize_policy) {
+    match read_review_policy_raw(cwd)
+        .as_deref()
+        .and_then(normalize_policy)
+    {
         Some(c) if c.chars().count() <= REVIEW_POLICY_MAX_CHARS => json!(policy_hash(&c)),
         _ => Value::Null,
     }
@@ -2242,7 +2254,10 @@ fn review_policy_pin(cwd: &str) -> Value {
 /// post-approval edit (e.g. a Bash write into the excluded `.ai-bridge/` dir, or a
 /// receipt resume that re-Nulls the pin) is ignored.
 pub fn active_review_policy(cwd: &str) -> ReviewPolicy {
-    let canonical = match read_review_policy_raw(cwd).as_deref().and_then(normalize_policy) {
+    let canonical = match read_review_policy_raw(cwd)
+        .as_deref()
+        .and_then(normalize_policy)
+    {
         None => return ReviewPolicy::Absent,
         Some(c) => c,
     };
@@ -2544,7 +2559,9 @@ pub fn record(
     verdict: &crate::gate::Verdict,
     findings: &str,
 ) -> Outcome {
-    match with_state_lock(cwd, |g| record_locked(cwd, g, expected_epoch, plan, verdict, findings)) {
+    match with_state_lock(cwd, |g| {
+        record_locked(cwd, g, expected_epoch, plan, verdict, findings)
+    }) {
         Some(o) => o,
         None => record_lock_failed(cwd, verdict, findings),
     }
@@ -5149,7 +5166,9 @@ mod tests {
         // Matching hash, but the gate is NOT enabled → no effective approval → ignored.
         let cwd = tmp();
         std::fs::create_dir_all(
-            std::path::Path::new(&cwd).join(".ai-bridge").join("plan-gate"),
+            std::path::Path::new(&cwd)
+                .join(".ai-bridge")
+                .join("plan-gate"),
         )
         .unwrap();
         let body = "valid policy";
@@ -5235,7 +5254,11 @@ mod tests {
         let p = ReviewPolicy::Active("P".into()).fp();
         let q = ReviewPolicy::Active("Q".into()).fp();
         assert_ne!(p, q, "different policy content → different fp");
-        assert_ne!(p, ReviewPolicy::Absent.fp(), "policy vs none → different fp");
+        assert_ne!(
+            p,
+            ReviewPolicy::Absent.fp(),
+            "policy vs none → different fp"
+        );
         assert_eq!(
             ReviewPolicy::Absent.fp(),
             ReviewPolicy::Ignored("any").fp(),
@@ -5249,7 +5272,10 @@ mod tests {
         std::fs::create_dir_all(std::path::Path::new(&cwd).join(".ai-bridge")).unwrap();
         assert!(!review_policy_present(&cwd), "no file → not present");
         write_policy(&cwd, "   \n  ");
-        assert!(!review_policy_present(&cwd), "whitespace-only → not present");
+        assert!(
+            !review_policy_present(&cwd),
+            "whitespace-only → not present"
+        );
         write_policy(&cwd, "accepted: links may 404");
         assert!(review_policy_present(&cwd), "in-bounds policy → present");
         write_policy(&cwd, &"x".repeat(REVIEW_POLICY_MAX_CHARS + 1));
@@ -5272,7 +5298,10 @@ mod tests {
     #[test]
     fn normalize_policy_treats_all_comment_scaffold_as_inert() {
         // The init scaffold (the whole file is one HTML comment) → None (Absent/inert).
-        assert_eq!(normalize_policy("<!-- template, no entries yet -->\n"), None);
+        assert_eq!(
+            normalize_policy("<!-- template, no entries yet -->\n"),
+            None
+        );
         // A real entry outside comments → Some(stripped entry); inline comments removed.
         let raw = "<!-- docs -->\n## Accepted\nlinks may 404 <!-- note --> until later";
         let got = normalize_policy(raw).unwrap();
@@ -5287,7 +5316,10 @@ mod tests {
     fn review_policy_present_false_for_all_comment_scaffold() {
         let cwd = tmp();
         std::fs::create_dir_all(std::path::Path::new(&cwd).join(".ai-bridge")).unwrap();
-        write_policy(&cwd, "<!--\nAI Bridge review policy template — no entries yet.\n-->\n");
+        write_policy(
+            &cwd,
+            "<!--\nAI Bridge review policy template — no entries yet.\n-->\n",
+        );
         assert!(
             !review_policy_present(&cwd),
             "an all-comment scaffold must be inert (not present)"
@@ -5387,8 +5419,14 @@ mod tests {
         approve(&cwd, "PLAN");
         let _held = hold_state_lock(&cwd);
         set_state_lock_budget_for_test(Duration::from_millis(30));
-        assert_eq!(begin_review(&cwd, "PLAN v2"), ReviewStart::MarkerWriteFailed);
-        assert!(force_block_active(&cwd), "begin_review lock-timeout poisons");
+        assert_eq!(
+            begin_review(&cwd, "PLAN v2"),
+            ReviewStart::MarkerWriteFailed
+        );
+        assert!(
+            force_block_active(&cwd),
+            "begin_review lock-timeout poisons"
+        );
         assert!(!is_effectively_approved(&cwd));
         assert!(
             read_state(&cwd).is_none(),
@@ -5409,7 +5447,10 @@ mod tests {
             record(&a, &ea, "PLAN", &crate::gate::Verdict::Approve, ""),
             Outcome::NeedsInfo(_)
         ));
-        assert!(!force_block_active(&a), "Approve lock-timeout must NOT poison");
+        assert!(
+            !force_block_active(&a),
+            "Approve lock-timeout must NOT poison"
+        );
         drop(ha);
 
         // RequestChanges under a lock-timeout → poison + a non-approve outcome (a prior approval,
@@ -5430,7 +5471,10 @@ mod tests {
             ),
             Outcome::Revise(_)
         ));
-        assert!(force_block_active(&b), "RequestChanges lock-timeout poisons");
+        assert!(
+            force_block_active(&b),
+            "RequestChanges lock-timeout poisons"
+        );
         assert!(!is_effectively_approved(&b), "prior approval neutralized");
     }
 
@@ -5508,7 +5552,10 @@ mod tests {
             matches!(out, Outcome::NeedsInfo(_)),
             "Approve write-fail → not Approved"
         );
-        assert!(!is_approved(&b), "the unpersisted approval did not take effect");
+        assert!(
+            !is_approved(&b),
+            "the unpersisted approval did not take effect"
+        );
     }
 
     #[test]
@@ -5520,7 +5567,10 @@ mod tests {
         FORCE_WRITE_FAIL.with(|c| c.set(true));
         start_epoch_inner(&cwd, "sess", "a different task", true); // forced fresh-epoch
         FORCE_WRITE_FAIL.with(|c| c.set(false));
-        assert!(force_block_active(&cwd), "fresh-epoch write-failure poisons");
+        assert!(
+            force_block_active(&cwd),
+            "fresh-epoch write-failure poisons"
+        );
         assert!(!is_effectively_approved(&cwd));
     }
 
@@ -5607,9 +5657,18 @@ mod tests {
             epoch_before,
             "poison forces a fresh epoch (no preserve)"
         );
-        assert!(!is_approved(&cwd), "stale approval not carried into the fresh epoch");
-        assert!(!force_block_active(&cwd), "the fresh epoch lifted the poison");
-        assert!(!has_pending_user_turn(&cwd), "no preserve marker was recorded");
+        assert!(
+            !is_approved(&cwd),
+            "stale approval not carried into the fresh epoch"
+        );
+        assert!(
+            !force_block_active(&cwd),
+            "the fresh epoch lifted the poison"
+        );
+        assert!(
+            !has_pending_user_turn(&cwd),
+            "no preserve marker was recorded"
+        );
     }
 
     #[test]
@@ -5818,11 +5877,20 @@ mod tests {
         let cwd = tmp();
         enable(&cwd).unwrap();
         let v = json!({ "operation_id": "x", "created_at": 1u64 });
-        assert!(operation_lease::read_operation(&cwd).is_none(), "absent → None");
+        assert!(
+            operation_lease::read_operation(&cwd).is_none(),
+            "absent → None"
+        );
         operation_lease::write_operation(&cwd, &v).unwrap();
-        assert_eq!(operation_lease::read_operation(&cwd).unwrap()["operation_id"], "x");
+        assert_eq!(
+            operation_lease::read_operation(&cwd).unwrap()["operation_id"],
+            "x"
+        );
         operation_lease::clear_operation(&cwd);
-        assert!(operation_lease::read_operation(&cwd).is_none(), "cleared → None");
+        assert!(
+            operation_lease::read_operation(&cwd).is_none(),
+            "cleared → None"
+        );
         // Durable sentinel.
         assert!(!operation_lease::operation_review_pending_active(&cwd));
         operation_lease::set_operation_review_pending(&cwd).unwrap();
@@ -5836,7 +5904,8 @@ mod tests {
         let cwd = tmp();
         approve_with_scope_state(&cwd, json!(["src/a.rs"]), true);
         let now = operation_lease::now_ms();
-        operation_lease::write_operation(&cwd, &lease_value(&cwd, now - 1000, now + 300_000)).unwrap();
+        operation_lease::write_operation(&cwd, &lease_value(&cwd, now - 1000, now + 300_000))
+            .unwrap();
         assert!(
             operation_lease::operation_lease_valid_with(&cwd, true),
             "config on + fresh in-window lease bound to the live approved+scoped epoch → VALID"
@@ -5853,7 +5922,8 @@ mod tests {
         let cwd = tmp();
         approve_with_scope_state(&cwd, json!(["src/a.rs"]), true);
         let now = operation_lease::now_ms();
-        operation_lease::write_operation(&cwd, &lease_value(&cwd, now - 1000, now + 300_000)).unwrap();
+        operation_lease::write_operation(&cwd, &lease_value(&cwd, now - 1000, now + 300_000))
+            .unwrap();
         set_force_block(&cwd);
         assert!(
             !operation_lease::operation_lease_valid_with(&cwd, true),
@@ -5870,22 +5940,34 @@ mod tests {
         let mut v = lease_value(&cwd, now - 1000, now + 300_000);
         v.as_object_mut().unwrap().remove("operation_id");
         operation_lease::write_operation(&cwd, &v).unwrap();
-        assert!(!operation_lease::operation_lease_valid_with(&cwd, true), "missing field");
+        assert!(
+            !operation_lease::operation_lease_valid_with(&cwd, true),
+            "missing field"
+        );
         // Missing approved_generation.
         let mut v = lease_value(&cwd, now - 1000, now + 300_000);
         v.as_object_mut().unwrap().remove("approved_generation");
         operation_lease::write_operation(&cwd, &v).unwrap();
-        assert!(!operation_lease::operation_lease_valid_with(&cwd, true), "missing generation");
+        assert!(
+            !operation_lease::operation_lease_valid_with(&cwd, true),
+            "missing generation"
+        );
         // Empty globs.
         let mut v = lease_value(&cwd, now - 1000, now + 300_000);
         v["approved_allowed_globs"] = json!([]);
         operation_lease::write_operation(&cwd, &v).unwrap();
-        assert!(!operation_lease::operation_lease_valid_with(&cwd, true), "empty globs");
+        assert!(
+            !operation_lease::operation_lease_valid_with(&cwd, true),
+            "empty globs"
+        );
         // Non-array globs.
         let mut v = lease_value(&cwd, now - 1000, now + 300_000);
         v["approved_allowed_globs"] = json!("src/a.rs");
         operation_lease::write_operation(&cwd, &v).unwrap();
-        assert!(!operation_lease::operation_lease_valid_with(&cwd, true), "non-array globs");
+        assert!(
+            !operation_lease::operation_lease_valid_with(&cwd, true),
+            "non-array globs"
+        );
     }
 
     #[test]
@@ -5894,24 +5976,35 @@ mod tests {
         approve_with_scope_state(&cwd, json!(["src/a.rs"]), true);
         let now = operation_lease::now_ms();
         // Expired (now > expires_at).
-        operation_lease::write_operation(&cwd, &lease_value(&cwd, now - 10_000, now - 5_000)).unwrap();
-        assert!(!operation_lease::operation_lease_valid_with(&cwd, true), "expired");
+        operation_lease::write_operation(&cwd, &lease_value(&cwd, now - 10_000, now - 5_000))
+            .unwrap();
+        assert!(
+            !operation_lease::operation_lease_valid_with(&cwd, true),
+            "expired"
+        );
         // Over-long TTL (window > MAX_TTL).
         operation_lease::write_operation(
             &cwd,
             &lease_value(&cwd, now - 1000, now + operation_lease::MAX_TTL_MS + 5000),
         )
         .unwrap();
-        assert!(!operation_lease::operation_lease_valid_with(&cwd, true), "over-TTL");
+        assert!(
+            !operation_lease::operation_lease_valid_with(&cwd, true),
+            "over-TTL"
+        );
         // Future created_at == backward-clock rollback (now < created_at) → fail closed.
-        operation_lease::write_operation(&cwd, &lease_value(&cwd, now + 50_000, now + 350_000)).unwrap();
+        operation_lease::write_operation(&cwd, &lease_value(&cwd, now + 50_000, now + 350_000))
+            .unwrap();
         assert!(
             !operation_lease::operation_lease_valid_with(&cwd, true),
             "future created_at / clock rollback fails closed"
         );
         // expires_at < created_at.
         operation_lease::write_operation(&cwd, &lease_value(&cwd, now - 1000, now - 2000)).unwrap();
-        assert!(!operation_lease::operation_lease_valid_with(&cwd, true), "expires<created");
+        assert!(
+            !operation_lease::operation_lease_valid_with(&cwd, true),
+            "expires<created"
+        );
     }
 
     #[test]
@@ -6024,7 +6117,13 @@ mod tests {
                 let plan = "do work\nALLOWED-GLOBS: src/a.rs";
                 begin_review(&cwd, plan);
                 if resume {
-                    assert!(!record_resume(&cwd, &epoch, plan, &[], &["src/a.rs".to_string()]));
+                    assert!(!record_resume(
+                        &cwd,
+                        &epoch,
+                        plan,
+                        &[],
+                        &["src/a.rs".to_string()]
+                    ));
                 } else {
                     assert!(matches!(
                         record(
@@ -6088,7 +6187,8 @@ mod tests {
         let cwd = tmp();
         approve_with_scope_state(&cwd, json!(["src/a.rs"]), true);
         let now = operation_lease::now_ms();
-        operation_lease::write_operation(&cwd, &lease_value(&cwd, now - 1000, now + 300_000)).unwrap();
+        operation_lease::write_operation(&cwd, &lease_value(&cwd, now - 1000, now + 300_000))
+            .unwrap();
         assert!(operation_lease::operation_lease_valid_with(&cwd, true));
         revoke(&cwd, "test"); // approval no longer effective
         assert!(

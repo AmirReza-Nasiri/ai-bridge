@@ -144,11 +144,8 @@ pub fn sanitize_env(input: &[(String, String)]) -> Vec<(String, String)> {
                     | "ENV"
             )
     };
-    let mut out: Vec<(String, String)> = input
-        .iter()
-        .filter(|(k, _)| !dropped(k))
-        .cloned()
-        .collect();
+    let mut out: Vec<(String, String)> =
+        input.iter().filter(|(k, _)| !dropped(k)).cloned().collect();
     // Re-add ONLY known-safe Git controls: system config OFF, GLOBAL/user config routed to
     // the null device (so `core.pager`/`diff.external`/include in ~/.gitconfig or
     // $XDG_CONFIG_HOME can't run a helper — GIT_CONFIG_GLOBAL overrides both), never prompt.
@@ -250,7 +247,10 @@ mod tests {
             #[cfg(unix)]
             chmod(&f, 0o755);
             assert!(
-                matches!(check_trusted_exe_path(&f), Err(TrustedExeReject::ShimOrScript(_))),
+                matches!(
+                    check_trusted_exe_path(&f),
+                    Err(TrustedExeReject::ShimOrScript(_))
+                ),
                 "{ext} must be rejected by extension"
             );
         }
@@ -279,7 +279,10 @@ mod tests {
             check_trusted_exe_path(&d.join("does-not-exist")),
             Err(TrustedExeReject::NotFound)
         );
-        assert_eq!(check_trusted_exe_path(&d), Err(TrustedExeReject::NotRegularFile));
+        assert_eq!(
+            check_trusted_exe_path(&d),
+            Err(TrustedExeReject::NotRegularFile)
+        );
     }
 
     #[test]
@@ -350,7 +353,11 @@ mod tests {
             ("git_config_global".into(), "/evil".into()), // case-insensitive
         ];
         let out = sanitize_env(&input);
-        let get = |k: &str| out.iter().find(|(key, _)| key == k).map(|(_, v)| v.as_str());
+        let get = |k: &str| {
+            out.iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| v.as_str())
+        };
         // Every loader/git-control/pager/askpass var is gone (the forced safe values are
         // RE-ADDED below, so we check the dangerous INPUT keys, not the forced ones).
         for gone in [
@@ -398,7 +405,9 @@ mod tests {
         assert_eq!(get("GIT_CONFIG_GLOBAL"), Some(null));
         assert_eq!(get("GIT_TERMINAL_PROMPT"), Some("0"));
         assert_eq!(
-            out.iter().filter(|(k, _)| k.eq_ignore_ascii_case("GIT_CONFIG_GLOBAL")).count(),
+            out.iter()
+                .filter(|(k, _)| k.eq_ignore_ascii_case("GIT_CONFIG_GLOBAL"))
+                .count(),
             1
         );
     }
@@ -407,12 +416,27 @@ mod tests {
     fn resolve_trusted_exe_rejects_non_bare_names() {
         // A path (not a bare tool name) is rejected BEFORE any PATH lookup.
         assert_eq!(resolve_trusted_exe(""), Err(TrustedExeReject::NameNotBare));
-        assert_eq!(resolve_trusted_exe("dir/git"), Err(TrustedExeReject::NameNotBare));
-        assert_eq!(resolve_trusted_exe("/abs/git"), Err(TrustedExeReject::NameNotBare));
-        assert_eq!(resolve_trusted_exe("a\\b"), Err(TrustedExeReject::NameNotBare));
-        assert_eq!(resolve_trusted_exe("C:git"), Err(TrustedExeReject::NameNotBare));
+        assert_eq!(
+            resolve_trusted_exe("dir/git"),
+            Err(TrustedExeReject::NameNotBare)
+        );
+        assert_eq!(
+            resolve_trusted_exe("/abs/git"),
+            Err(TrustedExeReject::NameNotBare)
+        );
+        assert_eq!(
+            resolve_trusted_exe("a\\b"),
+            Err(TrustedExeReject::NameNotBare)
+        );
+        assert_eq!(
+            resolve_trusted_exe("C:git"),
+            Err(TrustedExeReject::NameNotBare)
+        );
         assert_eq!(resolve_trusted_exe("."), Err(TrustedExeReject::NameNotBare));
-        assert_eq!(resolve_trusted_exe(".."), Err(TrustedExeReject::NameNotBare));
+        assert_eq!(
+            resolve_trusted_exe(".."),
+            Err(TrustedExeReject::NameNotBare)
+        );
     }
 
     #[test]
@@ -463,7 +487,10 @@ mod tests {
         );
         assert!(!envs.contains_key("GIT_PAGER"), "pager dropped");
         assert!(!envs.contains_key("NODE_OPTIONS"), "injection knob dropped");
-        assert_eq!(envs.get("GIT_CONFIG_NOSYSTEM"), Some(&Some("1".to_string())));
+        assert_eq!(
+            envs.get("GIT_CONFIG_NOSYSTEM"),
+            Some(&Some("1".to_string()))
+        );
         assert!(
             envs.contains_key("GIT_CONFIG_GLOBAL") && envs.contains_key("GIT_TERMINAL_PROMPT"),
             "forced safe git controls present"
