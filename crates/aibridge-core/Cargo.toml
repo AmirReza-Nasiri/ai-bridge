@@ -13,7 +13,7 @@ anyhow = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.10" # verify downloaded release binaries before replacing the installed one
 toml = { workspace = true } # parse codex config.toml to enumerate its MCP servers (review-mcp policy)
-sysinfo = { version = "0.32", default-features = false, features = ["system"] } # stale-process enumeration for safe self-update (v0.20.0)
+sysinfo = { version = "0.39", default-features = false, features = ["system"] } # stale-process enumeration for safe self-update (v0.20.0)
 zip = { version = "2", default-features = false, features = ["deflate"] } # extract rtk's Windows .zip release asset (v0.20.0)
 tar = "0.4" # extract rtk's macOS .tar.gz release asset (v0.20.0)
 flate2 = "1" # gzip layer for rtk's macOS .tar.gz (v0.20.0)
