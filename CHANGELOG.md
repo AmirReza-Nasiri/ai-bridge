@@ -6,6 +6,13 @@ versioning is semver.
 
 ## [Unreleased]
 
+## [0.34.1] - 2026-07-31
+
+First public release. This patch does not change runtime behavior; it moves the
+project's repository and updater metadata to the public maintainer namespace,
+documents the privacy/security boundary, and adds public contribution and
+security-reporting guidance.
+
 ## [0.34.0] - 2026-05-31
 
 Hardening + workflow groundwork bundled since 0.33.0: the plan gate's authority state is now

@@ -1,6 +1,6 @@
 # Install — Windows
 
-> Status: working (released — see the [Releases](https://github.com/omega-do-it-solutions/ai-bridge/releases) page).
+> Status: working (released — see the [Releases](https://github.com/AmirReza-Nasiri/ai-bridge/releases) page).
 
 ## Steps
 

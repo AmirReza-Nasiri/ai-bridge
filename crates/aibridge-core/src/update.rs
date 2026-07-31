@@ -17,7 +17,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 /// `owner/repo` slug parsed from `CARGO_PKG_REPOSITORY` (the Cargo.toml
-/// `repository` URL), e.g. `omega-do-it-solutions/ai-bridge`.
+/// `repository` URL), e.g. `AmirReza-Nasiri/ai-bridge`.
 pub fn repo_slug() -> &'static str {
     // Computed at runtime but cheap; kept simple (no once_cell dep).
     const URL: &str = env!("CARGO_PKG_REPOSITORY");
@@ -1760,7 +1760,7 @@ mod tests {
     #[test]
     fn repo_slug_is_owner_repo() {
         // Derived from Cargo.toml's repository URL.
-        assert_eq!(repo_slug(), "omega-do-it-solutions/ai-bridge");
+        assert_eq!(repo_slug(), "AmirReza-Nasiri/ai-bridge");
     }
 
     #[test]

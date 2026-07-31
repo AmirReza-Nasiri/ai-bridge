@@ -30,7 +30,7 @@
    `~/.cargo/bin/aibridge`, already on PATH):
 
    ```bash
-   git clone https://github.com/omega-do-it-solutions/ai-bridge
+   git clone https://github.com/AmirReza-Nasiri/ai-bridge
    cd ai-bridge
    cargo install --path crates/aibridge --locked
    ```

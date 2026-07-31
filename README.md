@@ -1,9 +1,18 @@
 # AI Bridge
 
+[![CI](https://github.com/AmirReza-Nasiri/ai-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/AmirReza-Nasiri/ai-bridge/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/AmirReza-Nasiri/ai-bridge)](https://github.com/AmirReza-Nasiri/ai-bridge/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 > A single Rust binary (MCP server) that keeps **Codex warm as a fast peer
 > reviewer for Claude Code** — on demand *and* automatically — and cuts the
 > startup overhead of those reviews.
-> The v4 successor to [`codex-peer`](https://github.com/omega-do-it-solutions/codex-peer).
+> The fourth-generation successor to the original `codex-peer` prototype.
+
+AI Bridge is local orchestration infrastructure, not a replacement for either
+Claude Code or Codex. It gives Claude Code a persistent second-model review
+path while keeping approvals, changes and release decisions under operator
+control.
 
 ## Status at a glance
 
@@ -49,7 +58,7 @@ three small, independent layers:
 **1. Install the `aibridge` binary once (so you can type `aibridge` anywhere):**
 
 ```bash
-git clone https://github.com/omega-do-it-solutions/ai-bridge
+git clone https://github.com/AmirReza-Nasiri/ai-bridge
 cd ai-bridge
 cargo install --path crates/aibridge      # → ~/.cargo/bin/aibridge (on PATH)
 ```
@@ -206,7 +215,7 @@ Per-session escape hatch (skip the plan gate for a trivial task — set it befor
 launching Claude Code): `AIBRIDGE_PLAN_GATE=0`.
 
 **Updating.** `aibridge update` pulls the matching binary (`aibridge-<target>[.exe]`)
-from the latest [GitHub Release](https://github.com/omega-do-it-solutions/ai-bridge/releases)
+from the latest [GitHub Release](https://github.com/AmirReza-Nasiri/ai-bridge/releases)
 via the `gh` CLI, verifies its SHA-256, and replaces the installed binary in place
 (on Windows even while the MCP server is running it) — then **reload Claude Code**
 so the MCP server picks up the new version. Cutting a release: bump the
@@ -221,6 +230,22 @@ MCP tools exposed by `mcp-server`: `consult` (named persisted topics),
 
 ---
 
+## Privacy and security model
+
+- AI Bridge runs locally, but prompts, plans and diffs sent for review are
+  processed through your existing Codex authentication. Do not use it on
+  material you are not authorized to send to that provider.
+- Named-topic transcripts and runtime receipts live under `.ai-bridge/`, which
+  is ignored by this repository. Treat that directory as potentially sensitive.
+- The plan and Stop gates reduce accidental unreviewed changes; they are not a
+  sandbox and do not replace source review, least-privilege credentials or
+  backups.
+- `aibridge run` executes approved local commands. Review the requested command
+  and repository state before allowing destructive or external operations.
+- Report vulnerabilities privately using the process in [SECURITY.md](SECURITY.md).
+
+---
+
 ## Requirements
 
 - **Claude Code** installed and logged in (used to register the MCP server + run the gate).
@@ -228,7 +253,7 @@ MCP tools exposed by `mcp-server`: `consult` (named persisted topics),
   `%APPDATA%\npm\codex.cmd` shim is auto-discovered).
 - **Git** on PATH (the gate and `review_diff` diff the working tree).
 - **GitHub CLI (`gh`)**, authenticated (`gh auth login`) — only for `aibridge update`
-  (it reaches the private repo's releases); everything else works without it.
+  (it reaches the public repository's releases); everything else works without it.
 - **Rust toolchain** — only to build/install from source.
 - **rtk** — optional output compressor; wired in safe-mode, opt-in via
   `aibridge init --rtk` (not required). AI Bridge never auto-downloads it;
