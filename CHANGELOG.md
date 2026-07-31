@@ -6,6 +6,13 @@ versioning is semver.
 
 ## [Unreleased]
 
+## [0.34.2] - 2026-07-31
+
+Security maintenance release: updates `anyhow` past RUSTSEC-2026-0190 and
+upgrades Ratatui so the resolved dependency graph no longer contains the
+affected `lru` release (RUSTSEC-2026-0002) or the unmaintained `paste` crate
+(RUSTSEC-2024-0436). The minimum supported Rust version is now 1.88.
+
 ## [0.34.1] - 2026-07-31
 
 First public release. This patch does not change runtime behavior; it moves the
